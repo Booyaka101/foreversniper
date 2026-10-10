@@ -1,0 +1,10 @@
+## Interface: 16001
+## Title: Forever Sniper
+## Notes: Learns auction prices from full scans, then alerts on newly listed deals below your threshold. It never buys — you do.
+## IconTexture: Interface\Icons\INV_Misc_Coin_01
+## Author: Thunderz
+## Version: 0.3.0
+## SavedVariables: ForeverSniperDB
+## X-Flavor-Note: Built for the WoW Forever beta 1.60.x (wow_classic_beta). API surface confirmed via the ForeverBeacon probe, 2026-09-17.
+
+ForeverSniper.lua
