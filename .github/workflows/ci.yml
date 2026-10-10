@@ -13,7 +13,10 @@ jobs:
         with:
           node-version: 22
       - name: wow-secret-lint
-        run: npx github:Booyaka101/wow-secret-lint .
+        run: |
+          git clone https://github.com/Booyaka101/wow-secret-lint /tmp/lint
+          cd /tmp/lint && npm install --no-save
+          node bin/wow-secret-lint.mjs $GITHUB_WORKSPACE
 
   sim:
     runs-on: ubuntu-latest
@@ -23,4 +26,7 @@ jobs:
         with:
           node-version: 22
       - name: wow-addon-sim
-        run: npx github:Booyaka101/wow-addon-sim .
+        run: |
+          git clone https://github.com/Booyaka101/wow-addon-sim /tmp/sim
+          cd /tmp/sim && npm install --no-save
+          node wow-addon-sim.mjs $GITHUB_WORKSPACE --strict
