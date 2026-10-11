@@ -988,13 +988,70 @@ function requestReplicate()
     -- event-driven from here: REPLICATE_ITEM_LIST_UPDATE completes the scan
 end
 
--- Live browse sweep (the sniper feed) ------------------------------------------------
--- Auctionator's IncrementalScan pattern: SendBrowseQuery with an empty string
--- returns the whole market aggregated per item (itemKey, minPrice,
--- totalQuantity), price-sorted so the cheapest listings surface first. Sweeping
--- this every few seconds finds a new cheap listing within seconds of it being
--- posted - unlike replicate, which is one snapshot per session. The book is
--- learned from every sweep, and each row is checked against its own median.
+-- Live sweep (the sniper feed) --------------------------------------------------------
+-- WoWSniper's engine, ported: weighted category rotation (one class per query,
+-- faster detection within the AH throttle), event-driven throttle tracking,
+-- browse paging, a safety check against Blizzard's own browse tab (querying
+-- under it can crash the client), and new-listing detection with expiry.
+-- The book learns from every row; deals fire only on NEW cheap listings that
+-- pass the listability gates.
+
+local SCAN_CATEGORIES = {
+    { name = "Weapons",     classID = 2,  priority = 3 },
+    { name = "Armor",       classID = 4,  priority = 3 },
+    { name = "Recipes",     classID = 9,  priority = 2 },
+    { name = "Pets",        classID = 17, priority = 3 },
+    { name = "Misc/Mounts", classID = 15, priority = 3 },
+    { name = "Containers",  classID = 1,  priority = 1 },
+}
+local rotationList, rotationIndex = {}, 0
+for _, cat in ipairs(SCAN_CATEGORIES) do
+    for p = 1, cat.priority do rotationList[#rotationList + 1] = cat end
+end
+local function nextCategory()
+    rotationIndex = rotationIndex + 1
+    if rotationIndex > #rotationList then
+        rotationIndex = 1
+        -- rotate the seen-cache at the top of each full pass
+        local cutoff = time() - 300
+        for k, t in pairs(S.seen or {}) do
+            if t < cutoff then S.seen[k] = nil end
+        end
+    end
+    return rotationList[rotationIndex]
+end
+
+S.seen = S.seen or {}
+local function isNewListing(itemID, price)
+    local k = tostring(itemID) .. ":" .. tostring(price)
+    if S.seen[k] then return false end
+    S.seen[k] = time()
+    return true
+end
+
+local throttleReady, pagePending, lastQueryAt = true, false, 0
+
+-- Querying while Blizzard's own browse tab is up can crash its ScrollBox
+local function blizzardBrowseActive()
+    if AuctionHouseFrame and AuctionHouseFrame.IsShown and AuctionHouseFrame:IsShown()
+        and AuctionHouseFrame.BrowseResultsFrame
+        and AuctionHouseFrame.BrowseResultsFrame.IsShown
+        and AuctionHouseFrame.BrowseResultsFrame:IsShown() then
+        return true
+    end
+    return false
+end
+
+local function canQuery()
+    if not cfg.enabled or not S.ahOpen then return false end
+    if pagePending or not throttleReady then return false end
+    if GetTime() - lastQueryAt < 1.0 then return false end
+    if C_AuctionHouse and C_AuctionHouse.IsThrottledMessageSystemReady then
+        local ok, ready = pcall(C_AuctionHouse.IsThrottledMessageSystemReady)
+        if ok and ready == false then return false end
+    end
+    return true
+end
 
 local function processBrowseRows(rows)
     local mins, t = {}, time()
@@ -1008,29 +1065,26 @@ local function processBrowseRows(rows)
             if b then
                 local med = freshMedian(b.s, t, (cfg.freshMins or 45) * 60, cfg.armAfter)
                 if med and med >= cfg.minUnit and price <= cfg.threshold * med then
-                    -- listability gates: verifiable quality, and a market that
-                    -- is not buried under a mountain of competing stock
+                    -- listability gates: verifiable quality, a market not buried
+                    -- under competing stock, and a NEW listing (old ones were
+                    -- either seen or already alerted)
                     local q = qualityOf(key)
                     local overhang = cfg.overhang or 0
                     local crowded = overhang > 0 and qty > overhang
+                    local fresh = isNewListing(key, price)
                     if q < (cfg.quality or 1) then
-                        dbg("skip " .. key .. ": quality " .. q .. " below bar, not a clean relist")
+                        -- quality below bar: not a clean relist
                     elseif crowded then
                         dbg("skip " .. key .. ": " .. qty .. " units listed, relist would queue behind them")
+                    elseif not fresh then
+                        -- already seen at this price: not a new deal
                     else
                         local line = cfg.threshold * med
                         local cost = qty * price
                         local est = math.floor(qty * med * (1 - cfg.cut) - cost)
-                        if not S.underLine or S.underLine[key] ~= true then
-                            S.underLine = S.underLine or {}
-                            S.underLine[key] = true
-                            fireAlert("market", key, nil, price, med,
-                                { units = qty, cost = cost, profit = est, line = line })
-                        end
+                        fireAlert("market", key, nil, price, med,
+                            { units = qty, cost = cost, profit = est, line = line })
                     end
-                elseif S.underLine and S.underLine[key]
-                    and (not med or price > cfg.threshold * med) then
-                    S.underLine[key] = nil -- back above the line: re-arm the alert
                 end
             end
         end
@@ -1039,24 +1093,42 @@ local function processBrowseRows(rows)
 end
 
 local function sweepQuery()
-    if not cfg.enabled or not S.ahOpen or S.sweeping then return end
+    if not canQuery() then return end
     if C_AuctionHouse == nil or C_AuctionHouse.SendBrowseQuery == nil then return end
-    if C_AuctionHouse.IsThrottledMessageSystemReady then
-        local ok, ready = pcall(C_AuctionHouse.IsThrottledMessageSystemReady)
-        if ok and ready == false then return end -- client is busy; next tick retries
+    if blizzardBrowseActive() then
+        dbg("yielding: Blizzard's browse tab is showing")
+        return
     end
+    local cat = nextCategory()
     local sorts = {}
     if Enum and Enum.AuctionHouseSortOrder then
         local so = Enum.AuctionHouseSortOrder.Price or Enum.AuctionHouseSortOrder.Buyout
         if so then sorts = { { sortOrder = so, reverseSort = false } } end -- cheapest first
     end
-    S.sweeping = true
-    local ok, e = pcall(C_AuctionHouse.SendBrowseQuery,
-        { searchString = "", sorts = sorts, filters = {}, itemClassFilters = {} })
+    local query = {
+        searchString = "",
+        sorts = sorts,
+        filters = {},
+        itemClassFilters = { { classID = cat.classID } },
+    }
+    local ok, e = pcall(C_AuctionHouse.SendBrowseQuery, query)
     if not ok then
-        S.sweeping = false
         err("SendBrowseQuery", e)
+        return
     end
+    lastQueryAt = GetTime()
+    pagePending = true -- cleared when results land (or paging completes)
+    S.sweeping = true
+end
+
+local function maybeMorePages()
+    if not S.ahOpen or C_AuctionHouse.HasFullBrowseResults == nil then pagePending = false return end
+    local ok, full = pcall(C_AuctionHouse.HasFullBrowseResults)
+    if ok and not full and canQuery() then
+        local ok2 = pcall(C_AuctionHouse.RequestMoreBrowseResults)
+        if ok2 then lastQueryAt = GetTime() return end
+    end
+    pagePending = false
 end
 
 local function startSweeping()
@@ -1064,7 +1136,7 @@ local function startSweeping()
     local period = math.max(tonumber(cfg.sweep) or 3, 2)
     S.sweepTicker = C_Timer.NewTicker(period, sweepQuery)
     after(1, sweepQuery)
-    dbg("live sweep armed: every " .. period .. "s")
+    dbg("live sweep armed: category rotation every " .. period .. "s")
 end
 
 local function stopSweeping()
@@ -1073,6 +1145,7 @@ local function stopSweeping()
         S.sweepTicker = nil
     end
     S.sweeping = false
+    pagePending = false
 end
 
 -- Events ---------------------------------------------------------------------------
@@ -1141,19 +1214,37 @@ end)
 on("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", function()
     -- a fresh result set answers our sweep (or any manual search); read it
     if S.sweeping and C_AuctionHouse.GetBrowseResults then
-        S.sweeping = false
         local ok, rows = pcall(C_AuctionHouse.GetBrowseResults)
         if ok and type(rows) == "table" then
             processBrowseRows(rows)
+            maybeMorePages()
         elseif not ok then
+            S.sweeping = false
+            pagePending = false
             err("GetBrowseResults", rows)
         end
     end
 end)
 
 on("AUCTION_HOUSE_BROWSE_RESULTS_ADDED", function()
-    -- pages appended after a manual "more results"; the sweep only reads page one
-    S.sweeping = false
+    -- the next page landed: process it, keep paging until full
+    if S.sweeping and C_AuctionHouse.GetBrowseResults then
+        local ok, rows = pcall(C_AuctionHouse.GetBrowseResults)
+        if ok and type(rows) == "table" then
+            processBrowseRows(rows)
+        end
+        maybeMorePages()
+    end
+end)
+
+-- Event-driven throttle (WoWSniper's approach: never guess, listen)
+onOptional("AUCTION_HOUSE_THROTTLED_SYSTEM_READY", function() throttleReady = true end)
+onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_RESPONSE_RECEIVED", function() throttleReady = true end)
+onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_SENT", function() throttleReady = false end)
+onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_QUEUED", function() throttleReady = false end)
+onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED", function()
+    throttleReady = true
+    pagePending = false -- retry on the next tick
 end)
 
 on("REPLICATE_ITEM_LIST_UPDATE", function()
