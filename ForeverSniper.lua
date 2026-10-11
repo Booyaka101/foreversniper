@@ -55,6 +55,7 @@ local DEFAULTS = {
     quiet     = false,   -- suppress per-scan summaries
     scanPage  = true,    -- auto-show the scanner monitor when the AH opens
     avoidBrowse = true, -- auto-switch the AH off the Browse tab so sweeps run
+    undercut  = true,    -- guard your listings: alert when the market undercuts you
 }
 
 ForeverSniperDB = ForeverSniperDB or {}
@@ -1619,6 +1620,25 @@ local function updateScanPage()
         fmtMoney(S.session.spent or 0), S.session.listed or 0, countKeys(db.watch)))
 end
 
+-- UNDERCUT GUARD (sell-side sauce): a flip only prints if it SELLS, and it
+-- sells fastest at the front of the queue. Poll our own auctions; when the
+-- learned market drops under our listing price, someone is in front of us -
+-- cancel and relist. The cancel-relist loop TSM charges a subscription for,
+-- running on book data no other local addon has.
+local undercutTicker
+local function checkUndercuts()
+    if not S.ahOpen or not cfg.undercut then return end
+    if C_AuctionHouse == nil or C_AuctionHouse.QueryOwnedAuctions == nil then return end
+    if GetTime() - (S.lastUndercutQuery or 0) < 1.0 then return end
+    if C_AuctionHouse.IsThrottledMessageSystemReady then
+        local okT, ready = pcall(C_AuctionHouse.IsThrottledMessageSystemReady)
+        if okT and ready == false then return end
+    end
+    S.lastUndercutQuery = GetTime()
+    local ok, e = pcall(C_AuctionHouse.QueryOwnedAuctions, {})
+    if not ok then err("QueryOwnedAuctions", e) end
+end
+
 -- Live sweep (the sniper feed) --------------------------------------------------------
 -- WoWSniper's engine, ported: weighted category rotation (one class per query,
 -- faster detection within the AH throttle), event-driven throttle tracking,
@@ -1930,6 +1950,9 @@ end
 
 local function startSweeping()
     if S.sweepTicker or not cfg.enabled then return end
+    if cfg.undercut and not undercutTicker and C_AuctionHouse and C_AuctionHouse.QueryOwnedAuctions then
+        undercutTicker = C_Timer.NewTicker(30, checkUndercuts)
+    end
     local period = math.max(tonumber(cfg.sweep) or 3, 2)
     S.sweepTicker = C_Timer.NewTicker(period, function()
         sweepQuery()
@@ -1945,8 +1968,49 @@ local function stopSweeping()
         S.sweepTicker:Cancel()
         S.sweepTicker = nil
     end
+    if undercutTicker then
+        undercutTicker:Cancel()
+        undercutTicker = nil
+    end
     S.sweeping = false
     pagePending = false
+end
+
+
+local function onOwnedAuctionsUpdated()
+    if C_AuctionHouse.GetNumOwnedAuctions == nil then return end
+    local okN, n = pcall(C_AuctionHouse.GetNumOwnedAuctions)
+    n = okN and math.floor(num(n) or 0) or 0
+    if n == 0 then return end
+    local t = time()
+    for i = 1, n do
+        local okI, info = pcall(C_AuctionHouse.GetOwnedAuctionInfo, i)
+        if okI and type(info) == "table" then
+            local itemID = info.itemKey and info.itemKey.itemID
+            local buyout = num(info.buyoutAmount)
+            local qty = num(info.quantity) or 1
+            if itemID and buyout and buyout > 0 then
+                local unit = math.floor(buyout / qty)
+                local b = db.book[itemID]
+                local med = b and freshMedian(b.s, t, (cfg.freshMins or 45) * 60, cfg.armAfter) or nil
+                if med and med > 0 and unit > med * 1.05 then
+                    if not (b.ownUntil and t < b.ownUntil) then
+                        local key = tostring(itemID)
+                        S.lastUndercut = S.lastUndercut or {}
+                        local last = S.lastUndercut[key]
+                        if not (last and t - last < 300) then
+                            S.lastUndercut[key] = t
+                            db.stats.undercuts = (db.stats.undercuts or 0) + 1
+                            printf("|cffff8800UNDERCUT|r %s - you list at %s, market now %s. |cffffd100Cancel + relist.|r",
+                                info.itemLink or (infoOf(itemID).name or ("item " .. itemID)),
+                                fmtMoney(unit), fmtMoney(math.floor(med)))
+                            playTierSound("SNIPE")
+                        end
+                    end
+                end
+            end
+        end
+    end
 end
 
 -- Events ---------------------------------------------------------------------------
@@ -2062,6 +2126,7 @@ on("AUCTION_HOUSE_BROWSE_RESULTS_ADDED", function()
 end)
 
 -- Event-driven throttle (WoWSniper's approach: never guess, listen)
+onOptional("OWNED_AUCTIONS_UPDATED", function() onOwnedAuctionsUpdated() end)
 onOptional("AUCTION_HOUSE_THROTTLED_SYSTEM_READY", function() throttleReady = true end)
 onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_RESPONSE_RECEIVED", function() throttleReady = true end)
 onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_SENT", function() throttleReady = false end)
@@ -2262,6 +2327,7 @@ local HELP = {
     "/fsn                  status",
     "/fsn feed             deal window (click a row = live prices, BUY = buy)",
     "/fsn profit           money printer stats (session + lifetime)",
+    "/fsn undercut         guard your listings (alert when undercut)",
     "/fsn options          settings panel",
     "/fsn page             scanner monitor window (toggle)",
     "/fsn on | off         enable / disable",
@@ -2518,6 +2584,12 @@ SlashCmdList.FOREVERSNIPER = function(msg)
     elseif cmd == "sound" then
         cfg.sound = not cfg.sound
         printf("alert sound %s.", cfg.sound and "on" or "off")
+
+    elseif cmd == "undercut" then
+        cfg.undercut = not cfg.undercut
+        if cfg.undercut and S.ahOpen then startSweeping() end
+        if not cfg.undercut and undercutTicker then undercutTicker:Cancel() undercutTicker = nil end
+        printf("undercut guard %s.", cfg.undercut and "on - checks your listings every 30s" or "off")
 
     elseif cmd == "flash" then
         cfg.flash = not cfg.flash
