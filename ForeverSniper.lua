@@ -39,7 +39,7 @@ local DEFAULTS = {
     enabled   = true,    -- master switch
     threshold = 0.50,    -- deal if unit price <= 50% of learned market
     every     = 45,      -- seconds between full scans while the AH is open
-    sweep     = 3,       -- seconds between live browse sweeps (the sniper feed)
+    sweep     = 2,       -- seconds between live browse sweeps (the sniper feed)
     freshMins = 45,      -- market age: older price samples do not arm alerts
     overhang  = 500,     -- max competing units above the deal; more = slow flip (0 = off)
     armAfter  = 2,       -- learned samples required before market alerts fire
@@ -90,7 +90,7 @@ local function printf(fmt, ...)
 end
 
 -- temporary: trace the replicate pipeline in chat
-local DEBUG = true
+local DEBUG = false
 local function dbg(msg) if DEBUG then print("|cff888888[FSN-D]|r " .. msg) end end
 
 -- Numbers that may be secret on this client never enter the book or the math.
@@ -206,6 +206,18 @@ local function qualityOf(itemID)
     return res
 end
 
+-- Vendor sell price (11th GetItemInfo return), cached. A listing priced under
+-- this is FREE MONEY: buy it, vendor it, instant guaranteed profit, no market
+-- risk, no relist wait. The purest form of printing.
+local vendorCache = {}
+local function vendorOf(itemID)
+    if vendorCache[itemID] ~= nil then return vendorCache[itemID] end
+    local ok, _, _, _, _, _, _, _, _, _, _, sell = pcall(GetItemInfo, itemID)
+    local res = (ok and type(sell) == "number") and sell or 0
+    vendorCache[itemID] = res
+    return res
+end
+
 local function mergeIntoBook(curMins, t)
     local bookN = countKeys(db.book)
     for key, unit in pairs(curMins) do
@@ -247,6 +259,7 @@ local S = {
     buying     = nil,   -- { itemID, link, line, market, commodity, t } active Buy click
     quote      = nil,   -- { itemID, units, total } live commodity quote
     boughtAt   = {},    -- itemID -> { t, price } purchase cooldown
+    session    = { started = time(), spent = 0, buys = 0 }, -- money printer P&L
 }
 
 -- Watchlist: split into fast lookups, rebuilt before each scan uses them.
@@ -421,6 +434,8 @@ local function showConfirm(q)
                 if ok then
                     printf("purchased |cffffd100%d units|r of %s.", q2.units, q2.link or ("item " .. q2.itemID))
                     S.boughtAt[q2.itemID] = { t = time(), price = q2.unit or 0 }
+                    S.session.spent = S.session.spent + (q2.total or (q2.units or 0) * (q2.unit or 0))
+                    S.session.buys = S.session.buys + 1
                     self:GetParent().q = nil
                     self:GetParent():Hide()
                 else
@@ -465,6 +480,8 @@ local function showConfirm(q)
             printf("bought |cffffd100%d units|r of %s for |cffffd100%s|r.",
                 bought, q2.link or ("item " .. q2.itemID), fmtMoney(spent))
             S.boughtAt[q2.itemID] = { t = time(), price = q2.line }
+            S.session.spent = S.session.spent + spent
+            S.session.buys = S.session.buys + 1
         end
         if misses > 0 then
             printf("%d listing%s already gone — the re-scan will catch anything left.",
@@ -679,6 +696,7 @@ local TIERS = {
     SNIPE = { mult = 5.0, sound = 8959, r = 1.00, g = 0.35, b = 0.15 },
     GREAT = { mult = 3.0, sound = 888,  r = 0.35, g = 0.80, b = 1.00 },
     GOOD  = { mult = 2.0, sound = 3081, r = 0.30, g = 1.00, b = 0.45 },
+    VENDOR = { mult = 1.0, sound = 8959, r = 1.00, g = 0.85, b = 0.20 },
 }
 local function tierOf(market, price)
     if not market or market <= 0 or not price or price <= 0 then return nil end
@@ -903,6 +921,10 @@ local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
 
     sweep = sweep or { units = 1, cost = unit }
     db.stats.deals = (db.stats.deals or 0) + 1
+    if kind == "vendor" then
+        db.stats.vendorDeals = (db.stats.vendorDeals or 0) + 1
+        db.stats.vendorProfit = (db.stats.vendorProfit or 0) + (sweep.profit or 0)
+    end
     push(db.alerts, CAPS.alerts, {
         t = now, kind = kind, id = itemID, unit = unit, market = market,
         units = sweep.units, cost = sweep.cost, profit = sweep.profit,
@@ -932,7 +954,7 @@ local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
     playAlertSound()
 
     -- WoWSniper-parity: tiered sound/flash/toast + the deal feed
-    local tier = tierOf(market, unit)
+    local tier = (kind == "vendor") and "VENDOR" or tierOf(market, unit)
     alertDeal(tier, itemID, link, unit, market, sweep, isNew)
 
     if cfg.popup then
@@ -1286,6 +1308,15 @@ local function processBrowseRows(rows)
         local qty = num(r.totalQuantity) or 0
         if key and price and price > 0 then
             mins[key] = price
+            -- VENDOR FLIP: priced under the vendor sell price = guaranteed
+            -- instant profit. No market gates apply - the vendor always buys.
+            local sell = vendorOf(key)
+            dbg("vendor check id=" .. tostring(key) .. " price=" .. tostring(price) .. " sell=" .. tostring(sell))
+            if sell > 0 and price < sell and isNewListing(key, price) then
+                local est = (sell - price) * qty
+                fireAlert("vendor", key, nil, price, sell,
+                    { units = qty, cost = price * qty, profit = est, line = sell })
+            end
             local b = db.book[key]
             if b then
                 local med = freshMedian(b.s, t, (cfg.freshMins or 45) * 60, cfg.armAfter)
@@ -1344,6 +1375,7 @@ local function sweepQuery()
     lastQueryAt = GetTime()
     pagePending = true -- cleared when results land (or paging completes)
     S.sweeping = true
+    dbg("sweep sent: " .. cat.name)
 end
 
 local function maybeMorePages()
@@ -1441,6 +1473,7 @@ on("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", function()
     if S.sweeping and C_AuctionHouse.GetBrowseResults then
         local ok, rows = pcall(C_AuctionHouse.GetBrowseResults)
         if ok and type(rows) == "table" then
+            dbg("browse results: " .. #rows .. " row(s)")
             processBrowseRows(rows)
             maybeMorePages()
         elseif not ok then
@@ -1566,6 +1599,7 @@ local HELP = {
     "/fsn quiet            toggle per-scan summaries",
     "/fsn sound            toggle the alert sound",
     "/fsn watchlist        current rules",
+    "/fsn profit            the money printer scoreboard (session + lifetime)",
     "/fsn alerts           last 8 alerts",
     "/fsn shape            what the beta's replicate API returned (debug)",
     "/fsn errors           recorded API failures",
@@ -1801,6 +1835,16 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             refreshFeed()
             printf("deal feed showing - best profit on top. BUY re-checks live prices.")
         end
+
+    elseif cmd == "profit" then
+        local st = db.stats or {}
+        local mins = math.floor((time() - (S.session.started or time())) / 60 + 0.5)
+        printf("|cffffd100money printer|r — session: %d buy(s), |cffff4d00%s committed|r in %d min.",
+            S.session.buys or 0, fmtMoney(S.session.spent or 0), mins)
+        printf("lifetime: %d deal(s) flagged, %d vendor flip(s) worth |cffffd100%s|r.",
+            st.deals or 0, st.vendorDeals or 0, fmtMoney(st.vendorProfit or 0))
+        printf("book: %d item(s) learned, %d scan(s) done. spend cap %s per Buy.",
+            (st.book or 0), st.scans or 0, fmtMoney(cfg.maxSpend))
 
     elseif cmd == "alerts" then
         local shown = 0
