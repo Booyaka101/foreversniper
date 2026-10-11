@@ -1485,6 +1485,7 @@ end
 
 local throttleReady, pagePending, lastQueryAt = true, false, 0
 local sweepCount, watchCursor = 0, 0
+S.sweepStats = { sent = 0, rows = 0, yields = 0, lastRows = 0 }
 
 -- one watched item as a search key, or nil when nothing is watched
 local function nextWatchKey()
@@ -1578,7 +1579,15 @@ local function sweepQuery()
     if not canQuery() then return end
     if C_AuctionHouse == nil then return end
     if blizzardBrowseActive() then
-        dbg("yielding: Blizzard's browse tab is showing")
+        -- querying under Blizzard's own browse results can crash its ScrollBox;
+        -- hunt a watched item instead (searches never touch that frame), and
+        -- tell the user ONCE why the full sweep is paused
+        S.sweepStats = S.sweepStats or { sent = 0, rows = 0, yields = 0 }
+        S.sweepStats.yields = S.sweepStats.yields + 1
+        if not S.warnedBrowse then
+            S.warnedBrowse = true
+            printf("the AH's own |cffffd100Browse tab is showing|r - the live sweep pauses under it (client crash risk). Switch to any other tab and the sniper resumes.")
+        end
         return
     end
     sweepCount = sweepCount + 1
@@ -1622,6 +1631,7 @@ local function sweepQuery()
     lastQueryAt = GetTime()
     pagePending = true -- cleared when results land (or paging completes)
     S.sweeping = true
+    S.sweepStats.sent = S.sweepStats.sent + 1
     dbg("sweep sent: " .. cat.name)
 end
 
@@ -1711,6 +1721,7 @@ end)
 
 on("AUCTION_HOUSE_SHOW", function()
     S.ahOpen = true
+    S.warnedBrowse = nil -- the yield hint fires once per AH session
     if cfg.enabled and C_AuctionHouse then
         startSweeping()
         after(2, requestReplicate) -- replicate is the book bootstrap, not the feed
@@ -1740,6 +1751,8 @@ on("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", function()
         local ok, rows = pcall(C_AuctionHouse.GetBrowseResults)
         if ok and type(rows) == "table" then
             dbg("browse results: " .. #rows .. " row(s)")
+            S.sweepStats.rows = S.sweepStats.rows + #rows
+            S.sweepStats.lastRows = #rows
             processBrowseRows(rows)
             maybeMorePages()
         elseif not ok then
@@ -2024,6 +2037,18 @@ SlashCmdList.FOREVERSNIPER = function(msg)
         printf("%s | %d scans done | book %d items | %d alerts fired",
             cfg.enabled and "|cff7cff4fon|r" or "|cffff4d4doff|r",
             S.scansDone, db.stats.book or 0, db.stats.deals or 0)
+        local ss = S.sweepStats or { sent = 0, rows = 0, yields = 0 }
+        if S.sweepTicker then
+            printf("live sweep: |cffffd100%d sent|r, %d rows read, %d yields (browse-tab pauses). AH open: %s.",
+                ss.sent, ss.rows, ss.yields, S.ahOpen and "yes" or "no")
+        elseif S.ahOpen then
+            printf("|cffff4d4dlive sweep is NOT running|r - the AH is open but no ticker. /fsn on, then reopen the AH.")
+        else
+            printf("live sweep idle - it runs while the AH is open (%d sent last session).", ss.sent)
+        end
+        if S.warnedBrowse and S.ahOpen then
+            printf("|cffffd100the Browse tab is blocking sweeps|r - switch to another AH tab.")
+        end
         if db.stats.lastScan then
             printf("last scan %s: %d listings. threshold %d%% of market, every %ds, arm after %d, floor %s.",
                 date("%m-%d %H:%M", db.stats.lastScan), db.stats.lastListings or 0,
