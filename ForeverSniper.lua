@@ -39,6 +39,7 @@ local DEFAULTS = {
     enabled   = true,    -- master switch
     threshold = 0.50,    -- deal if unit price <= 50% of learned market
     every     = 45,      -- seconds between full scans while the AH is open
+    sweep     = 3,       -- seconds between live browse sweeps (the sniper feed)
     armAfter  = 2,       -- learned samples required before market alerts fire
     minUnit   = 1000,    -- ignore deals under 10s per unit (vendor-junk floor)
     quality   = 1,       -- market alerts need this quality or better (0 = any)
@@ -83,6 +84,10 @@ end
 local function printf(fmt, ...)
     print("|cffff7d0aForever Sniper|r: " .. string.format(fmt, ...))
 end
+
+-- temporary: trace the replicate pipeline in chat
+local DEBUG = true
+local function dbg(msg) if DEBUG then print("|cff888888[FSN-D]|r " .. msg) end end
 
 -- Numbers that may be secret on this client never enter the book or the math.
 local function num(v)
@@ -686,6 +691,7 @@ end
 local function completeScan(reason)
     if not S.scanning then return end
     S.scanning = false
+    S.lastScan = time()
 
     local n = 0
     do
@@ -737,41 +743,10 @@ local function completeScan(reason)
         if okP and num(q17) and num(q17) > 0 then foreverLayout = true end
     end
 
-    for i = 1, n do
-        local ok, a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,a16,a17,a18 =
-            pcall(C_AuctionHouse.GetReplicateItemInfo, i)
-        if not ok then
-            err("replicate:" .. i, a1)
-        else
-            local itemID, count, buyout, link, quality
-            if foreverLayout then
-                itemID, count, buyout = num(a17), num(a3), num(a10)
-                if C_AuctionHouse.GetReplicateItemLink then
-                    local okL, l = pcall(C_AuctionHouse.GetReplicateItemLink, i)
-                    if okL and type(l) == "string" then link = l end
-                end
-                -- no quality field in this layout; the alert filter tolerates nil
-            else
-                itemID, count, buyout, quality = num(a1), num(a7), num(a14), num(a9)
-                link = type(a8) == "string" and a8 or nil
-            end
-            if itemID and itemID > 0 and count and count >= 1 and buyout and buyout > 0 then
-                local unit = math.floor(buyout / count)
-                local mk = tostring(itemID) .. "/" .. count .. "/" .. buyout
-                curSeen[mk] = (curSeen[mk] or 0) + 1
-                if not curMins[itemID] or unit < curMins[itemID] then
-                    curMins[itemID] = unit
-                end
-                local dl = depth[itemID]
-                if not dl then dl = {}; depth[itemID] = dl end
-                dl[#dl + 1] = { unit = unit, count = count }
-                local isNew = firstScan or curSeen[mk] > (S.prevList[mk] or 0)
-                if isNew then
-                    cands[#cands + 1] = { id = itemID, link = link, unit = unit, q = quality }
-                end
-            end
-        end
-    end
+    -- Auctionator's ProcessBatch shape: the analysis tail is finishScan, the
+    -- rows are harvested 250 at a time so a 3k-listing server never freezes
+    -- a frame, and finishScan runs when the last row lands
+    local function finishScan()
 
     -- Market deals: a new listing under threshold% of a learned median. The
     -- whole depth under that line is swept (every unit of every cheap listing,
@@ -863,58 +838,179 @@ local function completeScan(reason)
     end
 
     if S.ahOpen then after(cfg.every, requestReplicate) end
+    end -- finishScan
+
+    -- 250 rows per tick, Auctionator's ProcessBatch cadence
+    local rowIndex = 0
+    local function harvestBatch()
+        local step = 0
+        while rowIndex < n and step < 250 do
+            rowIndex = rowIndex + 1
+            local i = rowIndex
+            local ok, a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,a16,a17,a18 =
+                pcall(C_AuctionHouse.GetReplicateItemInfo, i)
+            if not ok then
+                err("replicate:" .. i, a1)
+            else
+                local itemID, count, buyout, link, quality
+                if foreverLayout then
+                    itemID, count, buyout = num(a17), num(a3), num(a10)
+                    if C_AuctionHouse.GetReplicateItemLink then
+                        local okL, l = pcall(C_AuctionHouse.GetReplicateItemLink, i)
+                        if okL and type(l) == "string" then link = l end
+                    end
+                    -- no quality field in this layout; the alert filter tolerates nil
+                else
+                    itemID, count, buyout, quality = num(a1), num(a7), num(a14), num(a9)
+                    link = type(a8) == "string" and a8 or nil
+                end
+                if itemID and itemID > 0 and count and count >= 1 and buyout and buyout > 0 then
+                    local unit = math.floor(buyout / count)
+                    local mk = tostring(itemID) .. "/" .. count .. "/" .. buyout
+                    curSeen[mk] = (curSeen[mk] or 0) + 1
+                    if not curMins[itemID] or unit < curMins[itemID] then
+                        curMins[itemID] = unit
+                    end
+                    local dl = depth[itemID]
+                    if not dl then dl = {}; depth[itemID] = dl end
+                    dl[#dl + 1] = { unit = unit, count = count }
+                    local isNew = firstScan or curSeen[mk] > (S.prevList[mk] or 0)
+                    if isNew then
+                        cands[#cands + 1] = { id = itemID, link = link, unit = unit, q = quality }
+                    end
+                end
+            end
+            step = step + 1
+        end
+        return rowIndex >= n
+    end
+    if harvestBatch() then
+        finishScan()
+    else
+        S.harvestTicker = C_Timer.NewTicker(0, function()
+            if harvestBatch() then
+                S.harvestTicker:Cancel()
+                S.harvestTicker = nil
+                finishScan()
+            end
+        end)
+    end
 end
 
--- Stability watchdog: if REPLICATE_ITEM_LIST_UPDATED never fires on this client,
--- call the scan complete once the listing count has held still for 6 seconds.
-local watchdog = CreateFrame("Frame")
-watchdog:Hide()
-watchdog:SetScript("OnUpdate", function(self, elapsed)
-    self.acc = (self.acc or 0) + elapsed
-    if self.acc < 0.5 then return end
-    self.acc = 0
-    if not S.scanning then self:Hide() return end
-    local ok, n = pcall(C_AuctionHouse.GetNumReplicateItems)
-    n = ok and math.floor(num(n) or 0) or 0
-    if n == self.lastN then
-        self.stable = (self.stable or 0) + 0.5
-        if n > 0 and self.stable >= 6 then
-            self:Hide()
-            completeScan("stability")
-        end
-    else
-        self.lastN = n
-        self.stable = 0
-    end
-    if GetTime() > (self.deadline or 0) then
-        self:Hide()
-        S.scanning = false
-        err("scan", "timed out waiting for replicate data")
-        if S.ahOpen then after(cfg.every, requestReplicate) end
-    end
-end)
+-- Scan engine, mirroring Auctionator's server-proven shape:
+--   * one request per 15 minutes of our own (CanInitiate cooldown)
+--   * no throttle check, no watchdog: the event completes the scan,
+--     AUCTION_HOUSE_CLOSED resets everything
+--   * pre-check: harvest data another addon already delivered instead of
+--     requesting over it (a fresh request clears the delivered rows and the
+--     server grants one list per session - live-traced 2026-10-11)
+--   * rows are harvested in 250-row batches (Auctionator's ProcessBatch)
+local SCAN_COOLDOWN = 15 * 60
 
 function requestReplicate()
     if not cfg.enabled or not S.ahOpen or S.scanning then return end
     if C_AuctionHouse == nil then return end
-    if C_AuctionHouse.IsThrottledMessageSystemReady then
-        local ok, ready = pcall(C_AuctionHouse.IsThrottledMessageSystemReady)
-        if ok and ready == false then
-            after(5, requestReplicate)
-            return
-        end
+    if S.lastScan and time() - S.lastScan < math.min(cfg.every, 60) then return end
+    local okN, n = pcall(C_AuctionHouse.GetNumReplicateItems)
+    n = okN and math.floor(num(n) or 0) or 0
+    if n > 0 then
+        dbg("replicate data present: n=" .. n .. " — harvesting, no new request")
+        S.scanning = true
+        after(3, function()
+            -- let an in-flight delivery settle; the event may beat the timer
+            if S.scanning then completeScan("present") end
+        end)
+        return
     end
+    if S.lastRequest and time() - S.lastRequest < SCAN_COOLDOWN then
+        dbg("request cooldown: " .. (time() - S.lastRequest) .. "s since last, waiting for the event or other data")
+        return
+    end
+    S.lastRequest = time()
     local ok, e = pcall(C_AuctionHouse.ReplicateItems)
+    dbg("ReplicateItems: ok=" .. tostring(ok) .. " ret=" .. tostring(e))
     if not ok then
         err("ReplicateItems", e)
-        after(math.max(cfg.every, 60), requestReplicate)
+        S.lastRequest = nil
         return
     end
     S.scanning = true
-    watchdog.lastN = -1
-    watchdog.stable = 0
-    watchdog.deadline = GetTime() + 90
-    watchdog:Show()
+    -- event-driven from here: REPLICATE_ITEM_LIST_UPDATE completes the scan
+end
+
+-- Live browse sweep (the sniper feed) ------------------------------------------------
+-- Auctionator's IncrementalScan pattern: SendBrowseQuery with an empty string
+-- returns the whole market aggregated per item (itemKey, minPrice,
+-- totalQuantity), price-sorted so the cheapest listings surface first. Sweeping
+-- this every few seconds finds a new cheap listing within seconds of it being
+-- posted - unlike replicate, which is one snapshot per session. The book is
+-- learned from every sweep, and each row is checked against its own median.
+
+local function processBrowseRows(rows)
+    local mins, t = {}, time()
+    for _, r in ipairs(rows) do
+        local key = num(r.itemKey and r.itemKey.itemID)
+        local price = num(r.minPrice)
+        local qty = num(r.totalQuantity) or 0
+        if key and price and price > 0 then
+            mins[key] = price
+            local b = db.book[key]
+            if b and sampleCount(b.s) >= cfg.armAfter then
+                local med = medianOfSamples(b.s)
+                if med and med >= cfg.minUnit and price <= cfg.threshold * med then
+                    local line = cfg.threshold * med
+                    local cost = qty * price
+                    local est = math.floor(qty * med * (1 - cfg.cut) - cost)
+                    if not S.underLine or S.underLine[key] ~= true then
+                        S.underLine = S.underLine or {}
+                        S.underLine[key] = true
+                        fireAlert("market", key, nil, price, med,
+                            { units = qty, cost = cost, profit = est, line = line })
+                    end
+                elseif S.underLine and S.underLine[key] then
+                    S.underLine[key] = nil -- back above the line: re-arm the alert
+                end
+            end
+        end
+    end
+    if next(mins) then mergeIntoBook(mins, t) end
+end
+
+local function sweepQuery()
+    if not cfg.enabled or not S.ahOpen or S.sweeping then return end
+    if C_AuctionHouse == nil or C_AuctionHouse.SendBrowseQuery == nil then return end
+    if C_AuctionHouse.IsThrottledMessageSystemReady then
+        local ok, ready = pcall(C_AuctionHouse.IsThrottledMessageSystemReady)
+        if ok and ready == false then return end -- client is busy; next tick retries
+    end
+    local sorts = {}
+    if Enum and Enum.AuctionHouseSortOrder then
+        local so = Enum.AuctionHouseSortOrder.Price or Enum.AuctionHouseSortOrder.Buyout
+        if so then sorts = { { sortOrder = so, reverseSort = false } } end -- cheapest first
+    end
+    S.sweeping = true
+    local ok, e = pcall(C_AuctionHouse.SendBrowseQuery,
+        { searchString = "", sorts = sorts, filters = {}, itemClassFilters = {} })
+    if not ok then
+        S.sweeping = false
+        err("SendBrowseQuery", e)
+    end
+end
+
+local function startSweeping()
+    if S.sweepTicker or not cfg.enabled then return end
+    local period = math.max(tonumber(cfg.sweep) or 3, 2)
+    S.sweepTicker = C_Timer.NewTicker(period, sweepQuery)
+    after(1, sweepQuery)
+    dbg("live sweep armed: every " .. period .. "s")
+end
+
+local function stopSweeping()
+    if S.sweepTicker then
+        S.sweepTicker:Cancel()
+        S.sweepTicker = nil
+    end
+    S.sweeping = false
 end
 
 -- Events ---------------------------------------------------------------------------
@@ -965,26 +1061,43 @@ end)
 on("AUCTION_HOUSE_SHOW", function()
     S.ahOpen = true
     if cfg.enabled and C_AuctionHouse then
-        after(2, requestReplicate)
+        startSweeping()
+        after(2, requestReplicate) -- replicate is the book bootstrap, not the feed
     end
 end)
 
 on("AUCTION_HOUSE_CLOSED", function()
     S.ahOpen = false
     S.scanning = false
-    watchdog:Hide()
+    stopSweeping()
+    if S.harvestTicker then
+        S.harvestTicker:Cancel()
+        S.harvestTicker = nil
+    end
+end)
+
+on("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", function()
+    -- a fresh result set answers our sweep (or any manual search); read it
+    if S.sweeping and C_AuctionHouse.GetBrowseResults then
+        S.sweeping = false
+        local ok, rows = pcall(C_AuctionHouse.GetBrowseResults)
+        if ok and type(rows) == "table" then
+            processBrowseRows(rows)
+        elseif not ok then
+            err("GetBrowseResults", rows)
+        end
+    end
+end)
+
+on("AUCTION_HOUSE_BROWSE_RESULTS_ADDED", function()
+    -- pages appended after a manual "more results"; the sweep only reads page one
+    S.sweeping = false
 end)
 
 on("REPLICATE_ITEM_LIST_UPDATE", function()
+    dbg("REPLICATE_ITEM_LIST_UPDATE fired")
     completeScan("event")
 end, "REPLICATE_ITEM_LIST_UPDATED") -- Forever spells it UPDATE, retail UPDATED
-
-onOptional("AUCTION_HOUSE_REPLICATE_ITEM_RESPONSE", function()
-    -- Batches arriving: keep the watchdog's stability window reset. Absent on
-    -- some clients (Auctionator does not use it there); the watchdog's own
-    -- count-change detection covers the same signal.
-    watchdog.stable = 0
-end)
 
 -- Print the cheapest live listings for the last row clicked.
 local function printPending(kind)
@@ -1047,6 +1160,7 @@ local HELP = {
     "/fsn on | off         enable / disable scanning",
     "/fsn thresh 50        alert at or under 50% of learned market (default 50)",
     "/fsn every 45         seconds between scans while the AH is open (15-900)",
+    "/fsn sweep 3          seconds between live market sweeps (2-30)",
     "/fsn arm 2            scans of history before market alerts fire (1-10)",
     "/fsn min 10s          ignore deals under this per-unit price",
     "/fsn quality 2        market alerts need this rarity or better (0 any, 2 green+)",
@@ -1144,6 +1258,14 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             cfg.every = math.floor(v)
             printf("scanning every %ds while the AH is open.", cfg.every)
         else printf("usage: /fsn every 45  (seconds, 15-900)") end
+
+    elseif cmd == "sweep" then
+        local v = tonumber(rest)
+        if v and v >= 2 and v <= 30 then
+            cfg.sweep = math.floor(v)
+            if S.sweepTicker then stopSweeping(); startSweeping() end
+            printf("live sweep every %ds while the AH is open.", cfg.sweep)
+        else printf("usage: /fsn sweep 3  (seconds, 2-30)") end
 
     elseif cmd == "arm" then
         local v = tonumber(rest)
