@@ -1819,6 +1819,7 @@ local function nextCategory()
     return rotationList[rotationIndex]
 end
 
+if db.boughtAt == nil then db.boughtAt = S.boughtAt end -- one table, two views
 S.seen = db.seen or {}
 db.seen = S.seen
 -- prune stale entries at load: seen data older than an hour is meaningless
@@ -2130,6 +2131,8 @@ local function startSweeping()
     dbg("live sweep armed: category rotation every " .. period .. "s")
 end
 
+local stopRelisting -- forward: defined with the batch-relist block below
+
 local function stopSweeping()
     if S.sweepTicker then
         S.sweepTicker:Cancel()
@@ -2139,10 +2142,127 @@ local function stopSweeping()
         undercutTicker:Cancel()
         undercutTicker = nil
     end
+    stopRelisting()
     S.sweeping = false
     pagePending = false
 end
 
+
+-- BATCH RELIST (paced): /fsn relist posts every held flip at its smart
+-- price - one post per second plus jitter, deliberately human-paced. Same
+-- API class as the SELL button and the cancel cannon (PostItem is
+-- addon-callable by design); the pacing keeps the pattern organic.
+local relistTicker
+stopRelisting = function()
+    if relistTicker then relistTicker:Cancel() relistTicker = nil end
+end
+
+local function startRelisting(queue)
+    stopRelisting()
+    if #queue == 0 then
+        printf("nothing to relist - no priced holdings found in your bags.")
+        return
+    end
+    printf("relisting |cffffd100%d holding(s)|r - one per second, human-paced.", #queue)
+    local idx = 0
+    local period = 1.0
+    local function postNext()
+        idx = idx + 1
+        if idx > #queue or not S.ahOpen then
+            stopRelisting()
+            printf("relist done: %d posted.", idx - 1)
+            return
+        end
+        local itemID = queue[idx]
+        local b = db.book[itemID]
+        local med = b and freshMedian(b.s, time(), (cfg.freshMins or 45) * 60, cfg.armAfter) or nil
+        if med then
+            local isComm = false
+            if C_AuctionHouse and C_AuctionHouse.GetItemCommodityStatus then
+                local okC, st = pcall(C_AuctionHouse.GetItemCommodityStatus, itemID)
+                if okC then isComm = (st == true) end
+            end
+            local sp = smartPrice(itemID, med, isComm)
+            sellAt(itemID, sp)
+        end
+    end
+    postNext() -- the first goes immediately
+    relistTicker = C_Timer.NewTicker(period, postNext)
+end
+
+-- PORTFOLIO: the trader's unrealized book. Crosses bags (what you hold)
+-- with boughtAt (what you paid) and the live medians (what it's worth now),
+-- then advises per holding from the signals we already compute: rising trend
+-- + fast absorber = HOLD, sinking trend = SELL NOW, under water = flagged.
+local function holdingsSnapshot()
+    local rows = {}
+    if C_Container == nil or C_Container.GetContainerNumSlots == nil then return rows end
+    local t = time()
+    for bag = 0, 11 do
+        local n = C_Container.GetContainerNumSlots(bag)
+        if n and n > 0 then
+            for slot = 1, n do
+                local id = C_Container.GetContainerItemID(bag, slot)
+                if id and db.boughtAt[id] then
+                    local bought = db.boughtAt[id]
+                    local b = db.book[id]
+                    local med = b and freshMedian(b.s, t, (cfg.freshMins or 45) * 60, cfg.armAfter) or nil
+                    local qty = 1
+                    if C_Container.GetContainerItemInfo then
+                        local info = C_Container.GetContainerItemInfo(bag, slot)
+                        if type(info) == "table" and info.stackCount then qty = info.stackCount end
+                    end
+                    rows[#rows + 1] = { id = id, qty = qty, paid = bought.price or 0,
+                        boughtAt = bought.t or 0, med = med or nil }
+                end
+            end
+        end
+    end
+    return rows
+end
+
+local function printPortfolio()
+    local rows = holdingsSnapshot()
+    if #rows == 0 then
+        printf("no priced holdings in your bags - buy something first.")
+        return
+    end
+    local t = time()
+    local totalPaid, totalNow = 0, 0
+    printf("|cffffd100holdings|r - %d position(s):", #rows)
+    for _, h in ipairs(rows) do
+        local name = infoOf(h.id).name or ("item " .. h.id)
+        if h.med then
+            local unreal = (h.med - h.paid) * h.qty
+            totalPaid = totalPaid + h.paid * h.qty
+            totalNow = totalNow + h.med * h.qty
+            local tr = bookTrend(h.id)
+            local vel = absorbVelocity(h.id)
+            local advice
+            if h.med < h.paid then
+                advice = "|cffff4d4dUNDER WATER|r - market " .. fmtMoney(math.floor(h.med)) .. " below your " .. fmtMoney(h.paid)
+            elseif tr < -0.05 then
+                advice = "|cffff8800SELL NOW|r - market sinking, front the queue"
+            elseif tr > 0.05 and vel and vel < 120 then
+                advice = "|cff7cff4fHOLD|r - rising and hot, let it run"
+            elseif vel and vel > 600 then
+                advice = "|cff888888slow absorber - consider undercutting to exit|r"
+            else
+                advice = "|cff888888bank it - flat market|r"
+            end
+            printf("  |cffffd100%s|r x%d - paid %s, worth %s |cff7cff4f%s|r %s",
+                name, h.qty, fmtMoney(h.paid), fmtMoney(math.floor(h.med)), fmtMoney(unreal), advice)
+        else
+            totalPaid = totalPaid + h.paid * h.qty
+            printf("  |cffffd100%s|r x%d - paid %s |cff888888(no fresh market - relist to price it)|r",
+                name, h.qty, fmtMoney(h.paid))
+        end
+    end
+    local net = totalNow - totalPaid
+    printf("position: %s committed, |cffffd100%s|r current | %s %s unrealized",
+        fmtMoney(totalPaid), fmtMoney(totalNow),
+        net >= 0 and "|cff7cff4f+" or "|cffff4d4d", fmtMoney(net))
+end
 
 -- CANCEL CANNON: CancelAuction is addon-callable on this client (no hardware
 -- event required - TSM ships retail auto-cancel on the same API). One command
@@ -2264,6 +2384,16 @@ onOptional("MAIL_SHOW", function() scanMailbox() end)
 
 on("PLAYER_LOGIN", function()
     buildPopup()
+    -- the desktop app's overnight briefing (file-based, written while the game
+    -- was closed): print once, then clear so it never shows twice
+    if type(ForeverSniperBriefing) == "table" and ForeverSniperBriefing.lines
+        and #ForeverSniperBriefing.lines > 0 then
+        printf("|cffffd100overnight briefing|r (from ForeverDesktop):")
+        for _, l in ipairs(ForeverSniperBriefing.lines) do
+            printf("  |cffc8c8c8%s|r", tostring(l))
+        end
+        ForeverSniperBriefing = nil
+    end
     after(8, scanMailbox) -- sales that landed while offline
     if C_AuctionHouse == nil then
         printf("C_AuctionHouse is not on this client; going dormant.")
@@ -2545,10 +2675,12 @@ local HELP = {
     "|cffff7d0aForever Sniper|r - it watches, you buy",
     "|cffffd100core|r",
     "/fsn                  status",
+    "/fsn portfolio         holdings: paid vs worth, hold/sell advice",
     "/fsn feed             deal window (click a row = live prices, BUY = buy)",
     "/fsn profit           money printer stats (session + lifetime)",
     "/fsn undercut         guard your listings (alert when undercut)",
     "/fsn cancel           cancel every owned listing above market (relist front)",
+    "/fsn relist           post every held flip at its smart price (paced)",
     "/fsn options          settings panel",
     "/fsn page             scanner monitor window (toggle)",
     "/fsn on | off         enable / disable",
@@ -2805,6 +2937,33 @@ SlashCmdList.FOREVERSNIPER = function(msg)
     elseif cmd == "sound" then
         cfg.sound = not cfg.sound
         printf("alert sound %s.", cfg.sound and "on" or "off")
+
+    elseif cmd == "relist" then
+        if not S.ahOpen then printf("open the AH first.") return end
+        if C_Container == nil or C_Container.GetContainerNumSlots == nil then
+            printf("this client cannot scan bags.") return
+        end
+        local queue, seen = {}, {}
+        local t = time()
+        for bag = 0, 11 do
+            local n = C_Container.GetContainerNumSlots(bag)
+            if n and n > 0 then
+                for slot = 1, n do
+                    local id = C_Container.GetContainerItemID(bag, slot)
+                    if id and not seen[id] then
+                        seen[id] = true
+                        local b = db.book[id]
+                        if b and freshMedian(b.s, t, (cfg.freshMins or 45) * 60, cfg.armAfter) then
+                            queue[#queue + 1] = id
+                        end
+                    end
+                end
+            end
+        end
+        startRelisting(queue)
+
+    elseif cmd == "portfolio" then
+        printPortfolio()
 
     elseif cmd == "cancel" then
         if not S.ahOpen then printf("open the AH first.") return end
