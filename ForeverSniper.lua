@@ -54,6 +54,7 @@ local DEFAULTS = {
     toast     = true,    -- slide-in toast notification on deals
     quiet     = false,   -- suppress per-scan summaries
     scanPage  = true,    -- auto-show the scanner monitor when the AH opens
+    avoidBrowse = true, -- auto-switch the AH off the Browse tab so sweeps run
 }
 
 ForeverSniperDB = ForeverSniperDB or {}
@@ -787,6 +788,7 @@ local function sellAt(itemID, unitPrice)
     printf("could not list: %s", tostring(e):sub(1, 160))
     return false
 end
+
 
 -- WoWSniper-parity alerts: tiers, sound, flash, toast, and a deal feed -----
 -- Deal depth tiers (WoWSniper's model): SNIPE = forgot a zero, GREAT = heavy
@@ -1602,6 +1604,28 @@ local function blizzardBrowseActive()
     return false
 end
 
+-- the AH opens on the Browse tab by default, and sweeping under it risks the
+-- client's ScrollBox crash - so land somewhere else instead of yielding.
+-- Tab 1 is Browse on this client family (Auctionator's LibAHTab relies on the
+-- same AuctionHouseFrame.Tabs layout); clicking any other tab clears it.
+local function avoidBrowseTab()
+    if not cfg.avoidBrowse or not S.ahOpen then return end
+    local ahf = AuctionHouseFrame
+    if not (ahf and ahf.Tabs) then return end
+    if not blizzardBrowseActive() then return end -- already on another page
+    for i = 2, #ahf.Tabs do
+        local tab = ahf.Tabs[i]
+        if tab then
+            local ok = pcall(function() tab:Click() end)
+            if ok then
+                printf("switched the AH off the Browse tab - the live sweep needs a clear page.")
+                updateScanPage()
+                return
+            end
+        end
+    end
+end
+
 local function canQuery()
     if not cfg.enabled or not S.ahOpen then return false end
     if pagePending or not throttleReady then return false end
@@ -1614,6 +1638,14 @@ local function canQuery()
 end
 
 local function processBrowseRows(rows)
+    S.gateLog = { at = time(), counts = {}, examples = {} }
+    local function why(reason, itemID, extra)
+        S.gateLog.counts[reason] = (S.gateLog.counts[reason] or 0) + 1
+        if #S.gateLog.examples < 6 and itemID then
+            S.gateLog.examples[#S.gateLog.examples + 1] =
+                (infoOf(itemID).name or ("item " .. itemID)) .. ": " .. reason .. (extra or "")
+        end
+    end
     local mins, t = {}, time()
     for _, r in ipairs(rows) do
         local key = num(r.itemKey and r.itemKey.itemID)
@@ -1625,6 +1657,11 @@ local function processBrowseRows(rows)
             -- instant profit. No market gates apply - the vendor always buys.
             local sell = vendorOf(key)
             dbg("vendor check id=" .. tostring(key) .. " price=" .. tostring(price) .. " sell=" .. tostring(sell))
+            if sell > 0 and price < sell then
+                if not isNewListing(key, price, true) then
+                    why("already seen (vendor flip)", key)
+                end
+            end
             if sell > 0 and price < sell and isNewListing(key, price) then
                 local est = (sell - price) * qty
                 fireAlert("vendor", key, nil, price, sell,
@@ -1633,6 +1670,17 @@ local function processBrowseRows(rows)
             local b = db.book[key]
             if b then
                 local med = freshMedian(b.s, t, (cfg.freshMins or 45) * 60, cfg.armAfter)
+                if not med then
+                    if (S.gateLog.counts["no fresh median"] or 0) < 3 then
+                        why("no fresh median yet", key)
+                    end
+                elseif med < cfg.minUnit then
+                    why("market under floor", key)
+                elseif price > cfg.threshold * med then
+                    if (S.gateLog.counts["not cheap enough"] or 0) < 3 then
+                        why("not cheap enough", key, " (" .. fmtMoney(price) .. " vs market " .. fmtMoney(math.floor(med)) .. ")")
+                    end
+                end
                 if med and med >= cfg.minUnit and price <= cfg.threshold * med then
                     -- listability gates: verifiable quality (uncached items get a
                     -- load request and pass on the NEXT sweep - the client caches
@@ -1815,6 +1863,7 @@ on("AUCTION_HOUSE_SHOW", function()
     S.ahOpen = true
     S.warnedBrowse = nil -- the yield hint fires once per AH session
     if cfg.scanPage then buildScanPage() scanPage:Show() updateScanPage() end
+    after(0.5, avoidBrowseTab) -- let the frame settle on Browse, then move off it
     if cfg.enabled and C_AuctionHouse then
         startSweeping()
         after(2, requestReplicate) -- replicate is the book bootstrap, not the feed
@@ -2230,6 +2279,20 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             cfg.cut = v / 100
             printf("assuming a %d%% AH cut when estimating profit.", v)
         else printf("usage: /fsn cut 5  (percent, 0-20)") end
+
+    elseif cmd == "why" then
+        local g = S.gateLog
+        if not g or not g.at or time() - g.at > 300 then
+            printf("no recent sweep data - open the AH and wait a few seconds.")
+        else
+            printf("last sweep %ds ago decided:", time() - g.at)
+            for reason, n in pairs(g.counts) do
+                printf("  |cffffd100%dx|r %s", n, reason)
+            end
+            for _, ex in ipairs(g.examples) do
+                printf("  e.g. %s", ex)
+            end
+        end
 
     elseif cmd == "profit" then
         local v = parseMoney(rest)
