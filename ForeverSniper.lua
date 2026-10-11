@@ -703,6 +703,85 @@ local function buildPopup()
     end
 end
 
+-- relist assistant: find bought flips in the bags and post them at the
+-- learned market - one SELL click, no sell-tab fiddling ---------------------
+-- Post mechanics live-proven by Auctionator on this client:
+--   C_AuctionHouse.PostItem(itemLocation, duration, quantity, buyout)
+--   C_AuctionHouse.PostCommodity(itemLocation, duration, quantity, unitPrice)
+
+local function findInBags(itemID)
+    if C_Container == nil or C_Container.GetContainerNumSlots == nil then return nil end
+    for bag = 0, 11 do
+        local n = C_Container.GetContainerNumSlots(bag)
+        if n and n > 0 then
+            for slot = 1, n do
+                local id = C_Container.GetContainerItemID(bag, slot)
+                if id == itemID then
+                    local qty = 1
+                    if C_Container.GetContainerItemInfo then
+                        local info = C_Container.GetContainerItemInfo(bag, slot)
+                        if type(info) == "table" and info.stackCount then
+                            qty = info.stackCount
+                        elseif type(info) == "number" then
+                            qty = info -- some builds return count directly
+                        end
+                    end
+                    return bag, slot, qty
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- post one listing of every unit we hold of itemID at unitPrice; returns ok
+local function sellAt(itemID, unitPrice)
+    if not S.ahOpen then
+        printf("open the Auction House first - selling needs the window up.")
+        return false
+    end
+    if C_AuctionHouse == nil or C_AuctionHouse.PostItem == nil then return false end
+    unitPrice = math.floor(num(unitPrice) or 0)
+    if unitPrice <= 0 then return false end
+    local bag, slot, qty = findInBags(itemID)
+    if bag == nil then
+        local info = infoOf(itemID)
+        printf("%s is not in your bags - nothing to list.", info.name or ("item " .. itemID))
+        return false
+    end
+    local loc = ItemLocation and ItemLocation.CreateFromBagAndSlot(bag, slot)
+    if loc == nil then return false end
+    if C_AuctionHouse.IsSellItemValid then
+        local okV, valid = pcall(C_AuctionHouse.IsSellItemValid, loc)
+        if okV and valid == false then
+            printf("%s cannot be sold on the AH (soulbound?). Vendor it.",
+                infoOf(itemID).name or ("item " .. itemID))
+            return false
+        end
+    end
+    local isCommodity = false
+    if C_AuctionHouse.GetItemCommodityStatus then
+        local okC, st = pcall(C_AuctionHouse.GetItemCommodityStatus, itemID)
+        if okC then isCommodity = (st == true) end
+    end
+    local ok, e
+    if isCommodity and C_AuctionHouse.PostCommodity then
+        ok, e = pcall(C_AuctionHouse.PostCommodity, loc, 3, qty, unitPrice)
+    else
+        ok, e = pcall(C_AuctionHouse.PostItem, loc, 3, qty, unitPrice * qty)
+    end
+    if ok then
+        printf("listed |cffffd100%d x %s|r at |cffffd100%s each|r (%s total) - 48h.",
+            qty, infoOf(itemID).name or ("item " .. itemID),
+            fmtMoney(unitPrice), fmtMoney(unitPrice * qty))
+        S.session.listed = (S.session.listed or 0) + 1
+        return true
+    end
+    err(isCommodity and "PostCommodity" or "PostItem", e)
+    printf("could not list: %s", tostring(e):sub(1, 160))
+    return false
+end
+
 -- WoWSniper-parity alerts: tiers, sound, flash, toast, and a deal feed -----
 -- Deal depth tiers (WoWSniper's model): SNIPE = forgot a zero, GREAT = heavy
 -- underprice, GOOD = solid. Sound, screen flash and toast fire per tier, and
@@ -787,8 +866,11 @@ local function showToast(tier, itemID, price, market, profit)
     local c = t and string.format("|cff%02x%02x%02x",
         math.floor((t.r * 255) + 0.5), math.floor((t.g * 255) + 0.5), math.floor((t.b * 255) + 0.5)) or "|cffffd100"
     toastFrame.title:SetText(c .. (tier or "DEAL") .. "|r " .. name)
+    local actionText = "relist on the AH"
+    if tier == "VENDOR" then actionText = "VENDOR it - instant"
+    elseif market and market > 0 then actionText = "AH at " .. fmtMoney(math.floor(market)) end
     toastFrame.detail:SetText(fmtMoney(price) .. "  market " .. fmtMoney(market or 0)
-        .. "  |cff44cc44+" .. fmtMoney(profit or 0) .. "|r")
+        .. "  |cff44cc44+" .. fmtMoney(profit or 0) .. "|r\n|cffffd100> " .. actionText .. "|r")
     toastFrame:Show()
     if toastFrame.hideTimer then toastFrame.hideTimer:Cancel() end
     toastFrame.hideTimer = C_Timer.NewTimer(5, function() toastFrame:Hide() end)
@@ -834,6 +916,14 @@ local function refreshFeed()
             end
             row.newBadge:SetShown(d.isNew == true)
             row.itemID, row.link, row.line, row.market2 = d.id, d.link, d.line, d.market
+            -- the action label: what to DO with this deal
+            if d.tier == "VENDOR" then
+                row.action:SetText("|cffffd100VENDOR|r")
+            elseif d.market and d.market > 0 then
+                row.action:SetText("|cff7cff4fAH " .. fmtMoney(math.floor(d.market)) .. "|r")
+            else
+                row.action:SetText("|cff9d9d9dwatch|r")
+            end
             row.buyBtn:SetShown(not d.bought)
             if d.bought then row.name:SetTextColor(0.5, 0.5, 0.5) else row.name:SetTextColor(1, 1, 1) end
             row:Show()
@@ -915,7 +1005,6 @@ local function buildFeed()
     closeBtn.fs:SetTextColor(0.9, 0.9, 0.9)
     closeBtn:SetScript("OnClick", function() feedFrame:Hide() end)
 
-    -- column headers
     local function col(x, w, label, right)
         local h = feedFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
         h:SetPoint("LEFT", x, 0) h:SetWidth(w or 60)
@@ -923,12 +1012,13 @@ local function buildFeed()
         h:SetTextColor(0.55, 0.55, 0.6)
         h:SetText(label)
     end
-    col(60, 220, "item")
-    col(285, 70, "price", true)
-    col(358, 70, "market", true)
-    col(430, 42, "off", true)
-    col(474, 40, "tier")
-    col(516, 60, "profit", true)
+    col(60, 200, "item")
+    col(265, 65, "price", true)
+    col(333, 65, "market", true)
+    col(402, 38, "off", true)
+    col(443, 36, "tier")
+    col(481, 58, "profit", true)
+    col(541, 60, "action", true)
 
     feedRows = {}
     for i = 1, FEED_ROWS do
@@ -943,20 +1033,33 @@ local function buildFeed()
         row.newBadge = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
         row.newBadge:SetPoint("LEFT", 26, 0) row.newBadge:SetText("|cffff4444NEW|r")
         row.name = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        row.name:SetPoint("LEFT", 60, 0) row.name:SetWidth(220)
+        row.name:SetPoint("LEFT", 60, 0) row.name:SetWidth(200)
         row.name:SetJustifyH("LEFT") row.name:SetWordWrap(false)
         row.price = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.price:SetPoint("LEFT", 285, 0) row.price:SetWidth(70) row.price:SetJustifyH("RIGHT")
+        row.price:SetPoint("LEFT", 265, 0) row.price:SetWidth(65) row.price:SetJustifyH("RIGHT")
         row.market = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.market:SetPoint("LEFT", 358, 0) row.market:SetWidth(70) row.market:SetJustifyH("RIGHT")
+        row.market:SetPoint("LEFT", 333, 0) row.market:SetWidth(65) row.market:SetJustifyH("RIGHT")
         row.pct = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.pct:SetPoint("LEFT", 430, 0) row.pct:SetWidth(42) row.pct:SetJustifyH("CENTER")
+        row.pct:SetPoint("LEFT", 402, 0) row.pct:SetWidth(38) row.pct:SetJustifyH("CENTER")
         row.tier = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.tier:SetPoint("LEFT", 474, 0) row.tier:SetWidth(40)
+        row.tier:SetPoint("LEFT", 443, 0) row.tier:SetWidth(36)
         row.profit = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.profit:SetPoint("LEFT", 516, 0) row.profit:SetWidth(60) row.profit:SetJustifyH("RIGHT")
+        row.profit:SetPoint("LEFT", 481, 0) row.profit:SetWidth(58) row.profit:SetJustifyH("RIGHT")
+        row.action = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.action:SetPoint("RIGHT", -104, 0) row.action:SetWidth(86) row.action:SetJustifyH("RIGHT")
+        row.sellBtn = CreateFrame("Button", nil, row)
+        row.sellBtn:SetSize(40, 18) row.sellBtn:SetPoint("RIGHT", -50, 0)
+        local sbg = row.sellBtn:CreateTexture(nil, "BACKGROUND")
+        sbg:SetAllPoints() sbg:SetColorTexture(0.15, 0.25, 0.45, 0.9)
+        row.sellBtn.fs = row.sellBtn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.sellBtn.fs:SetAllPoints() row.sellBtn.fs:SetText("SELL")
+        row.sellBtn.fs:SetTextColor(0.55, 0.75, 1)
+        row.sellBtn:SetScript("OnClick", function(self)
+            local r = self:GetParent()
+            if r.itemID and r.market2 then sellAt(r.itemID, r.market2) end
+        end)
         row.buyBtn = CreateFrame("Button", nil, row)
-        row.buyBtn:SetSize(42, 18) row.buyBtn:SetPoint("RIGHT", -2, 0)
+        row.buyBtn:SetSize(40, 18) row.buyBtn:SetPoint("RIGHT", -6, 0)
         local bbg = row.buyBtn:CreateTexture(nil, "BACKGROUND")
         bbg:SetAllPoints() bbg:SetColorTexture(0.15, 0.4, 0.15, 0.9)
         row.buyBtn.fs = row.buyBtn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
@@ -966,7 +1069,6 @@ local function buildFeed()
             local r = self:GetParent()
             if r.itemID and r.line then buySweep(r.itemID, r.link, r.line, r.market2) end
         end)
-        -- click the row itself: live price check in chat
         row:SetScript("OnClick", function(self)
             if self.itemID then searchListing(self.itemID, self.link, nil) end
         end)
@@ -981,65 +1083,6 @@ local function buildFeed()
     feedStatus:SetTextColor(0.55, 0.55, 0.6)
     feedStatus:SetText("|cff888888waiting for the first sweep...|r")
 end
-local function buildFeed()
-    if feedFrame then return end
-    feedFrame = CreateFrame("Frame", "ForeverSniperFeed", UIParent)
-    feedFrame:SetSize(FEED_W, 34 + FEED_ROWS * FEED_ROW_H + 8)
-    feedFrame:SetPoint("LEFT", UIParent, "LEFT", 16, 0)
-    feedFrame:SetMovable(true)
-    feedFrame:EnableMouse(true)
-    feedFrame:RegisterForDrag("LeftButton")
-    feedFrame:SetScript("OnDragStart", feedFrame.StartMoving)
-    feedFrame:SetScript("OnDragStop", feedFrame.StopMovingOrSizing)
-    local bg = feedFrame:CreateTexture(nil, "BACKGROUND")
-    bg:SetAllPoints() bg:SetColorTexture(0.05, 0.05, 0.07, 0.97)
-    local title = feedFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    title:SetPoint("TOPLEFT", 10, -8)
-    title:SetText("|cffff7d0aForever Sniper|r - deals (profit first)")
-    local closeBtn = CreateFrame("Button", nil, feedFrame, "UIPanelButtonTemplate")
-    closeBtn:SetSize(52, 18) closeBtn:SetPoint("TOPRIGHT", -6, -6)
-    closeBtn:SetText("Close")
-    closeBtn:SetScript("OnClick", function() feedFrame:Hide() end)
-    feedRows = {}
-    for i = 1, FEED_ROWS do
-        local row = CreateFrame("Button", nil, feedFrame)
-        row:SetSize(FEED_W - 16, FEED_ROW_H)
-        row:SetPoint("TOPLEFT", feedFrame, "TOPLEFT", 8, -30 - (i - 1) * FEED_ROW_H)
-        local rbg = row:CreateTexture(nil, "BACKGROUND")
-        rbg:SetAllPoints() rbg:SetColorTexture(0.07, 0.07, 0.10, 0.5)
-        row.icon = row:CreateTexture(nil, "ARTWORK")
-        row.icon:SetSize(20, 20) row.icon:SetPoint("LEFT", 2, 0)
-        row.newBadge = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.newBadge:SetPoint("LEFT", 26, 0) row.newBadge:SetText("|cffff4444NEW|r")
-        row.name = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        row.name:SetPoint("LEFT", 60, 0) row.name:SetWidth(220)
-        row.name:SetJustifyH("LEFT") row.name:SetWordWrap(false)
-        row.price = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.price:SetPoint("LEFT", 285, 0) row.price:SetWidth(70) row.price:SetJustifyH("RIGHT")
-        row.market = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.market:SetPoint("LEFT", 358, 0) row.market:SetWidth(70) row.market:SetJustifyH("RIGHT")
-        row.pct = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.pct:SetPoint("LEFT", 430, 0) row.pct:SetWidth(42) row.pct:SetJustifyH("CENTER")
-        row.tier = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.tier:SetPoint("LEFT", 470, 0) row.tier:SetWidth(46)
-        row.profit = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.profit:SetPoint("LEFT", 470, 0) row.profit:SetWidth(80) row.profit:SetJustifyH("RIGHT")
-        row.buyBtn = CreateFrame("Button", nil, row)
-        row.buyBtn:SetSize(42, 18) row.buyBtn:SetPoint("RIGHT", -2, 0)
-        local bbg = row.buyBtn:CreateTexture(nil, "BACKGROUND")
-        bbg:SetAllPoints() bbg:SetColorTexture(0.15, 0.4, 0.15, 0.9)
-        row.buyBtn.fs = row.buyBtn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        row.buyBtn.fs:SetAllPoints() row.buyBtn.fs:SetText("BUY")
-        row.buyBtn.fs:SetTextColor(0.3, 1, 0.3)
-        row.buyBtn:SetScript("OnClick", function(self)
-            local r = self:GetParent()
-            if r.itemID and r.line then buySweep(r.itemID, r.link, r.line, r.market2) end
-        end)
-        row:Hide()
-        feedRows[i] = row
-    end
-end
-
 local function alertDeal(tier, itemID, link, unit, market, sweep, isNew)
     playTierSound(tier)
     flashScreen(tier)
@@ -1075,17 +1118,26 @@ local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
     })
 
     local label = link or (infoOf(itemID).name) or ("item " .. tostring(itemID))
+    -- the action label: every deal says what to DO with it
+    local action
+    if kind == "vendor" then
+        action = "|cffffd100VENDOR it|r - instant, no relist"
+    elseif market and market > 0 then
+        action = "|cffffd100relist on the AH at " .. fmtMoney(math.floor(market)) .. "|r"
+    else
+        action = "|cff9d9d9dyour watch rule|r"
+    end
     if market and market > 0 then
         if sweep.units > 1 then
             printf("|cffff4d00DEAL|r %s - |cffffd100%d units|r under %s: |cffffd100%s total|r (avg %s, market %s) |cff7cff4f+%s profit|r",
                 label, sweep.units, fmtMoney(math.floor(sweep.cost / sweep.units + 0.5)),
                 fmtMoney(sweep.cost), fmtMoney(math.floor(sweep.cost / sweep.units + 0.5)),
-                fmtMoney(market), fmtMoney(sweep.profit or 0))
+                fmtMoney(market), fmtMoney(sweep.profit or 0), action)
         else
             printf("|cffff4d00DEAL|r %s - %s  (market %s, |cff7cff4f-%d%%|r, |cff7cff4f+%s|r)",
                 label, fmtMoney(unit), fmtMoney(market),
                 math.floor((1 - unit / market) * 100 + 0.5),
-                fmtMoney(math.floor(market * (1 - cfg.cut) - unit)))
+                fmtMoney(math.floor(market * (1 - cfg.cut) - unit)), action)
         end
     else
         if sweep.units > 1 then
@@ -2229,4 +2281,5 @@ SlashCmdList.FOREVERSNIPER = function(msg)
         printf("unknown command %q. /fsn help", cmd)
     end
 end
+
 
