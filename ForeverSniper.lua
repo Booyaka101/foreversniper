@@ -726,18 +726,35 @@ local function completeScan(reason)
     local depth = {}     -- itemID -> { {unit=, count=}, ... } every priced listing
     local cands = {}     -- new listings this scan (details for the alert pass)
 
+    -- Layout: the Forever client returns [3]=count, [10]=buyout, [17]=itemID,
+    -- [18]=loaded-flag, link via GetReplicateItemLink (Auctionator's live-proven
+    -- positions on this client); retail lineage is 1=itemID, 7=count, 8=link,
+    -- 9=quality, 14=buyout. Detect once from row 1, parse accordingly.
+    local foreverLayout = false
+    do
+        local okP, q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18 =
+            pcall(C_AuctionHouse.GetReplicateItemInfo, 1)
+        if okP and num(q17) and num(q17) > 0 then foreverLayout = true end
+    end
+
     for i = 1, n do
-        local ok, a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14 =
+        local ok, a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,a16,a17,a18 =
             pcall(C_AuctionHouse.GetReplicateItemInfo, i)
         if not ok then
             err("replicate:" .. i, a1)
         else
-            -- Retail-lineage positions: 1 itemID, 7 count, 8 link, 9 quality, 14 buyout.
-            local itemID = num(a1)
-            local count = num(a7)
-            local link = type(a8) == "string" and a8 or nil
-            local quality = num(a9)
-            local buyout = num(a14)
+            local itemID, count, buyout, link, quality
+            if foreverLayout then
+                itemID, count, buyout = num(a17), num(a3), num(a10)
+                if C_AuctionHouse.GetReplicateItemLink then
+                    local okL, l = pcall(C_AuctionHouse.GetReplicateItemLink, i)
+                    if okL and type(l) == "string" then link = l end
+                end
+                -- no quality field in this layout; the alert filter tolerates nil
+            else
+                itemID, count, buyout, quality = num(a1), num(a7), num(a14), num(a9)
+                link = type(a8) == "string" and a8 or nil
+            end
             if itemID and itemID > 0 and count and count >= 1 and buyout and buyout > 0 then
                 local unit = math.floor(buyout / count)
                 local mk = tostring(itemID) .. "/" .. count .. "/" .. buyout
@@ -906,11 +923,23 @@ local f = CreateFrame("Frame")
 local handlers = {}
 local unknownEvents = {}
 
-local function on(event, fn)
+-- Register a handler; altEvent is a fallback name for clients that spell the
+-- event differently (the Forever client fires REPLICATE_ITEM_LIST_UPDATE,
+-- retail fires REPLICATE_ITEM_LIST_UPDATED — one letter cost the whole scan loop)
+local function on(event, fn, altEvent)
     handlers[event] = fn
-    if not pcall(f.RegisterEvent, f, event) then
-        unknownEvents[#unknownEvents + 1] = event
+    if pcall(f.RegisterEvent, f, event) then return end
+    if altEvent and pcall(f.RegisterEvent, f, altEvent) then
+        handlers[altEvent] = fn
+        return
     end
+    unknownEvents[#unknownEvents + 1] = event
+end
+
+-- Optional handler: register if this client has the event, stay silent if not
+local function onOptional(event, fn)
+    handlers[event] = fn
+    pcall(f.RegisterEvent, f, event)
 end
 
 f:SetScript("OnEvent", function(_, event, ...)
@@ -946,12 +975,14 @@ on("AUCTION_HOUSE_CLOSED", function()
     watchdog:Hide()
 end)
 
-on("REPLICATE_ITEM_LIST_UPDATED", function()
+on("REPLICATE_ITEM_LIST_UPDATE", function()
     completeScan("event")
-end)
+end, "REPLICATE_ITEM_LIST_UPDATED") -- Forever spells it UPDATE, retail UPDATED
 
-on("AUCTION_HOUSE_REPLICATE_ITEM_RESPONSE", function()
-    -- Batches arriving: keep the watchdog's stability window reset.
+onOptional("AUCTION_HOUSE_REPLICATE_ITEM_RESPONSE", function()
+    -- Batches arriving: keep the watchdog's stability window reset. Absent on
+    -- some clients (Auctionator does not use it there); the watchdog's own
+    -- count-change detection covers the same signal.
     watchdog.stable = 0
 end)
 
