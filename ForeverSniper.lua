@@ -40,6 +40,8 @@ local DEFAULTS = {
     threshold = 0.50,    -- deal if unit price <= 50% of learned market
     every     = 45,      -- seconds between full scans while the AH is open
     sweep     = 3,       -- seconds between live browse sweeps (the sniper feed)
+    freshMins = 45,      -- market age: older price samples do not arm alerts
+    overhang  = 500,     -- max competing units above the deal; more = slow flip (0 = off)
     armAfter  = 2,       -- learned samples required before market alerts fire
     minUnit   = 1000,    -- ignore deals under 10s per unit (vendor-junk floor)
     quality   = 1,       -- market alerts need this quality or better (0 = any)
@@ -174,6 +176,33 @@ local function medianOfSamples(s)
 end
 
 local function sampleCount(s) return math.floor(#s / 2) end
+
+-- Median over FRESH samples only: a price seen an hour ago is not a market you
+-- can list into today. Returns nil when fewer than `need` fresh samples exist.
+local function freshMedian(s, now, maxAge, need)
+    local vals, n = {}, 0
+    for i = 1, #s - 1, 2 do
+        if now - s[i] <= maxAge then
+            n = n + 1
+            vals[n] = s[i + 1]
+        end
+    end
+    if n < need then return nil end
+    table.sort(vals)
+    if n % 2 == 1 then return vals[(n + 1) / 2] end
+    return (vals[n / 2] + vals[n / 2 + 1]) / 2
+end
+
+-- Listability: an item we cannot verify as sellable (quality unknown or below
+-- the bar) never alerts. Quality comes from GetItemInfo, cached per item.
+local qualityCache = {}
+local function qualityOf(itemID)
+    if qualityCache[itemID] ~= nil then return qualityCache[itemID] end
+    local ok, _, _, q = pcall(GetItemInfo, itemID)
+    local res = (ok and type(q) == "number") and q or -1
+    qualityCache[itemID] = res
+    return res
+end
 
 local function mergeIntoBook(curMins, t)
     local bookN = countKeys(db.book)
@@ -765,13 +794,24 @@ local function completeScan(reason)
     local deals = 0
     if not firstScan then
         for _, c in ipairs(cands) do
-            if not db.blacklist[c.id] and c.unit >= cfg.minUnit
-                and (c.q == nil or c.q >= cfg.quality) then
+            if not db.blacklist[c.id] and c.unit >= cfg.minUnit then
                 local b = db.book[c.id]
-                if b and sampleCount(b.s) >= cfg.armAfter then
-                    local med = medianOfSamples(b.s)
-                    if med and med >= cfg.minUnit and c.unit <= cfg.threshold * med then
-                        local line = cfg.threshold * med
+                local med = b and freshMedian(b.s, t, (cfg.freshMins or 45) * 60, cfg.armAfter) or nil
+                if med and med >= cfg.minUnit and c.unit <= cfg.threshold * med then
+                    local line = cfg.threshold * med
+                    -- exact overhang: units listed ABOVE the deal line queue
+                    -- ahead of the relist; too many means a slow flip
+                    local overhangUnits = 0
+                    for _, L in ipairs(depth[c.id] or {}) do
+                        if L.unit > line then overhangUnits = overhangUnits + L.count end
+                    end
+                    local q = qualityOf(c.id)
+                    local maxOver = cfg.overhang or 0
+                    if q < (cfg.quality or 1) then
+                        dbg("skip " .. c.id .. ": quality " .. q .. " below bar, not a clean relist")
+                    elseif maxOver > 0 and overhangUnits > maxOver then
+                        dbg("skip " .. c.id .. ": " .. overhangUnits .. " units sit above the line, relist would queue")
+                    else
                         local units, cost = 0, 0
                         for _, L in ipairs(depth[c.id] or {}) do
                             if L.unit <= line then
@@ -965,19 +1005,31 @@ local function processBrowseRows(rows)
         if key and price and price > 0 then
             mins[key] = price
             local b = db.book[key]
-            if b and sampleCount(b.s) >= cfg.armAfter then
-                local med = medianOfSamples(b.s)
+            if b then
+                local med = freshMedian(b.s, t, (cfg.freshMins or 45) * 60, cfg.armAfter)
                 if med and med >= cfg.minUnit and price <= cfg.threshold * med then
-                    local line = cfg.threshold * med
-                    local cost = qty * price
-                    local est = math.floor(qty * med * (1 - cfg.cut) - cost)
-                    if not S.underLine or S.underLine[key] ~= true then
-                        S.underLine = S.underLine or {}
-                        S.underLine[key] = true
-                        fireAlert("market", key, nil, price, med,
-                            { units = qty, cost = cost, profit = est, line = line })
+                    -- listability gates: verifiable quality, and a market that
+                    -- is not buried under a mountain of competing stock
+                    local q = qualityOf(key)
+                    local overhang = cfg.overhang or 0
+                    local crowded = overhang > 0 and qty > overhang
+                    if q < (cfg.quality or 1) then
+                        dbg("skip " .. key .. ": quality " .. q .. " below bar, not a clean relist")
+                    elseif crowded then
+                        dbg("skip " .. key .. ": " .. qty .. " units listed, relist would queue behind them")
+                    else
+                        local line = cfg.threshold * med
+                        local cost = qty * price
+                        local est = math.floor(qty * med * (1 - cfg.cut) - cost)
+                        if not S.underLine or S.underLine[key] ~= true then
+                            S.underLine = S.underLine or {}
+                            S.underLine[key] = true
+                            fireAlert("market", key, nil, price, med,
+                                { units = qty, cost = cost, profit = est, line = line })
+                        end
                     end
-                elseif S.underLine and S.underLine[key] then
+                elseif S.underLine and S.underLine[key]
+                    and (not med or price > cfg.threshold * med) then
                     S.underLine[key] = nil -- back above the line: re-arm the alert
                 end
             end
@@ -1176,6 +1228,8 @@ local HELP = {
     "/fsn thresh 50        alert at or under 50% of learned market (default 50)",
     "/fsn every 45         seconds between scans while the AH is open (15-900)",
     "/fsn sweep 3          seconds between live market sweeps (2-30)",
+    "/fsn fresh 45         minutes a price sample stays fresh enough to arm alerts (5-480)",
+    "/fsn overhang 500     skip deals with more units listed above them (0 = off)",
     "/fsn arm 2            scans of history before market alerts fire (1-10)",
     "/fsn min 10s          ignore deals under this per-unit price",
     "/fsn quality 2        market alerts need this rarity or better (0 any, 2 green+)",
@@ -1281,6 +1335,24 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             if S.sweepTicker then stopSweeping(); startSweeping() end
             printf("live sweep every %ds while the AH is open.", cfg.sweep)
         else printf("usage: /fsn sweep 3  (seconds, 2-30)") end
+
+    elseif cmd == "fresh" then
+        local v = tonumber(rest)
+        if v and v >= 5 and v <= 480 then
+            cfg.freshMins = math.floor(v)
+            printf("market samples older than %d min no longer arm alerts.", cfg.freshMins)
+        else printf("usage: /fsn fresh 45  (minutes, 5-480)") end
+
+    elseif cmd == "overhang" then
+        local v = tonumber(rest)
+        if v and v >= 0 and v <= 100000 then
+            cfg.overhang = math.floor(v)
+            if cfg.overhang == 0 then
+                printf("overhang gate off: alerts fire regardless of competing stock.")
+            else
+                printf("alerts skip items with more than %d units listed above the deal.", cfg.overhang)
+            end
+        else printf("usage: /fsn overhang 500  (units, 0 = off)") end
 
     elseif cmd == "arm" then
         local v = tonumber(rest)
