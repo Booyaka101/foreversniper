@@ -416,7 +416,7 @@ local S = {
     buying     = nil,   -- { itemID, link, line, market, commodity, t } active Buy click
     quote      = nil,   -- { itemID, units, total } live commodity quote
     boughtAt   = db.boughtAt or {}, -- itemID -> { t, price } purchase cooldown (persistent)
-    session    = { started = time(), spent = 0, buys = 0, best = nil }, -- money printer P&L
+    session    = { started = time(), spent = 0, buys = 0, best = nil, realized = 0 }, -- money printer P&L
 }
 
 -- Watchlist: split into fast lookups, rebuilt before each scan uses them.
@@ -2078,6 +2078,40 @@ local function onOwnedAuctionsUpdated()
     end
 end
 
+-- MAILBOX MINT (dark sauce): sold-auction mail carries the invoice - exact
+-- deposit paid, AH cut taken, real sale price. Crossed with what we PAID
+-- (boughtAt), this closes the P&L loop with realized profit, the number
+-- every other sniper guesses at.
+local function scanMailbox()
+    if GetInboxNumItems == nil then return end
+    local okN, n = pcall(GetInboxNumItems)
+    n = okN and math.floor(num(n) or 0) or 0
+    if n == 0 then return end
+    local t = time()
+    for i = 1, n do
+        -- invoice data only exists on auction-sold mail
+        if GetInboxInvoiceInfo then
+            local okI, invoiceType, itemName, quantity, invoiceAmount, deposit, consignment =
+                pcall(GetInboxInvoiceInfo, i)
+            if okI and invoiceType == "seller" and invoiceAmount then
+                local key = S.mailSeen and S.mailSeen[i] -- dedupe by slot+amount
+                local totalReceived = invoiceAmount + (deposit or 0) - (consignment or 0)
+                local sig = tostring(i) .. ":" .. tostring(totalReceived)
+                S.mailSeen = S.mailSeen or {}
+                if S.mailSeen[sig] ~= true then
+                    S.mailSeen[sig] = true
+                    db.stats.sales = (db.stats.sales or 0) + 1
+                    db.stats.realized = (db.stats.realized or 0) + totalReceived
+                    S.session.realized = (S.session.realized or 0) + totalReceived
+                    printf("|cff7cff4fSOLD|r %s x%s - |cffffd100%s|r received (deposit %s, AH cut %s)",
+                        itemName or "item", quantity or 1,
+                        fmtMoney(totalReceived), fmtMoney(deposit or 0), fmtMoney(consignment or 0))
+                end
+            end
+        end
+    end
+end
+
 -- Events ---------------------------------------------------------------------------
 
 local f = CreateFrame("Frame")
@@ -2110,8 +2144,11 @@ f:SetScript("OnEvent", function(_, event, ...)
     if not ok then err(event, e) end
 end)
 
+onOptional("MAIL_SHOW", function() scanMailbox() end)
+
 on("PLAYER_LOGIN", function()
     buildPopup()
+    after(8, scanMailbox) -- sales that landed while offline
     if C_AuctionHouse == nil then
         printf("C_AuctionHouse is not on this client; going dormant.")
         return
@@ -2152,11 +2189,13 @@ on("AUCTION_HOUSE_CLOSED", function()
         S.harvestTicker:Cancel()
         S.harvestTicker = nil
     end
+    scanMailbox() -- sales land while trading
     -- compact session summary: what the printer did while you were in there
     local best = S.session.best
     if best and best.profit and best.profit > 0 then
-        printf("session: |cffffd100%d buy(s)|r for |cffff4d00%s|r - best find |cffffd100%s|r |cff7cff4f+%s|r.",
+        printf("session: |cffffd100%d buy(s)|r for |cffff4d00%s|r |cff7cff4f|%d sold for %s|r (realized) - best find %s |cff7cff4f+%s|r.",
             S.session.buys or 0, fmtMoney(S.session.spent or 0),
+            db.stats.sales or 0, fmtMoney(S.session.realized or 0),
             infoOf(best.id).name or ("item " .. best.id), fmtMoney(best.profit))
     end
 end)
@@ -2700,8 +2739,9 @@ SlashCmdList.FOREVERSNIPER = function(msg)
         local mins = math.floor((time() - (S.session.started or time())) / 60 + 0.5)
         printf("|cffffd100money printer|r - session: %d buy(s), |cffff4d00%s committed|r in %d min.",
             S.session.buys or 0, fmtMoney(S.session.spent or 0), mins)
-        printf("lifetime: %d deal(s) flagged, %d vendor flip(s) worth |cffffd100%s|r.",
-            st.deals or 0, st.vendorDeals or 0, fmtMoney(st.vendorProfit or 0))
+        printf("lifetime: %d deal(s) flagged, %d vendor flip(s) worth |cffffd100%s|r, |cff7cff4f%d sold|%r |cff7cff4f%s realized|r.",
+            st.deals or 0, st.vendorDeals or 0, fmtMoney(st.vendorProfit or 0),
+            st.sales or 0, fmtMoney(st.realized or 0))
         printf("book: %d item(s) learned, %d scan(s) done. spend cap %s per Buy.",
             (st.book or 0), st.scans or 0, fmtMoney(cfg.maxSpend))
 
