@@ -43,16 +43,17 @@ local DEFAULTS = {
     freshMins = 45,      -- market age: older price samples do not arm alerts
     overhang  = 500,     -- max competing units above the deal; more = slow flip (0 = off)
     armAfter  = 2,       -- learned samples required before market alerts fire
-    minUnit   = 1000,    -- ignore deals under 10s per unit (vendor-junk floor)
+    minUnit   = 100,     -- ignore deals under 1s per unit (classic economy floor)
     quality   = 1,       -- market alerts need this quality or better (0 = any)
     cut       = 0.05,    -- AH cut assumed when estimating resale profit
-    profit    = 10000,   -- deals must clear this much estimated profit (0 = off)
+    profit    = 1000,    -- deals must clear 10s estimated profit (classic scale)
     maxSpend  = 1000000, -- spend cap per Buy click (100g default)
     sound     = true,
     popup     = true,
     flash     = true,    -- tier-colored screen flash on deals
     toast     = true,    -- slide-in toast notification on deals
     quiet     = false,   -- suppress per-scan summaries
+    scanPage  = true,    -- auto-show the scanner monitor when the AH opens
 }
 
 ForeverSniperDB = ForeverSniperDB or {}
@@ -204,6 +205,11 @@ local function infoOf(itemID)
     local c = itemInfoCache[itemID]
     if c ~= nil then return c end
     local ok, name, _, q, _, _, _, _, _, _, icon, sell = pcall(GetItemInfo, itemID)
+    if not ok or type(name) ~= "string" then
+        -- uncached item: never cache the unknown state - the client fills
+        -- item info in asynchronously and the next call must see it
+        return { name = nil, icon = nil, quality = -1, vendor = 0 }
+    end
     c = {
         name = (ok and type(name) == "string") and name or nil,
         icon = (ok and type(icon) == "string") and icon or nil,
@@ -1250,7 +1256,9 @@ local function completeScan(reason)
                     end
                     local q = qualityOf(c.id)
                     local maxOver = cfg.overhang or 0
-                    if q < (cfg.quality or 1) then
+                    if q == -1 then
+                        requestItemLoad(c.id) -- uncached: passes next scan
+                    elseif q < (cfg.quality or 1) then
                         dbg("skip " .. c.id .. ": quality " .. q .. " below bar, not a clean relist")
                     elseif maxOver > 0 and overhangUnits > maxOver then
                         dbg("skip " .. c.id .. ": " .. overhangUnits .. " units sit above the line, relist would queue")
@@ -1431,6 +1439,77 @@ function requestReplicate()
     -- event-driven from here: REPLICATE_ITEM_LIST_UPDATE completes the scan
 end
 
+
+-- scanner monitor: the always-visible heartbeat page (WoWSniper's scan view) --
+-- Auto-shows with the AH: what the sniper is doing RIGHT NOW - sweeping,
+-- paused (and why), counters, and the last category hunted. If this window
+-- is quiet, something is wrong; /fsn says the same in text.
+local scanPage, scanPageLines
+
+local function buildScanPage()
+    if scanPage then return end
+    scanPage = CreateFrame("Frame", "ForeverSniperScanPage", UIParent)
+    scanPage:SetSize(320, 118)
+    scanPage:SetPoint("TOPRIGHT", UIParent, "TOPRIGHT", -16, -220)
+    scanPage:SetMovable(true)
+    scanPage:EnableMouse(true)
+    scanPage:RegisterForDrag("LeftButton")
+    scanPage:SetScript("OnDragStart", scanPage.StartMoving)
+    scanPage:SetScript("OnDragStop", scanPage.StopMovingOrSizing)
+    local bg = scanPage:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints() bg:SetColorTexture(0.05, 0.05, 0.07, 0.94)
+    local title = scanPage:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOPLEFT", 10, -8)
+    title:SetText("|cffff7d0aForever Sniper|r")
+    local closeBtn = CreateFrame("Button", nil, scanPage)
+    closeBtn:SetSize(40, 16) closeBtn:SetPoint("TOPRIGHT", -4, -4)
+    local xbg = closeBtn:CreateTexture(nil, "BACKGROUND")
+    xbg:SetAllPoints() xbg:SetColorTexture(0.35, 0.15, 0.15, 0.9)
+    closeBtn.fs = closeBtn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    closeBtn.fs:SetAllPoints() closeBtn.fs:SetText("X")
+    closeBtn.fs:SetTextColor(1, 0.7, 0.7)
+    closeBtn:SetScript("OnClick", function()
+        scanPage:Hide()
+        cfg.scanPage = false
+    end)
+    scanPageLines = {}
+    for i = 1, 4 do
+        local l = scanPage:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        l:SetPoint("TOPLEFT", 12, -26 - (i - 1) * 20)
+        l:SetWidth(296)
+        l:SetJustifyH("LEFT")
+        l:SetText("|cff888888...|r")
+        scanPageLines[i] = l
+    end
+end
+
+local function updateScanPage()
+    if not scanPage or not scanPage:IsShown() then return end
+    local ss = S.sweepStats or { sent = 0, rows = 0, yields = 0 }
+    local statusText, r, g, b
+    if not S.ahOpen then
+        statusText = "IDLE - open the Auction House"
+        r, g, b = 0.55, 0.55, 0.55
+    elseif S.warnedBrowse then
+        statusText = "PAUSED - the Browse tab is up. Switch tabs!"
+        r, g, b = 1, 0.35, 0.3
+    elseif S.sweepTicker then
+        statusText = "SCANNING - " .. (S.sweepStats.lastCat or "market")
+        r, g, b = 0.35, 1, 0.45
+    else
+        statusText = "STOPPED - no sweep ticker (/fsn on)"
+        r, g, b = 1, 0.5, 0.3
+    end
+    scanPageLines[1]:SetText(string.format("|cff%02x%02x%02x%s|r",
+        math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5), statusText))
+    scanPageLines[2]:SetText(string.format("|cff888888sweeps|r |cffffd100%d|r  |cff888888rows read|r |cffffd100%d|r  |cff888888yields|r |cffffd100%d|r",
+        ss.sent, ss.rows, ss.yields))
+    scanPageLines[3]:SetText(string.format("|cff888888book|r |cffffd100%d|r items  |cff888888deals|r |cffffd100%d|r  |cff888888buys|r |cffffd100%d|r",
+        db.stats.book or 0, db.stats.deals or 0, S.session.buys or 0))
+    scanPageLines[4]:SetText(string.format("|cff888888committed|r |cffff4d00%s|r  |cff888888listed|r |cffffd100%d|r  |cff888888watch rules|r |cffffd100%d|r",
+        fmtMoney(S.session.spent or 0), S.session.listed or 0, countKeys(db.watch)))
+end
+
 -- Live sweep (the sniper feed) --------------------------------------------------------
 -- WoWSniper's engine, ported: weighted category rotation (one class per query,
 -- faster detection within the AH throttle), event-driven throttle tracking,
@@ -1476,11 +1555,18 @@ do
         if (a.t or 0) < cutoff then S.lastAlert[k] = nil end
     end
 end
-local function isNewListing(itemID, price)
+local function isNewListing(itemID, price, peekOnly)
     local k = tostring(itemID) .. ":" .. tostring(price)
     if S.seen[k] then return false end
-    S.seen[k] = time()
+    if not peekOnly then S.seen[k] = time() end
     return true
+end
+
+-- request the client to cache an item's info; quality checks pass next sweep
+local function requestItemLoad(itemID)
+    if C_Item and C_Item.RequestLoadItemDataByID then
+        pcall(C_Item.RequestLoadItemDataByID, itemID)
+    end
 end
 
 local throttleReady, pagePending, lastQueryAt = true, false, 0
@@ -1548,18 +1634,21 @@ local function processBrowseRows(rows)
             if b then
                 local med = freshMedian(b.s, t, (cfg.freshMins or 45) * 60, cfg.armAfter)
                 if med and med >= cfg.minUnit and price <= cfg.threshold * med then
-                    -- listability gates: verifiable quality, a market not buried
-                    -- under competing stock, and a NEW listing (old ones were
-                    -- either seen or already alerted)
+                    -- listability gates: verifiable quality (uncached items get a
+                    -- load request and pass on the NEXT sweep - the client caches
+                    -- item info asynchronously), a market not buried under
+                    -- competing stock, and a NEW listing
                     local q = qualityOf(key)
                     local overhang = cfg.overhang or 0
                     local crowded = overhang > 0 and qty > overhang
-                    local fresh = isNewListing(key, price)
-                    if q < (cfg.quality or 1) then
+                    if q == -1 then
+                        -- unknown: never a hard block, just not this sweep
+                        requestItemLoad(key)
+                    elseif q < (cfg.quality or 1) then
                         -- quality below bar: not a clean relist
                     elseif crowded then
                         dbg("skip " .. key .. ": " .. qty .. " units listed, relist would queue behind them")
-                    elseif not fresh then
+                    elseif not isNewListing(key, price) then
                         -- already seen at this price: not a new deal
                     else
                         local line = cfg.threshold * med
@@ -1632,6 +1721,8 @@ local function sweepQuery()
     pagePending = true -- cleared when results land (or paging completes)
     S.sweeping = true
     S.sweepStats.sent = S.sweepStats.sent + 1
+    S.sweepStats.lastCat = cat.name
+    updateScanPage()
     dbg("sweep sent: " .. cat.name)
 end
 
@@ -1651,6 +1742,7 @@ local function startSweeping()
     S.sweepTicker = C_Timer.NewTicker(period, function()
         sweepQuery()
         feedTick() -- apply deferred feed refreshes
+        updateScanPage()
     end)
     after(1, sweepQuery)
     dbg("live sweep armed: category rotation every " .. period .. "s")
@@ -1722,6 +1814,7 @@ end)
 on("AUCTION_HOUSE_SHOW", function()
     S.ahOpen = true
     S.warnedBrowse = nil -- the yield hint fires once per AH session
+    if cfg.scanPage then buildScanPage() scanPage:Show() updateScanPage() end
     if cfg.enabled and C_AuctionHouse then
         startSweeping()
         after(2, requestReplicate) -- replicate is the book bootstrap, not the feed
@@ -1732,6 +1825,7 @@ on("AUCTION_HOUSE_CLOSED", function()
     S.ahOpen = false
     S.scanning = false
     stopSweeping()
+    if scanPage then updateScanPage() end
     if S.harvestTicker then
         S.harvestTicker:Cancel()
         S.harvestTicker = nil
@@ -1976,6 +2070,7 @@ local HELP = {
     "/fsn feed             deal window (click a row = live prices, BUY = buy)",
     "/fsn profit           money printer stats (session + lifetime)",
     "/fsn options          settings panel",
+    "/fsn page             scanner monitor window (toggle)",
     "/fsn on | off         enable / disable",
     "/fsn watch <link> 50s watchlist rule (a plain item name works too)",
     "/fsn unwatch <link>|all",
@@ -2234,6 +2329,18 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             feedFrame:Show()
             refreshFeed()
             printf("deal feed showing - best profit on top. BUY re-checks live prices.")
+        end
+
+    elseif cmd == "page" then
+        cfg.scanPage = not cfg.scanPage
+        if cfg.scanPage then
+            buildScanPage()
+            scanPage:Show()
+            updateScanPage()
+            printf("scanner monitor on - it shows with the AH.")
+        else
+            if scanPage then scanPage:Hide() end
+            printf("scanner monitor off.")
         end
 
     elseif cmd == "options" then
