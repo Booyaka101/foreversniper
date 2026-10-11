@@ -50,6 +50,8 @@ local DEFAULTS = {
     maxSpend  = 1000000, -- spend cap per Buy click (100g default)
     sound     = true,
     popup     = true,
+    flash     = true,    -- tier-colored screen flash on deals
+    toast     = true,    -- slide-in toast notification on deals
     quiet     = false,   -- suppress per-scan summaries
 }
 
@@ -668,7 +670,226 @@ local function buildPopup()
     end
 end
 
-local function fireAlert(kind, itemID, link, unit, market, sweep)
+-- WoWSniper-parity alerts: tiers, sound, flash, toast, and a deal feed -----
+-- Deal depth tiers (WoWSniper's model): SNIPE = forgot a zero, GREAT = heavy
+-- underprice, GOOD = solid. Sound, screen flash and toast fire per tier, and
+-- every deal lands in a profit-sorted feed window (/fsn feed) with BUY buttons.
+
+local TIERS = {
+    SNIPE = { mult = 5.0, sound = 8959, r = 1.00, g = 0.35, b = 0.15 },
+    GREAT = { mult = 3.0, sound = 888,  r = 0.35, g = 0.80, b = 1.00 },
+    GOOD  = { mult = 2.0, sound = 3081, r = 0.30, g = 1.00, b = 0.45 },
+}
+local function tierOf(market, price)
+    if not market or market <= 0 or not price or price <= 0 then return nil end
+    local m = market / price
+    if m >= TIERS.SNIPE.mult then return "SNIPE" end
+    if m >= TIERS.GREAT.mult then return "GREAT" end
+    if m >= TIERS.GOOD.mult then return "GOOD" end
+    return nil
+end
+
+local function playTierSound(tier)
+    if not cfg.sound then return end
+    local t = tier and TIERS[tier]
+    PlaySound(t and t.sound or 3081, "Master")
+end
+
+-- screen flash ---------------------------------------------------------------------
+local flashFrame
+local function flashScreen(tier)
+    if not cfg.flash then return end
+    if flashFrame then
+        local t = tier and TIERS[tier]
+        flashFrame.tex:SetColorTexture(t and t.r or 1, t and t.g or 0.85, t and t.b or 0, 0.2)
+        flashFrame:Show()
+        if flashFrame.anim then flashFrame.anim:Stop() flashFrame.anim:Play() end
+        return
+    end
+    flashFrame = CreateFrame("Frame", nil, UIParent)
+    flashFrame:SetAllPoints()
+    flashFrame:SetFrameStrata("FULLSCREEN_DIALOG")
+    flashFrame:SetFrameLevel(100)
+    flashFrame:Hide()
+    flashFrame.tex = flashFrame:CreateTexture(nil, "BACKGROUND")
+    flashFrame.tex:SetAllPoints()
+    flashFrame.tex:SetColorTexture(1, 0.85, 0, 0.15)
+    flashFrame.anim = flashFrame:CreateAnimationGroup()
+    local fadeIn = flashFrame.anim:CreateAnimation("Alpha")
+    fadeIn:SetFromAlpha(0) fadeIn:SetToAlpha(1) fadeIn:SetDuration(0.1) fadeIn:SetOrder(1)
+    local fadeOut = flashFrame.anim:CreateAnimation("Alpha")
+    fadeOut:SetFromAlpha(1) fadeOut:SetToAlpha(0) fadeOut:SetDuration(0.4) fadeOut:SetOrder(2)
+    flashFrame.anim:SetScript("OnFinished", function() flashFrame:Hide() end)
+    flashScreen(tier)
+end
+
+-- toast ----------------------------------------------------------------------------
+local toastFrame
+local function showToast(tier, itemID, price, market, profit)
+    if not cfg.toast then return end
+    if not toastFrame then
+        toastFrame = CreateFrame("Frame", nil, UIParent)
+        toastFrame:SetSize(280, 50)
+        toastFrame:SetPoint("TOPRIGHT", UIParent, "TOPRIGHT", -20, -120)
+        toastFrame:SetFrameStrata("FULLSCREEN_DIALOG")
+        toastFrame:Hide()
+        local bg = toastFrame:CreateTexture(nil, "BACKGROUND")
+        bg:SetAllPoints() bg:SetColorTexture(0.08, 0.08, 0.12, 0.95)
+        toastFrame.icon = toastFrame:CreateTexture(nil, "ARTWORK")
+        toastFrame.icon:SetSize(36, 36) toastFrame.icon:SetPoint("LEFT", 6, 0)
+        toastFrame.title = toastFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        toastFrame.title:SetPoint("TOPLEFT", toastFrame.icon, "TOPRIGHT", 6, -2)
+        toastFrame.title:SetPoint("RIGHT", -6, 0)
+        toastFrame.title:SetJustifyH("LEFT")
+        toastFrame.detail = toastFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        toastFrame.detail:SetPoint("BOTTOMLEFT", toastFrame.icon, "BOTTOMRIGHT", 6, 2)
+        toastFrame.detail:SetPoint("RIGHT", -6, 0)
+        toastFrame.detail:SetJustifyH("LEFT")
+    end
+    local t = tier and TIERS[tier]
+    local name = ("item " .. tostring(itemID))
+    local icon
+    local okN, n, _, _, _, _, _, _, _, ic = pcall(GetItemInfo, itemID)
+    if okN and type(n) == "string" then name = n end
+    if ic then icon = ic end
+    if icon then toastFrame.icon:SetTexture(icon) end
+    local c = t and string.format("|cff%02x%02x%02x",
+        math.floor((t.r * 255) + 0.5), math.floor((t.g * 255) + 0.5), math.floor((t.b * 255) + 0.5)) or "|cffffd100"
+    toastFrame.title:SetText(c .. (tier or "DEAL") .. "|r " .. name)
+    toastFrame.detail:SetText(fmtMoney(price) .. "  market " .. fmtMoney(market or 0)
+        .. "  |cff44cc44+" .. fmtMoney(profit or 0) .. "|r")
+    toastFrame:Show()
+    if toastFrame.hideTimer then toastFrame.hideTimer:Cancel() end
+    toastFrame.hideTimer = C_Timer.NewTimer(5, function() toastFrame:Hide() end)
+end
+
+-- deal feed ------------------------------------------------------------------------
+S.deals = S.deals or {}
+local MAX_FEED = 200
+local feedFrame, feedRows
+local FEED_ROWS, FEED_ROW_H, FEED_W = 14, 26, 560
+
+local function refreshFeed()
+    if not feedFrame or not feedFrame:IsShown() then return end
+    for i = 1, FEED_ROWS do
+        local row = feedRows[i]
+        local d = S.deals[i]
+        if d then
+            local okN, n, _, _, _, _, _, _, _, ic = pcall(GetItemInfo, d.id)
+            row.name:SetText((okN and n) or ("item " .. tostring(d.id)))
+            if ic then row.icon:SetTexture(ic) end
+            row.price:SetText(fmtMoney(d.unit))
+            row.market:SetText(fmtMoney(d.market or 0))
+            row.pct:SetText(d.market and ("-"
+                .. math.floor((1 - d.unit / d.market) * 100 + 0.5) .. "%") or "watch")
+            row.tier:SetText(d.tier or "")
+            local t = d.tier and TIERS[d.tier]
+            if t then
+                row.tier:SetTextColor(t.r, t.g, t.b)
+                row.profit:SetTextColor(0.3, 1, 0.45)
+                row.profit:SetText(d.profit and ("+" .. fmtMoney(d.profit)) or "")
+            else
+                row.tier:SetTextColor(0.6, 0.6, 0.6)
+                row.profit:SetText("")
+            end
+            row.newBadge:SetShown(d.isNew == true)
+            row.itemID, row.link, row.line, row.market2 = d.id, d.link, d.line, d.market
+            row:Show()
+        else
+            row:Hide()
+        end
+    end
+end
+
+local function addDeal(tier, itemID, link, unit, market, sweep, isNew)
+    for _, d in ipairs(S.deals) do
+        if d.id == itemID and d.unit == unit and not d.bought then return end
+    end
+    local deal = {
+        id = itemID, link = link, unit = unit, market = market, tier = tier,
+        profit = sweep and sweep.profit, units = sweep and sweep.units,
+        line = sweep and sweep.line, isNew = isNew, t = time(), bought = false,
+    }
+    local inserted = false
+    for i, d in ipairs(S.deals) do
+        if (deal.profit or 0) > (d.profit or 0) then
+            table.insert(S.deals, i, deal)
+            inserted = true
+            break
+        end
+    end
+    if not inserted then S.deals[#S.deals + 1] = deal end
+    while #S.deals > MAX_FEED do table.remove(S.deals) end
+    refreshFeed()
+end
+
+local function buildFeed()
+    if feedFrame then return end
+    feedFrame = CreateFrame("Frame", "ForeverSniperFeed", UIParent)
+    feedFrame:SetSize(FEED_W, 34 + FEED_ROWS * FEED_ROW_H + 8)
+    feedFrame:SetPoint("LEFT", UIParent, "LEFT", 16, 0)
+    feedFrame:SetMovable(true)
+    feedFrame:EnableMouse(true)
+    feedFrame:RegisterForDrag("LeftButton")
+    feedFrame:SetScript("OnDragStart", feedFrame.StartMoving)
+    feedFrame:SetScript("OnDragStop", feedFrame.StopMovingOrSizing)
+    local bg = feedFrame:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints() bg:SetColorTexture(0.05, 0.05, 0.07, 0.97)
+    local title = feedFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOPLEFT", 10, -8)
+    title:SetText("|cffff7d0aForever Sniper|r — deals (profit first)")
+    local closeBtn = CreateFrame("Button", nil, feedFrame, "UIPanelButtonTemplate")
+    closeBtn:SetSize(52, 18) closeBtn:SetPoint("TOPRIGHT", -6, -6)
+    closeBtn:SetText("Close")
+    closeBtn:SetScript("OnClick", function() feedFrame:Hide() end)
+    feedRows = {}
+    for i = 1, FEED_ROWS do
+        local row = CreateFrame("Button", nil, feedFrame)
+        row:SetSize(FEED_W - 16, FEED_ROW_H)
+        row:SetPoint("TOPLEFT", feedFrame, "TOPLEFT", 8, -30 - (i - 1) * FEED_ROW_H)
+        local rbg = row:CreateTexture(nil, "BACKGROUND")
+        rbg:SetAllPoints() rbg:SetColorTexture(0.07, 0.07, 0.10, 0.5)
+        row.icon = row:CreateTexture(nil, "ARTWORK")
+        row.icon:SetSize(20, 20) row.icon:SetPoint("LEFT", 2, 0)
+        row.newBadge = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.newBadge:SetPoint("LEFT", 26, 0) row.newBadge:SetText("|cffff4444NEW|r")
+        row.name = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        row.name:SetPoint("LEFT", 60, 0) row.name:SetWidth(220)
+        row.name:SetJustifyH("LEFT") row.name:SetWordWrap(false)
+        row.price = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.price:SetPoint("LEFT", 285, 0) row.price:SetWidth(70) row.price:SetJustifyH("RIGHT")
+        row.market = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.market:SetPoint("LEFT", 358, 0) row.market:SetWidth(70) row.market:SetJustifyH("RIGHT")
+        row.pct = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.pct:SetPoint("LEFT", 430, 0) row.pct:SetWidth(42) row.pct:SetJustifyH("CENTER")
+        row.tier = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.tier:SetPoint("LEFT", 470, 0) row.tier:SetWidth(46)
+        row.profit = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.profit:SetPoint("LEFT", 470, 0) row.profit:SetWidth(80) row.profit:SetJustifyH("RIGHT")
+        row.buyBtn = CreateFrame("Button", nil, row)
+        row.buyBtn:SetSize(42, 18) row.buyBtn:SetPoint("RIGHT", -2, 0)
+        local bbg = row.buyBtn:CreateTexture(nil, "BACKGROUND")
+        bbg:SetAllPoints() bbg:SetColorTexture(0.15, 0.4, 0.15, 0.9)
+        row.buyBtn.fs = row.buyBtn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.buyBtn.fs:SetAllPoints() row.buyBtn.fs:SetText("BUY")
+        row.buyBtn.fs:SetTextColor(0.3, 1, 0.3)
+        row.buyBtn:SetScript("OnClick", function(self)
+            local r = self:GetParent()
+            if r.itemID and r.line then buySweep(r.itemID, r.link, r.line, r.market2) end
+        end)
+        row:Hide()
+        feedRows[i] = row
+    end
+end
+
+local function alertDeal(tier, itemID, link, unit, market, sweep, isNew)
+    playTierSound(tier)
+    flashScreen(tier)
+    showToast(tier, itemID, unit, market, sweep and sweep.profit)
+    addDeal(tier, itemID, link, unit, market, sweep, isNew)
+end
+
+local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
     local now = time()
     local key = tostring(itemID)
     local last = S.lastAlert[key]
@@ -709,6 +930,10 @@ local function fireAlert(kind, itemID, link, unit, market, sweep)
         end
     end
     playAlertSound()
+
+    -- WoWSniper-parity: tiered sound/flash/toast + the deal feed
+    local tier = tierOf(market, unit)
+    alertDeal(tier, itemID, link, unit, market, sweep, isNew)
 
     if cfg.popup then
         local icon
@@ -823,7 +1048,7 @@ local function completeScan(reason)
                             local profit = math.floor(units * med * (1 - cfg.cut) - cost)
                             if profit >= cfg.profit then
                                 fireAlert("market", c.id, c.link, c.unit, med,
-                                    { units = units, cost = cost, profit = profit, line = line })
+                                    { units = units, cost = cost, profit = profit, line = line }, true)
                                 deals = deals + 1
                             end
                         end
@@ -1083,7 +1308,7 @@ local function processBrowseRows(rows)
                         local cost = qty * price
                         local est = math.floor(qty * med * (1 - cfg.cut) - cost)
                         fireAlert("market", key, nil, price, med,
-                            { units = qty, cost = cost, profit = est, line = line })
+                            { units = qty, cost = cost, profit = est, line = line }, true)
                     end
                 end
             end
@@ -1335,6 +1560,9 @@ local HELP = {
     "/fsn unignore <link>|all",
     "/fsn scan             force a scan right now (AH window open)",
     "/fsn pop              show/hide the alert popup",
+    "/fsn feed             show/hide the deal feed window (profit-sorted, BUY buttons)",
+    "/fsn flash            toggle the deal screen flash",
+    "/fsn toast            toggle toast notifications",
     "/fsn quiet            toggle per-scan summaries",
     "/fsn sound            toggle the alert sound",
     "/fsn watchlist        current rules",
@@ -1554,6 +1782,25 @@ SlashCmdList.FOREVERSNIPER = function(msg)
     elseif cmd == "sound" then
         cfg.sound = not cfg.sound
         printf("alert sound %s.", cfg.sound and "on" or "off")
+
+    elseif cmd == "flash" then
+        cfg.flash = not cfg.flash
+        printf("screen flash %s.", cfg.flash and "on" or "off")
+
+    elseif cmd == "toast" then
+        cfg.toast = not cfg.toast
+        printf("toast notifications %s.", cfg.toast and "on" or "off")
+
+    elseif cmd == "feed" then
+        buildFeed()
+        if feedFrame:IsShown() then
+            feedFrame:Hide()
+            printf("deal feed hidden.")
+        else
+            feedFrame:Show()
+            refreshFeed()
+            printf("deal feed showing - best profit on top. BUY re-checks live prices.")
+        end
 
     elseif cmd == "alerts" then
         local shown = 0
