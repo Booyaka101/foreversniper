@@ -1,15 +1,15 @@
--- ForeverSniper.lua — auction deal sniper for the WoW: Forever beta.
+-- ForeverSniper.lua - auction deal sniper for the WoW: Forever beta.
 --
 -- How it works
 --   * While the auction house window is open, the addon keeps requesting the
 --     full-listing snapshot (C_AuctionHouse.ReplicateItems) on a cadence.
 --   * Every completed scan does two jobs:
---       1. LEARN — per item, remember this scan's cheapest unit price. The
+--       1. LEARN - per item, remember this scan's cheapest unit price. The
 --          "market value" of an item is the median of the last 8 scan
 --          minimums, so one mislisted 1c item cannot define a market.
---       2. SNIPE — diff the scan against the previous one. When a NEW listing
+--       2. SNIPE - diff the scan against the previous one. When a NEW listing
 --          appears at or under threshold% of market, the whole DEPTH of that
---          item under the line is swept — every unit of every cheap listing,
+--          item under the line is swept - every unit of every cheap listing,
 --          totalled. A deal only fires if the estimated resale profit of the
 --          sweep (market after the AH cut, minus cost) clears the profit
 --          floor and the item clears the quality floor. Stackables report as
@@ -19,7 +19,7 @@
 --
 -- Buying: every purchase this addon makes happens strictly inside a click you
 -- made on a Buy button. Blizzard gates the purchase calls behind hardware
--- events on purpose — that gate is the whole security model, and it is
+-- events on purpose - that gate is the whole security model, and it is
 -- honored here: no timers, no event-driven purchases, no automation of any
 -- kind. Each click is bounded by a spend cap, and prices are re-checked fresh
 -- at click time, so a stale alert can never buy. Commodities open the filled
@@ -28,7 +28,7 @@
 --
 -- The beta moves week to week, so every C_AuctionHouse call is pcall-wrapped
 -- and a failure is recorded in db.errors (the gap is data, ForeverBeacon
--- style). If an API changes shape, the addon goes quiet — mid-AH errors are
+-- style). If an API changes shape, the addon goes quiet - mid-AH errors are
 -- worse than silence.
 
 local ADDON = ...
@@ -72,7 +72,7 @@ for k, v in pairs(DEFAULTS) do
 end
 local cfg = db.config
 
-local CAPS = { errors = 200, alerts = 60, samples = 8, book = 12000 }
+local CAPS = { errors = 200, alerts = 60, samples = 30, book = 12000 }
 
 -- Small helpers ---------------------------------------------------------------
 
@@ -195,27 +195,34 @@ local function freshMedian(s, now, maxAge, need)
     return (vals[n / 2] + vals[n / 2 + 1]) / 2
 end
 
+-- Item info cache: ONE GetItemInfo per item for name, icon, quality and
+-- vendor price. Toast, feed and alerts all read from here - no per-frame
+-- item info probing (the old code could pcall GetItemInfo 30+ times a
+-- refresh; now it is once per item per session).
+local itemInfoCache = {}
+local function infoOf(itemID)
+    local c = itemInfoCache[itemID]
+    if c ~= nil then return c end
+    local ok, name, _, q, _, _, _, _, _, _, icon, sell = pcall(GetItemInfo, itemID)
+    c = {
+        name = (ok and type(name) == "string") and name or nil,
+        icon = (ok and type(icon) == "string") and icon or nil,
+        quality = (ok and type(q) == "number") and q or -1,
+        vendor = (ok and type(sell) == "number") and sell or 0,
+    }
+    itemInfoCache[itemID] = c
+    return c
+end
 -- Listability: an item we cannot verify as sellable (quality unknown or below
--- the bar) never alerts. Quality comes from GetItemInfo, cached per item.
-local qualityCache = {}
+-- the bar) never alerts; quality and vendor price come from the shared cache.
 local function qualityOf(itemID)
-    if qualityCache[itemID] ~= nil then return qualityCache[itemID] end
-    local ok, _, _, q = pcall(GetItemInfo, itemID)
-    local res = (ok and type(q) == "number") and q or -1
-    qualityCache[itemID] = res
-    return res
+    return infoOf(itemID).quality
 end
 
--- Vendor sell price (11th GetItemInfo return), cached. A listing priced under
--- this is FREE MONEY: buy it, vendor it, instant guaranteed profit, no market
--- risk, no relist wait. The purest form of printing.
-local vendorCache = {}
+-- Vendor sell price. A listing priced under this is FREE MONEY: buy it,
+-- vendor it, instant guaranteed profit, no market risk, no relist wait.
 local function vendorOf(itemID)
-    if vendorCache[itemID] ~= nil then return vendorCache[itemID] end
-    local ok, _, _, _, _, _, _, _, _, _, _, sell = pcall(GetItemInfo, itemID)
-    local res = (ok and type(sell) == "number") and sell or 0
-    vendorCache[itemID] = res
-    return res
+    return infoOf(itemID).vendor
 end
 
 local function mergeIntoBook(curMins, t)
@@ -276,6 +283,7 @@ local function rebuildWatch()
 end
 
 local nameByKey = {}
+
 local function nameOf(itemID, link)
     if nameByKey[itemID] then return nameByKey[itemID] end
     if link then
@@ -332,7 +340,7 @@ end
 
 local function searchListing(itemID, link, units)
     if C_AuctionHouse == nil then
-        printf("C_AuctionHouse is gone on this client — cannot search.")
+        printf("C_AuctionHouse is gone on this client - cannot search.")
         return
     end
     if not S.ahOpen then
@@ -359,10 +367,10 @@ local function searchListing(itemID, link, units)
     end
     S.pending = { itemID = itemID, link = link, t = GetTime(), units = units }
     if units and units > 1 then
-        printf("searching %s — buy the whole sweep: |cffffd100%d units|r is every one under your line.",
+        printf("searching %s - buy the whole sweep: |cffffd100%d units|r is every one under your line.",
             link or ("item " .. tostring(itemID)), units)
     else
-        printf("searching %s — cheapest listings print below; the buy is yours to click.",
+        printf("searching %s - cheapest listings print below; the buy is yours to click.",
             link or ("item " .. tostring(itemID)))
     end
 end
@@ -394,7 +402,7 @@ local function buildConfirm()
     f:RegisterForDrag("LeftButton")
     f:SetScript("OnDragStart", f.StartMoving)
     f:SetScript("OnDragStop", f.StopMovingOrSizing)
-    f.TitleText:SetText("Forever Sniper — purchase")
+    f.TitleText:SetText("Forever Sniper - purchase")
     f.body = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     f.body:SetPoint("TOP", 0, -36)
     f.body:SetWidth(330)
@@ -436,6 +444,10 @@ local function showConfirm(q)
                     S.boughtAt[q2.itemID] = { t = time(), price = q2.unit or 0 }
                     S.session.spent = S.session.spent + (q2.total or (q2.units or 0) * (q2.unit or 0))
                     S.session.buys = S.session.buys + 1
+                    for _, d in ipairs(S.deals) do
+                        if d.id == q2.itemID then d.bought = true end
+                    end
+                    refreshFeed()
                     self:GetParent().q = nil
                     self:GetParent():Hide()
                 else
@@ -448,7 +460,7 @@ local function showConfirm(q)
                     q2.quoting = true
                     self:SetText("Confirm")
                     self:GetParent().body:SetText(string.format(
-                        "%d x %s — fetching the exact total ...\n(press Confirm when it appears)",
+                        "%d x %s - fetching the exact total ...\n(press Confirm when it appears)",
                         q2.units, q2.link or ("item " .. q2.itemID)))
                     S.quote = q2
                 else
@@ -464,7 +476,7 @@ local function showConfirm(q)
         local spent, bought, misses = 0, 0, 0
         for _, L in ipairs(q2.list or {}) do
             if spent + L.buyout > cfg.maxSpend then
-                printf("spend cap %s reached — skipped the rest. /fsn max to raise it.", fmtMoney(cfg.maxSpend))
+                printf("spend cap %s reached - skipped the rest. /fsn max to raise it.", fmtMoney(cfg.maxSpend))
                 break
             end
             local okP, eP = pcall(C_AuctionHouse.PlaceBid, L.auctionID, L.buyout)
@@ -482,13 +494,17 @@ local function showConfirm(q)
             S.boughtAt[q2.itemID] = { t = time(), price = q2.line }
             S.session.spent = S.session.spent + spent
             S.session.buys = S.session.buys + 1
+            for _, d in ipairs(S.deals) do
+                if d.id == q2.itemID then d.bought = true end
+            end
+            refreshFeed()
         end
         if misses > 0 then
-            printf("%d listing%s already gone — the re-scan will catch anything left.",
+            printf("%d listing%s already gone - the re-scan will catch anything left.",
                 misses, misses == 1 and "" or "s")
         end
         if bought == 0 and misses == 0 then
-            printf("nothing was under the line anymore — someone beat you to it.")
+            printf("nothing was under the line anymore - someone beat you to it.")
         end
         self:GetParent().q = nil
         self:GetParent():Hide()
@@ -502,7 +518,7 @@ local function buyFromResults(kind)
     local b = S.buying
     if not b or GetTime() - b.t > 15 then S.buying = nil return end
     S.buying = nil
-    if not S.ahOpen then printf("the AH window closed — buy aborted.") return end
+    if not S.ahOpen then printf("the AH window closed - buy aborted.") return end
 
     -- this client's result readers are keyed: GetNumItemSearchResults(itemKey),
     -- GetItemSearchResultInfo(itemKey, index), GetCommoditySearchResultInfo(itemID, index)
@@ -536,13 +552,13 @@ local function buyFromResults(kind)
             i = i + 1
         end
         if units <= 0 then
-            printf("nothing under %s anymore — someone beat you to it.", fmtMoney(b.line))
+            printf("nothing under %s anymore - someone beat you to it.", fmtMoney(b.line))
             return
         end
         showConfirm({
             commodity = true, itemID = b.itemID, link = b.link,
             units = units, unit = math.floor(cost / units),
-            body = string.format("%d x %s — every unit under %s\nestimated total |cffffd100%s|r (cap %s)",
+            body = string.format("%d x %s - every unit under %s\nestimated total |cffffd100%s|r (cap %s)",
                 units, b.link or ("item " .. b.itemID), fmtMoney(b.line), fmtMoney(cost), fmtMoney(cfg.maxSpend)),
         })
         return
@@ -570,13 +586,13 @@ local function buyFromResults(kind)
         end
     end
     if units <= 0 then
-        printf("nothing under %s anymore — someone beat you to it.", fmtMoney(b.line))
+        printf("nothing under %s anymore - someone beat you to it.", fmtMoney(b.line))
         return
     end
     showConfirm({
         commodity = false, itemID = b.itemID, link = b.link, line = b.line,
         units = units, list = list,
-        body = string.format("%d units of %s — %d listing%s under %s\ntotal |cffffd100%s|r%s",
+        body = string.format("%d units of %s - %d listing%s under %s\ntotal |cffffd100%s|r%s",
             units, b.link or ("item " .. b.itemID), #list, #list == 1 and "" or "s",
             fmtMoney(b.line), fmtMoney(cost),
             list.capped and string.format("  (cap %s hit)", fmtMoney(cfg.maxSpend)) or ""),
@@ -585,7 +601,7 @@ end
 
 local function buySweep(itemID, link, line, market)
     if C_AuctionHouse == nil then
-        printf("C_AuctionHouse is gone on this client — cannot buy.")
+        printf("C_AuctionHouse is gone on this client - cannot buy.")
         return
     end
     if not S.ahOpen then
@@ -593,7 +609,7 @@ local function buySweep(itemID, link, line, market)
         return
     end
     if not line or line <= 0 then
-        printf("no price line recorded for this alert — re-scan and try again.")
+        printf("no price line recorded for this alert - re-scan and try again.")
         return
     end
     local commodity = false
@@ -765,12 +781,9 @@ local function showToast(tier, itemID, price, market, profit)
         toastFrame.detail:SetJustifyH("LEFT")
     end
     local t = tier and TIERS[tier]
-    local name = ("item " .. tostring(itemID))
-    local icon
-    local okN, n, _, _, _, _, _, _, _, ic = pcall(GetItemInfo, itemID)
-    if okN and type(n) == "string" then name = n end
-    if ic then icon = ic end
-    if icon then toastFrame.icon:SetTexture(icon) end
+    local info = infoOf(itemID)
+    local name = info.name or ("item " .. tostring(itemID))
+    if info.icon then toastFrame.icon:SetTexture(info.icon) end
     local c = t and string.format("|cff%02x%02x%02x",
         math.floor((t.r * 255) + 0.5), math.floor((t.g * 255) + 0.5), math.floor((t.b * 255) + 0.5)) or "|cffffd100"
     toastFrame.title:SetText(c .. (tier or "DEAL") .. "|r " .. name)
@@ -784,18 +797,24 @@ end
 -- deal feed ------------------------------------------------------------------------
 S.deals = S.deals or {}
 local MAX_FEED = 200
-local feedFrame, feedRows
+local feedFrame, feedRows, feedStatus
 local FEED_ROWS, FEED_ROW_H, FEED_W = 14, 26, 560
+local feedDirty, feedLastRefresh = false, 0
 
 local function refreshFeed()
-    if not feedFrame or not feedFrame:IsShown() then return end
+    if not feedFrame or not feedFrame:IsShown() then feedDirty = true return end
+    -- throttled: a burst of deals refreshes once per quarter second, not per alert
+    local now = GetTime()
+    if now - feedLastRefresh < 0.25 then feedDirty = true return end
+    feedLastRefresh = now
+    feedDirty = false
     for i = 1, FEED_ROWS do
         local row = feedRows[i]
         local d = S.deals[i]
         if d then
-            local okN, n, _, _, _, _, _, _, _, ic = pcall(GetItemInfo, d.id)
-            row.name:SetText((okN and n) or ("item " .. tostring(d.id)))
-            if ic then row.icon:SetTexture(ic) end
+            local info = infoOf(d.id)
+            row.name:SetText(info.name or ("item " .. tostring(d.id)))
+            if info.icon then row.icon:SetTexture(info.icon) end
             row.price:SetText(fmtMoney(d.unit))
             row.market:SetText(fmtMoney(d.market or 0))
             row.pct:SetText(d.market and ("-"
@@ -812,11 +831,26 @@ local function refreshFeed()
             end
             row.newBadge:SetShown(d.isNew == true)
             row.itemID, row.link, row.line, row.market2 = d.id, d.link, d.line, d.market
+            row.buyBtn:SetShown(not d.bought)
+            if d.bought then row.name:SetTextColor(0.5, 0.5, 0.5) else row.name:SetTextColor(1, 1, 1) end
             row:Show()
         else
             row:Hide()
         end
     end
+    if feedStatus then
+        local mins = math.floor((time() - (S.session.started or time())) / 60 + 0.5)
+        feedStatus:SetText(string.format(
+            "|cff888888%d deal(s) this session - %d buy(s), %s committed in %d min - book %d items|r",
+            #S.deals, S.session.buys or 0, fmtMoney(S.session.spent or 0), mins,
+            countKeys(db.book)))
+    end
+end
+
+-- called from the OnUpdate ticker: applies a deferred refresh when one was
+-- requested during the throttle window
+local function feedTick()
+    if feedDirty then refreshFeed() end
 end
 
 local function addDeal(tier, itemID, link, unit, market, sweep, isNew)
@@ -844,6 +878,109 @@ end
 local function buildFeed()
     if feedFrame then return end
     feedFrame = CreateFrame("Frame", "ForeverSniperFeed", UIParent)
+    feedFrame:SetSize(FEED_W, 58 + FEED_ROWS * FEED_ROW_H + 26)
+    feedFrame:SetPoint("LEFT", UIParent, "LEFT", 16, 0)
+    feedFrame:SetMovable(true)
+    feedFrame:EnableMouse(true)
+    feedFrame:RegisterForDrag("LeftButton")
+    feedFrame:SetScript("OnDragStart", feedFrame.StartMoving)
+    feedFrame:SetScript("OnDragStop", feedFrame.StopMovingOrSizing)
+    local bg = feedFrame:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints() bg:SetColorTexture(0.05, 0.05, 0.07, 0.97)
+    local title = feedFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOPLEFT", 10, -8)
+    title:SetText("|cffff7d0aForever Sniper|r - deals (profit first)")
+    local clearBtn = CreateFrame("Button", nil, feedFrame)
+    clearBtn:SetSize(52, 18) clearBtn:SetPoint("TOPRIGHT", -62, -6)
+    local cbg = clearBtn:CreateTexture(nil, "BACKGROUND")
+    cbg:SetAllPoints() cbg:SetColorTexture(0.35, 0.2, 0.1, 0.9)
+    clearBtn.fs = clearBtn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    clearBtn.fs:SetAllPoints() clearBtn.fs:SetText("Clear")
+    clearBtn.fs:SetTextColor(1, 0.8, 0.6)
+    clearBtn:SetScript("OnClick", function()
+        for i = #S.deals, 1, -1 do
+            if S.deals[i].bought then table.remove(S.deals, i) end
+        end
+        refreshFeed()
+    end)
+    local closeBtn = CreateFrame("Button", nil, feedFrame)
+    closeBtn:SetSize(52, 18) closeBtn:SetPoint("TOPRIGHT", -6, -6)
+    local xbg = closeBtn:CreateTexture(nil, "BACKGROUND")
+    xbg:SetAllPoints() xbg:SetColorTexture(0.2, 0.2, 0.25, 0.95)
+    closeBtn.fs = closeBtn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    closeBtn.fs:SetAllPoints() closeBtn.fs:SetText("Close")
+    closeBtn.fs:SetTextColor(0.9, 0.9, 0.9)
+    closeBtn:SetScript("OnClick", function() feedFrame:Hide() end)
+
+    -- column headers
+    local function col(x, w, label, right)
+        local h = feedFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        h:SetPoint("LEFT", x, 0) h:SetWidth(w or 60)
+        h:SetJustifyH(right and "RIGHT" or "LEFT")
+        h:SetTextColor(0.55, 0.55, 0.6)
+        h:SetText(label)
+    end
+    col(60, 220, "item")
+    col(285, 70, "price", true)
+    col(358, 70, "market", true)
+    col(430, 42, "off", true)
+    col(474, 40, "tier")
+    col(516, 60, "profit", true)
+
+    feedRows = {}
+    for i = 1, FEED_ROWS do
+        local row = CreateFrame("Button", nil, feedFrame)
+        row:SetSize(FEED_W - 16, FEED_ROW_H)
+        row:SetPoint("TOPLEFT", feedFrame, "TOPLEFT", 8, -30 - (i - 1) * FEED_ROW_H)
+        local rbg = row:CreateTexture(nil, "BACKGROUND")
+        rbg:SetAllPoints()
+        rbg:SetColorTexture(0.07, 0.07, 0.10, i % 2 == 0 and 0.6 or 0.35)
+        row.icon = row:CreateTexture(nil, "ARTWORK")
+        row.icon:SetSize(20, 20) row.icon:SetPoint("LEFT", 2, 0)
+        row.newBadge = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.newBadge:SetPoint("LEFT", 26, 0) row.newBadge:SetText("|cffff4444NEW|r")
+        row.name = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        row.name:SetPoint("LEFT", 60, 0) row.name:SetWidth(220)
+        row.name:SetJustifyH("LEFT") row.name:SetWordWrap(false)
+        row.price = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.price:SetPoint("LEFT", 285, 0) row.price:SetWidth(70) row.price:SetJustifyH("RIGHT")
+        row.market = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.market:SetPoint("LEFT", 358, 0) row.market:SetWidth(70) row.market:SetJustifyH("RIGHT")
+        row.pct = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.pct:SetPoint("LEFT", 430, 0) row.pct:SetWidth(42) row.pct:SetJustifyH("CENTER")
+        row.tier = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.tier:SetPoint("LEFT", 474, 0) row.tier:SetWidth(40)
+        row.profit = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.profit:SetPoint("LEFT", 516, 0) row.profit:SetWidth(60) row.profit:SetJustifyH("RIGHT")
+        row.buyBtn = CreateFrame("Button", nil, row)
+        row.buyBtn:SetSize(42, 18) row.buyBtn:SetPoint("RIGHT", -2, 0)
+        local bbg = row.buyBtn:CreateTexture(nil, "BACKGROUND")
+        bbg:SetAllPoints() bbg:SetColorTexture(0.15, 0.4, 0.15, 0.9)
+        row.buyBtn.fs = row.buyBtn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.buyBtn.fs:SetAllPoints() row.buyBtn.fs:SetText("BUY")
+        row.buyBtn.fs:SetTextColor(0.3, 1, 0.3)
+        row.buyBtn:SetScript("OnClick", function(self)
+            local r = self:GetParent()
+            if r.itemID and r.line then buySweep(r.itemID, r.link, r.line, r.market2) end
+        end)
+        -- click the row itself: live price check in chat
+        row:SetScript("OnClick", function(self)
+            if self.itemID then searchListing(self.itemID, self.link, nil) end
+        end)
+        row:Hide()
+        feedRows[i] = row
+    end
+
+    feedStatus = feedFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    feedStatus:SetPoint("BOTTOMLEFT", 10, 6)
+    feedStatus:SetWidth(FEED_W - 20)
+    feedStatus:SetJustifyH("LEFT")
+    feedStatus:SetTextColor(0.55, 0.55, 0.6)
+    feedStatus:SetText("|cff888888waiting for the first sweep...|r")
+end
+local function buildFeed()
+    if feedFrame then return end
+    feedFrame = CreateFrame("Frame", "ForeverSniperFeed", UIParent)
     feedFrame:SetSize(FEED_W, 34 + FEED_ROWS * FEED_ROW_H + 8)
     feedFrame:SetPoint("LEFT", UIParent, "LEFT", 16, 0)
     feedFrame:SetMovable(true)
@@ -855,7 +992,7 @@ local function buildFeed()
     bg:SetAllPoints() bg:SetColorTexture(0.05, 0.05, 0.07, 0.97)
     local title = feedFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     title:SetPoint("TOPLEFT", 10, -8)
-    title:SetText("|cffff7d0aForever Sniper|r — deals (profit first)")
+    title:SetText("|cffff7d0aForever Sniper|r - deals (profit first)")
     local closeBtn = CreateFrame("Button", nil, feedFrame, "UIPanelButtonTemplate")
     closeBtn:SetSize(52, 18) closeBtn:SetPoint("TOPRIGHT", -6, -6)
     closeBtn:SetText("Close")
@@ -930,25 +1067,25 @@ local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
         units = sweep.units, cost = sweep.cost, profit = sweep.profit,
     })
 
-    local label = link or ("item " .. tostring(itemID))
+    local label = link or (infoOf(itemID).name) or ("item " .. tostring(itemID))
     if market and market > 0 then
         if sweep.units > 1 then
-            printf("|cffff4d00DEAL|r %s — |cffffd100%d units|r under %s: |cffffd100%s total|r (avg %s, market %s) |cff7cff4f+%s profit|r",
+            printf("|cffff4d00DEAL|r %s - |cffffd100%d units|r under %s: |cffffd100%s total|r (avg %s, market %s) |cff7cff4f+%s profit|r",
                 label, sweep.units, fmtMoney(math.floor(sweep.cost / sweep.units + 0.5)),
                 fmtMoney(sweep.cost), fmtMoney(math.floor(sweep.cost / sweep.units + 0.5)),
                 fmtMoney(market), fmtMoney(sweep.profit or 0))
         else
-            printf("|cffff4d00DEAL|r %s — %s  (market %s, |cff7cff4f-%d%%|r, |cff7cff4f+%s|r)",
+            printf("|cffff4d00DEAL|r %s - %s  (market %s, |cff7cff4f-%d%%|r, |cff7cff4f+%s|r)",
                 label, fmtMoney(unit), fmtMoney(market),
                 math.floor((1 - unit / market) * 100 + 0.5),
                 fmtMoney(math.floor(market * (1 - cfg.cut) - unit)))
         end
     else
         if sweep.units > 1 then
-            printf("|cffff4d00DEAL|r %s — |cffffd100%d units|r at or under %s: |cffffd100%s total|r (|cff9d9d9dwatch rule|r)",
+            printf("|cffff4d00DEAL|r %s - |cffffd100%d units|r at or under %s: |cffffd100%s total|r (|cff9d9d9dwatch rule|r)",
                 label, sweep.units, fmtMoney(unit), fmtMoney(sweep.cost))
         else
-            printf("|cffff4d00DEAL|r %s — %s  (|cff9d9d9dwatch rule|r)", label, fmtMoney(unit))
+            printf("|cffff4d00DEAL|r %s - %s  (|cff9d9d9dwatch rule|r)", label, fmtMoney(unit))
         end
     end
     playAlertSound()
@@ -1037,7 +1174,7 @@ local function completeScan(reason)
     -- Market deals: a new listing under threshold% of a learned median. The
     -- whole depth under that line is swept (every unit of every cheap listing,
     -- so stackables come as one lot), and the deal only fires if the estimated
-    -- resale profit — market after the AH cut, minus cost — clears the floor.
+    -- resale profit - market after the AH cut, minus cost - clears the floor.
     local deals = 0
     if not firstScan then
         for _, c in ipairs(cands) do
@@ -1082,7 +1219,7 @@ local function completeScan(reason)
 
     -- Watch rules: absolute price, no history needed, fires even on scan one.
     -- Swept against the rule's own ceiling the same way, so a stack of cheap
-    -- cloth reads as one lot, but no profit guess — the rule IS the decision.
+    -- cloth reads as one lot, but no profit guess - the rule IS the decision.
     if next(db.watch) ~= nil then
         rebuildWatch()
         for _, c in ipairs(cands) do
@@ -1211,7 +1348,7 @@ function requestReplicate()
     local okN, n = pcall(C_AuctionHouse.GetNumReplicateItems)
     n = okN and math.floor(num(n) or 0) or 0
     if n > 0 then
-        dbg("replicate data present: n=" .. n .. " — harvesting, no new request")
+        dbg("replicate data present: n=" .. n .. " - harvesting, no new request")
         S.scanning = true
         after(3, function()
             -- let an in-flight delivery settle; the event may beat the timer
@@ -1391,7 +1528,10 @@ end
 local function startSweeping()
     if S.sweepTicker or not cfg.enabled then return end
     local period = math.max(tonumber(cfg.sweep) or 3, 2)
-    S.sweepTicker = C_Timer.NewTicker(period, sweepQuery)
+    S.sweepTicker = C_Timer.NewTicker(period, function()
+        sweepQuery()
+        feedTick() -- apply deferred feed refreshes
+    end)
     after(1, sweepQuery)
     dbg("live sweep armed: category rotation every " .. period .. "s")
 end
@@ -1413,7 +1553,7 @@ local unknownEvents = {}
 
 -- Register a handler; altEvent is a fallback name for clients that spell the
 -- event differently (the Forever client fires REPLICATE_ITEM_LIST_UPDATE,
--- retail fires REPLICATE_ITEM_LIST_UPDATED — one letter cost the whole scan loop)
+-- retail fires REPLICATE_ITEM_LIST_UPDATED - one letter cost the whole scan loop)
 local function on(event, fn, altEvent)
     handlers[event] = fn
     if pcall(f.RegisterEvent, f, event) then return end
@@ -1446,8 +1586,17 @@ on("PLAYER_LOGIN", function()
     if #unknownEvents > 0 then
         err("events", "unknown: " .. table.concat(unknownEvents, ", "))
     end
-    printf("armed. /fsn help — visits to the AH build the price book (alert %d%% of market).",
-        math.floor(cfg.threshold * 100 + 0.5))
+    if not db.welcomed then
+        db.welcomed = true
+        printf("|cffff7d0aWelcome to Forever Sniper|r - the AH money printer.")
+        printf("1. open the Auction House - it learns prices and hunts deals automatically")
+        printf("2. type |cffffd100/fsn feed|r for the live deal window (click a row to check prices, BUY to buy)")
+        printf("3. under-vendor listings alert as |cffffd100VENDOR|r flips: buy, vendor, instant profit")
+        printf("everything else: |cffffd100/fsn help|r")
+    else
+        printf("armed. /fsn help - visits to the AH build the price book (alert %d%% of market).",
+            math.floor(cfg.threshold * 100 + 0.5))
+    end
 end)
 
 on("AUCTION_HOUSE_SHOW", function()
@@ -1536,16 +1685,16 @@ local function printPending(kind)
         for i = 1, math.min(n, 3) do
             local ok2, info = pcall(C_AuctionHouse.GetItemSearchResultInfo, key, i)
             if ok2 and type(info) == "table" then
-                printf("  x%d — %s  (buy in the AH window)", info.quantity or 1,
+                printf("  x%d - %s  (buy in the AH window)", info.quantity or 1,
                     fmtMoney(info.buyoutAmount or info.unitPrice))
                 shown = shown + 1
             end
         end
     end
     if p.units and p.units > 1 then
-        printf("  |cffffd100buy %d units|r — that is every one under your line, one purchase.", p.units)
+        printf("  |cffffd100buy %d units|r - that is every one under your line, one purchase.", p.units)
     end
-    if shown == 0 then printf("  results are in — check the AH window; nothing printable.") end
+    if shown == 0 then printf("  results are in - check the AH window; nothing printable.") end
 end
 
 on("ITEM_SEARCH_RESULTS_UPDATED", function()
@@ -1568,46 +1717,127 @@ on("COMMODITY_PRICE_UPDATED", function(total)
     end
 end)
 
+-- options panel: plain-frame toggles and steppers, no templates needed ------
+local optionsFrame
+
+local function buildOptions()
+    if optionsFrame then return end
+    optionsFrame = CreateFrame("Frame", "ForeverSniperOptions", UIParent)
+    optionsFrame:SetSize(300, 240)
+    optionsFrame:SetPoint("CENTER")
+    optionsFrame:SetMovable(true)
+    optionsFrame:EnableMouse(true)
+    optionsFrame:RegisterForDrag("LeftButton")
+    optionsFrame:SetScript("OnDragStart", optionsFrame.StartMoving)
+    optionsFrame:SetScript("OnDragStop", optionsFrame.StopMovingOrSizing)
+    local bg = optionsFrame:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints() bg:SetColorTexture(0.05, 0.05, 0.07, 0.97)
+    local title = optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOPLEFT", 10, -8)
+    title:SetText("|cffff7d0aForever Sniper|r - options")
+    local closeBtn = CreateFrame("Button", nil, optionsFrame)
+    closeBtn:SetSize(52, 18) closeBtn:SetPoint("TOPRIGHT", -6, -6)
+    local xbg = closeBtn:CreateTexture(nil, "BACKGROUND")
+    xbg:SetAllPoints() xbg:SetColorTexture(0.2, 0.2, 0.25, 0.95)
+    closeBtn.fs = closeBtn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    closeBtn.fs:SetAllPoints() closeBtn.fs:SetText("Close")
+    closeBtn:SetScript("OnClick", function() optionsFrame:Hide() end)
+
+    local function toggle(y, label, key, extra)
+        local b = CreateFrame("Button", nil, optionsFrame)
+        b:SetSize(120, 22) b:SetPoint("TOPLEFT", 12, -y)
+        b.bg = b:CreateTexture(nil, "BACKGROUND")
+        b.bg:SetAllPoints()
+        b.fs = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        b.fs:SetPoint("LEFT", 6, 0)
+        local function paint()
+            if cfg[key] then
+                b.bg:SetColorTexture(0.15, 0.4, 0.15, 0.9)
+                b.fs:SetTextColor(0.4, 1, 0.5)
+            else
+                b.bg:SetColorTexture(0.35, 0.15, 0.15, 0.9)
+                b.fs:SetTextColor(1, 0.5, 0.5)
+            end
+            b.fs:SetText(label .. ": " .. (cfg[key] and "on" or "off"))
+        end
+        b:SetScript("OnClick", function()
+            cfg[key] = not cfg[key]
+            paint()
+            if extra then extra() end
+        end)
+        paint()
+        return b
+    end
+
+    toggle(34, "sound", "sound")
+    toggle(62, "screen flash", "flash")
+    toggle(90, "toast", "toast")
+    toggle(118, "alert popup", "popup")
+    toggle(146, "quiet summaries", "quiet")
+
+    local function stepper(y, label, get, set, fmt, step)
+        local lab = optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        lab:SetPoint("TOPLEFT", 160, -y - 3)
+        lab:SetText(label)
+        local val = optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        val:SetPoint("TOPLEFT", 160, -y - 22)
+        local function paint() val:SetText(fmt(get())) end
+        local function mk(text, dx, fn)
+            local b = CreateFrame("Button", nil, optionsFrame)
+            b:SetSize(24, 20) b:SetPoint("TOPLEFT", 160 + dx, -y - 20)
+            local t = b:CreateTexture(nil, "BACKGROUND")
+            t:SetAllPoints() t:SetColorTexture(0.2, 0.25, 0.35, 0.95)
+            local fs = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            fs:SetAllPoints() fs:SetText(text)
+            b:SetScript("OnClick", function() fn() paint() end)
+        end
+        mk("-", 100, function() set(get() - step) end)
+        mk("+", 128, function() set(get() + step) end)
+        paint()
+    end
+
+    stepper(34, "deal threshold", function() return cfg.threshold end,
+        function(v) cfg.threshold = math.min(0.99, math.max(0.01, v)) end,
+        function(v) return math.floor(v * 100 + 0.5) .. "% of market" end, 0.05)
+    stepper(96, "sweep seconds", function() return cfg.sweep end,
+        function(v)
+            cfg.sweep = math.min(30, math.max(2, math.floor(v)))
+            if S.sweepTicker then stopSweeping() startSweeping() end
+        end,
+        function(v) return tostring(v) .. "s between sweeps" end, 1)
+    stepper(152, "spend cap (gold)", function() return cfg.maxSpend / 10000 end,
+        function(v) cfg.maxSpend = math.max(1, math.floor(v)) * 10000 end,
+        function(v) return math.floor(v + 0.5) .. "g per Buy" end, 25)
+end
 -- Slash commands ---------------------------------------------------------------------
 
 local HELP = {
-    "|cffffd100Forever Sniper|r — it watches, you buy",
+    "|cffff7d0aForever Sniper|r - it watches, you buy",
+    "|cffffd100core|r",
     "/fsn                  status",
-    "/fsn on | off         enable / disable scanning",
-    "/fsn thresh 50        alert at or under 50% of learned market (default 50)",
-    "/fsn every 45         seconds between scans while the AH is open (15-900)",
-    "/fsn sweep 3          seconds between live market sweeps (2-30)",
-    "/fsn fresh 45         minutes a price sample stays fresh enough to arm alerts (5-480)",
-    "/fsn overhang 500     skip deals with more units listed above them (0 = off)",
-    "/fsn arm 2            scans of history before market alerts fire (1-10)",
-    "/fsn min 10s          ignore deals under this per-unit price",
-    "/fsn quality 2        market alerts need this rarity or better (0 any, 2 green+)",
-    "/fsn cut 5            AH cut assumed when estimating profit (percent)",
-    "/fsn profit 1g        deals must clear this estimated resale profit (0 off)",
-    "/fsn max 250g         spend cap per Buy click (default 100g)",
-    "   row [Buy]          one press: re-checks live prices, buys every unit under",
-    "                       your line (commodities open the filled purchase)",
-    "/fsn watch <link> 50g watchlist rule; a plain item name works too",
+    "/fsn feed             deal window (click a row = live prices, BUY = buy)",
+    "/fsn profit           money printer stats (session + lifetime)",
+    "/fsn options          settings panel",
+    "/fsn on | off         enable / disable",
+    "/fsn watch <link> 50s watchlist rule (a plain item name works too)",
     "/fsn unwatch <link>|all",
-    "/fsn ignore <link>    never alert this item (false-deal silencer)",
-    "/fsn unignore <link>|all",
-    "/fsn scan             force a scan right now (AH window open)",
-    "/fsn pop              show/hide the alert popup",
-    "/fsn feed             show/hide the deal feed window (profit-sorted, BUY buttons)",
-    "/fsn flash            toggle the deal screen flash",
-    "/fsn toast            toggle toast notifications",
-    "/fsn quiet            toggle per-scan summaries",
-    "/fsn sound            toggle the alert sound",
-    "/fsn watchlist        current rules",
-    "/fsn profit            the money printer scoreboard (session + lifetime)",
-    "/fsn alerts           last 8 alerts",
-    "/fsn shape            what the beta's replicate API returned (debug)",
-    "/fsn errors           recorded API failures",
-    "/fsn wipe book|all    clear the price book / everything",
+    "|cffffd100tuning|r",
+    "/fsn thresh 50        alert at %% of learned market (1-99)",
+    "/fsn sweep 3          seconds between live sweeps (2-30)",
+    "/fsn max 250g         spend cap per Buy click",
+    "/fsn min 10s          ignore deals under this per-unit price",
+    "/fsn quality 2        minimum rarity for market alerts (0 = any)",
+    "/fsn profit 1g        minimum estimated resale profit (0 = off)",
+    "/fsn arm 2            scans of history before alerts fire",
+    "/fsn fresh 45         minutes a price sample stays fresh (5-480)",
+    "/fsn overhang 500     skip deals buried under more units (0 = off)",
+    "/fsn every 45 / cut 5 full-scan cadence / assumed AH cut percent",
+    "|cffffd100alerts|r - sound, flash, toast, pop, quiet",
+    "|cffffd100data|r - alerts, watchlist, shape, errors, wipe book|all",
 }
 
 local function usageWatch(rest)
-    -- "/fsn watch [Item Link] 3g50s" — the money words come off the end.
+    -- "/fsn watch [Item Link] 3g50s" - the money words come off the end.
     local words = { strsplit(" ", (rest:gsub("%s+", " "):gsub("^%s", ""))) }
     local moneyWords = {}
     while #words > 0 and words[#words]:match("^%d+[gGsScC]?%d*[gGsScC]?$") and words[#words]:match("%d") do
@@ -1654,12 +1884,12 @@ SlashCmdList.FOREVERSNIPER = function(msg)
                 date("%m-%d %H:%M", db.stats.lastScan), db.stats.lastListings or 0,
                 math.floor(cfg.threshold * 100 + 0.5), cfg.every, cfg.armAfter, fmtMoney(cfg.minUnit))
         else
-            printf("no scans yet — open the auction house to start learning.")
+            printf("no scans yet - open the auction house to start learning.")
         end
         printf("profit gate: quality %s, %d%% AH cut, minimum profit %s.",
             cfg.quality == 0 and "any" or (cfg.quality .. "+"),
             math.floor(cfg.cut * 100 + 0.5), cfg.profit > 0 and fmtMoney(cfg.profit) or "off")
-        printf("spend cap per Buy click: |cffffd100%s|r. every purchase is your click — never automatic.",
+        printf("spend cap per Buy click: |cffffd100%s|r. every purchase is your click - never automatic.",
             fmtMoney(cfg.maxSpend))
         printf("AH window %s. %d watch rules, %d blacklisted. /fsn help for everything.",
             S.ahOpen and "open" or "closed", countKeys(db.watch), countKeys(db.blacklist))
@@ -1775,7 +2005,7 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             printf("%d watch rule%s:", n, n == 1 and "" or "s")
             for key, w in pairs(db.watch) do
                 local ok, name = pcall(GetItemInfo, tonumber(key) or key)
-                printf("  %s — at or under %s", (key:sub(1, 2) == "n:" and key:sub(3)) or name or ("item " .. key), fmtMoney(w.maxPrice))
+                printf("  %s - at or under %s", (key:sub(1, 2) == "n:" and key:sub(3)) or name or ("item " .. key), fmtMoney(w.maxPrice))
             end
         end
 
@@ -1792,7 +2022,7 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             if itemID then
                 if cmd == "ignore" then
                     db.blacklist[itemID] = true
-                    printf("item %d blacklisted — no more alerts.", itemID)
+                    printf("item %d blacklisted - no more alerts.", itemID)
                 else
                     db.blacklist[itemID] = nil
                     printf("item %d un-blacklisted.", itemID)
@@ -1836,10 +2066,18 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             printf("deal feed showing - best profit on top. BUY re-checks live prices.")
         end
 
+    elseif cmd == "options" then
+        buildOptions()
+        if optionsFrame:IsShown() then
+            optionsFrame:Hide()
+        else
+            optionsFrame:Show()
+        end
+
     elseif cmd == "profit" then
         local st = db.stats or {}
         local mins = math.floor((time() - (S.session.started or time())) / 60 + 0.5)
-        printf("|cffffd100money printer|r — session: %d buy(s), |cffff4d00%s committed|r in %d min.",
+        printf("|cffffd100money printer|r - session: %d buy(s), |cffff4d00%s committed|r in %d min.",
             S.session.buys or 0, fmtMoney(S.session.spent or 0), mins)
         printf("lifetime: %d deal(s) flagged, %d vendor flip(s) worth |cffffd100%s|r.",
             st.deals or 0, st.vendorDeals or 0, fmtMoney(st.vendorProfit or 0))
@@ -1857,7 +2095,7 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             if a.profit and a.profit > 0 then
                 suffix = suffix .. string.format(", |cff7cff4f+%s profit|r", fmtMoney(a.profit))
             end
-            printf("  [%s] %s — %s%s", date("%m-%d %H:%M", a.t), a.link or ("item " .. tostring(a.id)),
+            printf("  [%s] %s - %s%s", date("%m-%d %H:%M", a.t), a.link or ("item " .. tostring(a.id)),
                 fmtMoney(a.unit), suffix)
             shown = shown + 1
             if shown >= 8 then break end
@@ -1898,3 +2136,4 @@ SlashCmdList.FOREVERSNIPER = function(msg)
         printf("unknown command %q. /fsn help", cmd)
     end
 end
+
