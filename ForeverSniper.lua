@@ -214,18 +214,50 @@ local itemInfoCache = {}
 local function infoOf(itemID)
     local c = itemInfoCache[itemID]
     if c ~= nil then return c end
-    local ok, name, _, q, _, _, _, _, _, _, icon, sell = pcall(GetItemInfo, itemID)
-    if not ok or type(name) ~= "string" then
+    -- direct by-ID queries first: no item link needed, and they answer when
+    -- full GetItemInfo is not cached yet (GetItemMaxStackSizeByID is the
+    -- stackable oracle on this client)
+    local dName, dQuality, dIcon, dMaxStack
+    if C_Item then
+        if C_Item.GetItemNameByID then
+            local okN, n = pcall(C_Item.GetItemNameByID, itemID)
+            if okN and type(n) == "string" then dName = n end
+        end
+        if C_Item.GetItemQualityByID then
+            local okQ, q2 = pcall(C_Item.GetItemQualityByID, itemID)
+            if okQ and type(q2) == "number" then dQuality = q2 end
+        end
+        if C_Item.GetItemIconByID then
+            local okI, ic = pcall(C_Item.GetItemIconByID, itemID)
+            if okI and type(ic) == "string" then dIcon = ic end
+        end
+        if C_Item.GetItemMaxStackSizeByID then
+            local okS, ms = pcall(C_Item.GetItemMaxStackSizeByID, itemID)
+            if okS and type(ms) == "number" then dMaxStack = ms end
+        end
+    end
+    local ok, name, _, q, _, _, _, _, gStack, _, icon, sell = pcall(GetItemInfo, itemID)
+    if dName == nil and (not ok or name == nil) then
         -- uncached item: never cache the unknown state - the client fills
         -- item info in asynchronously and the next call must see it
-        return { name = nil, icon = nil, quality = -1, vendor = 0 }
+        return { name = nil, icon = nil, quality = -1, vendor = 0, maxStack = nil, stackable = nil }
     end
     c = {
-        name = (ok and type(name) == "string") and name or nil,
-        icon = (ok and type(icon) == "string") and icon or nil,
-        quality = (ok and type(q) == "number") and q or -1,
+        name = dName or ((ok and type(name) == "string") and name or nil),
+        icon = dIcon or ((ok and type(icon) == "string") and icon or nil),
+        quality = dQuality or ((ok and type(q) == "number") and q or -1),
         vendor = (ok and type(sell) == "number") and sell or 0,
+        maxStack = dMaxStack or ((ok and type(gStack) == "number") and gStack or nil),
     }
+    if c.maxStack ~= nil then
+        c.stackable = (c.maxStack > 1) and true or false
+    else
+        c.stackable = nil -- unknown until the client caches the item
+    end
+    if not c.stackable and C_AuctionHouse and C_AuctionHouse.GetItemCommodityStatus then
+        local okC, st = pcall(C_AuctionHouse.GetItemCommodityStatus, itemID)
+        if okC and st == true then c.stackable = true end
+    end
     itemInfoCache[itemID] = c
     return c
 end
@@ -1267,7 +1299,10 @@ local function completeScan(reason)
                     end
                     local q = qualityOf(c.id)
                     local maxOver = cfg.overhang or 0
-                    if q == -1 then
+                    local stackableR = infoOf(c.id).stackable
+                    if stackableR == false then
+                        -- stackables-only mode
+                    elseif stackableR == nil or q == -1 then
                         requestItemLoad(c.id) -- uncached: passes next scan
                     elseif q < (cfg.quality or 1) then
                         dbg("skip " .. c.id .. ": quality " .. q .. " below bar, not a clean relist")
@@ -1529,13 +1564,14 @@ end
 -- The book learns from every row; deals fire only on NEW cheap listings that
 -- pass the listability gates.
 
+-- STACKABLE ONLY: mats, consumables, gems, enhancements. Non-stackables
+-- (gear, mounts, pets, recipes) are out of scope by design - the rotation
+-- hunts commodity classes, and every alert path re-checks stackability.
 local SCAN_CATEGORIES = {
-    { name = "Weapons",     classID = 2,  priority = 3 },
-    { name = "Armor",       classID = 4,  priority = 3 },
-    { name = "Recipes",     classID = 9,  priority = 2 },
-    { name = "Pets",        classID = 17, priority = 3 },
-    { name = "Misc/Mounts", classID = 15, priority = 3 },
-    { name = "Containers",  classID = 1,  priority = 1 },
+    { name = "Trade Goods",  classID = 7, priority = 3 },
+    { name = "Consumables",  classID = 0, priority = 3 },
+    { name = "Gems",         classID = 3, priority = 2 },
+    { name = "Enhancements", classID = 8, priority = 2 },
 }
 local rotationList, rotationIndex = {}, 0
 for _, cat in ipairs(SCAN_CATEGORIES) do
@@ -1665,7 +1701,13 @@ local function processBrowseRows(rows)
             -- VENDOR FLIP: priced under the vendor sell price = guaranteed
             -- instant profit. No market gates apply - the vendor always buys.
             local sell = vendorOf(key)
-            dbg("vendor check id=" .. tostring(key) .. " price=" .. tostring(price) .. " sell=" .. tostring(sell))
+            if S.gateLog and infoOf(key).stackable ~= true then
+                if (S.gateLog.counts["not stackable (skipped)"] or 0) < 6 then
+                    why("not stackable (skipped)", key, " (stack=" .. tostring(infoOf(key).maxStack) .. ")")
+                else
+                    S.gateLog.counts["not stackable (skipped)"] = (S.gateLog.counts["not stackable (skipped)"] or 0) + 1
+                end
+            end
             if sell > 0 and price < sell then
                 if not isNewListing(key, price, true) then
                     why("already seen (vendor flip)", key)
@@ -1698,7 +1740,12 @@ local function processBrowseRows(rows)
                     local q = qualityOf(key)
                     local overhang = cfg.overhang or 0
                     local crowded = overhang > 0 and qty > overhang
-                    if q == -1 then
+                    local stackable = infoOf(key).stackable
+                    if stackable == false then
+                        -- stackables-only mode: non-stackables never alert
+                    elseif stackable == nil or q == -1 then
+                        -- unknown (stackable or quality): load and pass next sweep
+                        requestItemLoad(key)
                         -- unknown: never a hard block, just not this sweep
                         requestItemLoad(key)
                     elseif q < (cfg.quality or 1) then
@@ -2008,7 +2055,7 @@ on("ITEM_SEARCH_RESULTS_UPDATED", function()
                 local qty = num(info.quantity) or 1
                 if buyout and buyout > 0 then
                     local unit = math.floor(buyout / qty)
-                    if unit <= ws.maxPrice then
+                    if infoOf(ws.id).stackable == true and unit <= ws.maxPrice then
                         fireAlert("watch", ws.id, info.itemLink,
                             unit, nil, { units = qty, cost = buyout, line = ws.maxPrice })
                     end
