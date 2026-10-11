@@ -261,12 +261,12 @@ local S = {
     scanning   = false,
     prevList   = nil,   -- multiset: "id/count/buyout" -> occurrences
     scansDone  = 0,
-    lastAlert  = {},    -- itemID -> { t, price }
+    lastAlert  = db.lastAlert or {}, -- itemID -> { t, price } (persistent)
     pending    = nil,   -- { itemID, link, t } awaiting search results to print
     buying     = nil,   -- { itemID, link, line, market, commodity, t } active Buy click
     quote      = nil,   -- { itemID, units, total } live commodity quote
-    boughtAt   = {},    -- itemID -> { t, price } purchase cooldown
-    session    = { started = time(), spent = 0, buys = 0 }, -- money printer P&L
+    boughtAt   = db.boughtAt or {}, -- itemID -> { t, price } purchase cooldown (persistent)
+    session    = { started = time(), spent = 0, buys = 0, best = nil }, -- money printer P&L
 }
 
 -- Watchlist: split into fast lookups, rebuilt before each scan uses them.
@@ -795,7 +795,10 @@ local function showToast(tier, itemID, price, market, profit)
 end
 
 -- deal feed ------------------------------------------------------------------------
-S.deals = S.deals or {}
+-- deals, seen-listings and alert guards are db-backed: they survive /reload
+-- and relogs, so a restart never re-alerts listings you already dismissed
+S.deals = db.deals or {}
+db.deals = S.deals
 local MAX_FEED = 200
 local feedFrame, feedRows, feedStatus
 local FEED_ROWS, FEED_ROW_H, FEED_W = 14, 26, 560
@@ -1061,6 +1064,10 @@ local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
     if kind == "vendor" then
         db.stats.vendorDeals = (db.stats.vendorDeals or 0) + 1
         db.stats.vendorProfit = (db.stats.vendorProfit or 0) + (sweep.profit or 0)
+    end
+    local profit = sweep.profit or 0
+    if profit > 0 and (not S.session.best or profit > (S.session.best.profit or 0)) then
+        S.session.best = { id = itemID, profit = profit }
     end
     push(db.alerts, CAPS.alerts, {
         t = now, kind = kind, id = itemID, unit = unit, market = market,
@@ -1405,7 +1412,18 @@ local function nextCategory()
     return rotationList[rotationIndex]
 end
 
-S.seen = S.seen or {}
+S.seen = db.seen or {}
+db.seen = S.seen
+-- prune stale entries at load: seen data older than an hour is meaningless
+do
+    local cutoff = time() - 3600
+    for k, t in pairs(S.seen) do
+        if t < cutoff then S.seen[k] = nil end
+    end
+    for k, a in pairs(S.lastAlert) do
+        if (a.t or 0) < cutoff then S.lastAlert[k] = nil end
+    end
+end
 local function isNewListing(itemID, price)
     local k = tostring(itemID) .. ":" .. tostring(price)
     if S.seen[k] then return false end
@@ -1414,6 +1432,25 @@ local function isNewListing(itemID, price)
 end
 
 local throttleReady, pagePending, lastQueryAt = true, false, 0
+local sweepCount, watchCursor = 0, 0
+
+-- one watched item as a search key, or nil when nothing is watched
+local function nextWatchKey()
+    if not next(db.watch) then return nil end
+    rebuildWatch()
+    local ids = {}
+    for id, w in pairs(watchByID) do ids[#ids + 1] = tonumber(id) or id end
+    if #ids == 0 then return nil end
+    watchCursor = (watchCursor % #ids) + 1
+    local id = ids[watchCursor]
+    local w = watchByID[id]
+    local key = { itemID = id }
+    if C_AuctionHouse and C_AuctionHouse.MakeItemKey then
+        local okK, k = pcall(C_AuctionHouse.MakeItemKey, id)
+        if okK and type(k) == "table" then key = k end
+    end
+    return key, id, w
+end
 
 -- Querying while Blizzard's own browse tab is up can crash its ScrollBox
 local function blizzardBrowseActive()
@@ -1487,11 +1524,32 @@ end
 
 local function sweepQuery()
     if not canQuery() then return end
-    if C_AuctionHouse == nil or C_AuctionHouse.SendBrowseQuery == nil then return end
+    if C_AuctionHouse == nil then return end
     if blizzardBrowseActive() then
         dbg("yielding: Blizzard's browse tab is showing")
         return
     end
+    sweepCount = sweepCount + 1
+    -- every 5th query hunts a watched item directly: deep listings the browse
+    -- first page never shows, at the speed of an explicit search
+    if sweepCount % 5 == 0 and C_AuctionHouse.SendSearchQuery then
+        local key, id, w = nextWatchKey()
+        if key and w then
+            local sorts = {}
+            if Enum and Enum.AuctionHouseSortOrder then
+                local so = Enum.AuctionHouseSortOrder.Price or Enum.AuctionHouseSortOrder.Buyout
+                if so then sorts = { { sortOrder = so, reverseSort = false } } end
+            end
+            local ok, e = pcall(C_AuctionHouse.SendSearchQuery, key, sorts, false)
+            if ok then
+                lastQueryAt = GetTime()
+                S.watchSearch = { id = id, maxPrice = w.maxPrice, t = GetTime() }
+                return
+            end
+            err("SendSearchQuery(watch)", e)
+        end
+    end
+    if C_AuctionHouse.SendBrowseQuery == nil then return end
     local cat = nextCategory()
     local sorts = {}
     if Enum and Enum.AuctionHouseSortOrder then
@@ -1615,6 +1673,13 @@ on("AUCTION_HOUSE_CLOSED", function()
         S.harvestTicker:Cancel()
         S.harvestTicker = nil
     end
+    -- compact session summary: what the printer did while you were in there
+    local best = S.session.best
+    if best and best.profit and best.profit > 0 then
+        printf("session: |cffffd100%d buy(s)|r for |cffff4d00%s|r - best find |cffffd100%s|r |cff7cff4f+%s|r.",
+            S.session.buys or 0, fmtMoney(S.session.spent or 0),
+            infoOf(best.id).name or ("item " .. best.id), fmtMoney(best.profit))
+    end
 end)
 
 on("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", function()
@@ -1698,6 +1763,34 @@ local function printPending(kind)
 end
 
 on("ITEM_SEARCH_RESULTS_UPDATED", function()
+    -- watch-rule search results first: cheapest listing under the rule's
+    -- ceiling fires a watch alert immediately
+    local ws = S.watchSearch
+    if ws and GetTime() - ws.t < 10 and C_AuctionHouse.GetItemSearchResultInfo then
+        S.watchSearch = nil
+        local key = { itemID = ws.id }
+        if C_AuctionHouse.MakeItemKey then
+            local okK, k = pcall(C_AuctionHouse.MakeItemKey, ws.id)
+            if okK and type(k) == "table" then key = k end
+        end
+        local okN, n = pcall(C_AuctionHouse.GetNumItemSearchResults, key)
+        n = okN and math.floor(num(n) or 0) or 0
+        if n > 0 then
+            local okI, info = pcall(C_AuctionHouse.GetItemSearchResultInfo, key, 1)
+            if okI and type(info) == "table" then
+                local buyout = num(info.buyoutAmount)
+                local qty = num(info.quantity) or 1
+                if buyout and buyout > 0 then
+                    local unit = math.floor(buyout / qty)
+                    if unit <= ws.maxPrice then
+                        fireAlert("watch", ws.id, info.itemLink,
+                            unit, nil, { units = qty, cost = buyout, line = ws.maxPrice })
+                    end
+                end
+            end
+        end
+        return
+    end
     if S.buying then buyFromResults("item") else printPending("item") end
 end)
 on("COMMODITY_SEARCH_RESULTS_UPDATED", function()
