@@ -303,7 +303,9 @@ local function searchListing(itemID, link, units)
     key = key or { itemID = itemID }
     local sorts
     if Enum and Enum.AuctionHouseSortOrder and Enum.AuctionHouseSortOrder.Price then
-        sorts = { { sortOrder = Enum.AuctionHouseSortOrder.Price, reverse = false } }
+        -- this client validates the field by name: reverseSort, not reverse
+        -- (live error: "Current Field: [reverseSort]"); Auctionator's shape
+        sorts = { { sortOrder = Enum.AuctionHouseSortOrder.Price, reverseSort = false } }
     end
     local ok, e = pcall(C_AuctionHouse.SendSearchQuery, key, sorts, false)
     if not ok then
@@ -454,13 +456,21 @@ local function buyFromResults(kind)
     S.buying = nil
     if not S.ahOpen then printf("the AH window closed — buy aborted.") return end
 
+    -- this client's result readers are keyed: GetNumItemSearchResults(itemKey),
+    -- GetItemSearchResultInfo(itemKey, index), GetCommoditySearchResultInfo(itemID, index)
+    local key = { itemID = b.itemID }
+    if C_AuctionHouse.MakeItemKey then
+        local okK, k = pcall(C_AuctionHouse.MakeItemKey, b.itemID)
+        if okK and type(k) == "table" then key = k end
+    end
+
     if kind == "commodity" then
         -- Commodity results: price points, cheapest first. Take every unit
         -- under the line, cheapest first, stopping at the spend cap.
         local units, cost = 0, 0
         local i = 1
         while true do
-            local ok, info = pcall(C_AuctionHouse.GetCommoditySearchResultInfo, i)
+            local ok, info = pcall(C_AuctionHouse.GetCommoditySearchResultInfo, b.itemID, i)
             if not ok or type(info) ~= "table" then break end
             local price = num(info.unitPrice or info.buyoutAmount)
             local avail = num(info.quantity) or 0
@@ -492,11 +502,11 @@ local function buyFromResults(kind)
 
     -- Item listings: capture every listing under the line, cheapest first,
     -- capped. The Purchase press buys them; nothing executes here.
-    local okN, n = pcall(C_AuctionHouse.GetNumItemSearchResults)
+    local okN, n = pcall(C_AuctionHouse.GetNumItemSearchResults, key)
     n = okN and math.floor(num(n) or 0) or 0
     local list, units, cost = {}, 0, 0
     for i = 1, n do
-        local ok, info = pcall(C_AuctionHouse.GetItemSearchResultInfo, i)
+        local ok, info = pcall(C_AuctionHouse.GetItemSearchResultInfo, key, i)
         if ok and type(info) == "table" and info.auctionID then
             local buyout = num(info.buyoutAmount)
             local qty = num(info.quantity) or 1
@@ -556,7 +566,7 @@ local function buySweep(itemID, link, line, market)
     key = key or { itemID = itemID }
     local sorts
     if Enum and Enum.AuctionHouseSortOrder and Enum.AuctionHouseSortOrder.Price then
-        sorts = { { sortOrder = Enum.AuctionHouseSortOrder.Price, reverse = false } }
+        sorts = { { sortOrder = Enum.AuctionHouseSortOrder.Price, reverseSort = false } }
     end
     local ok, e = pcall(C_AuctionHouse.SendSearchQuery, key, sorts, false)
     if not ok then
@@ -1105,20 +1115,25 @@ local function printPending(kind)
     if not p or GetTime() - p.t > 10 then return end
     S.pending = nil
     local shown = 0
+    local key = { itemID = p.itemID }
+    if C_AuctionHouse.MakeItemKey then
+        local okK, k = pcall(C_AuctionHouse.MakeItemKey, p.itemID)
+        if okK and type(k) == "table" then key = k end
+    end
     if kind == "commodity" and C_AuctionHouse.GetCommoditySearchResultInfo then
         local i = 1
         while shown < 3 do
-            local ok, info = pcall(C_AuctionHouse.GetCommoditySearchResultInfo, i)
+            local ok, info = pcall(C_AuctionHouse.GetCommoditySearchResultInfo, p.itemID, i)
             if not ok or type(info) ~= "table" then break end
             printf("  %d x %s each", info.quantity or 1, fmtMoney(info.unitPrice or info.buyoutAmount))
             shown = shown + 1
             i = i + 1
         end
     elseif C_AuctionHouse.GetItemSearchResultInfo then
-        local ok, n = pcall(C_AuctionHouse.GetNumItemSearchResults)
+        local ok, n = pcall(C_AuctionHouse.GetNumItemSearchResults, key)
         n = ok and math.floor(num(n) or 0) or 0
         for i = 1, math.min(n, 3) do
-            local ok2, info = pcall(C_AuctionHouse.GetItemSearchResultInfo, i)
+            local ok2, info = pcall(C_AuctionHouse.GetItemSearchResultInfo, key, i)
             if ok2 and type(info) == "table" then
                 printf("  x%d — %s  (buy in the AH window)", info.quantity or 1,
                     fmtMoney(info.buyoutAmount or info.unitPrice))
