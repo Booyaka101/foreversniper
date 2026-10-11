@@ -298,6 +298,47 @@ local function absorbTrack(itemID, belowLine, now)
         end
     end
 
+-- MOMENTUM + VOLATILITY (strategy sauce): the book's recent samples tell
+-- whether a market is climbing (hold/raise your price) or sinking (front the
+-- queue now), and how much it swings (flippability).
+local function bookTrend(itemID)
+    local b = db.book[itemID]
+    if not b or not b.s or #b.s < 8 then return 0 end
+    local n = #b.s / 2
+    local recent, prior = {}, {}
+    for i = 1, n do
+        local p = b.s[i * 2]
+        if i > n - 3 then recent[#recent + 1] = p else prior[#prior + 1] = p end
+    end
+    local function avg(tbl) local s2 = 0 for _, v in ipairs(tbl) do s2 = s2 + v end return s2 / #tbl end
+    local a, c = avg(recent), avg(prior)
+    if c <= 0 then return 0 end
+    return (a - c) / c
+end
+
+local function bookVolatility(itemID)
+    local b = db.book[itemID]
+    if not b or not b.s or #b.s < 8 then return nil end
+    local vals = {}
+    for i = 2, #b.s, 2 do vals[#vals + 1] = b.s[i] end
+    local n = #vals
+    local mean = 0
+    for _, v in ipairs(vals) do mean = mean + v end
+    mean = mean / n
+    local var = 0
+    for _, v in ipairs(vals) do var = var + (v - mean) * (v - mean) end
+    if mean <= 0 then return nil end
+    return math.sqrt(var / n) / mean
+end
+
+-- smart relist price: rising market -> ask above median; sinking -> undercut
+local function smartPrice(itemID, med)
+    local tr = bookTrend(itemID)
+    if tr > 0.05 then return math.floor(med * 1.10), tr end
+    if tr < -0.05 then return math.floor(med * 0.92), tr end
+    return math.floor(med), tr
+end
+
 -- TSM-STYLE TIERED THRESHOLD (their default sniper formula, classic-scaled):
 -- expensive items only need a small discount, cheap ones need a huge one.
 --   market > 250g -> 20% off | >100g -> 30% | >50g -> 40% | >25g -> 50%
@@ -880,9 +921,13 @@ local function sellAt(itemID, unitPrice)
         ok, e = pcall(C_AuctionHouse.PostItem, loc, 3, qty, unitPrice * qty)
     end
     if ok then
-        printf("listed |cffffd100%d x %s|r at |cffffd100%s each|r (%s total) - 48h.",
+        local _, tr = smartPrice(itemID, unitPrice)
+        local trendTxt = ""
+        if tr > 0.05 then trendTxt = " (market climbing - hold for more)"
+        elseif tr < -0.05 then trendTxt = " (market sinking - priced to front the queue)" end
+        printf("listed |cffffd100%d x %s|r at |cffffd100%s each|r (%s total) - 48h%s.",
             qty, infoOf(itemID).name or ("item " .. itemID),
-            fmtMoney(unitPrice), fmtMoney(unitPrice * qty))
+            fmtMoney(unitPrice), fmtMoney(unitPrice * qty), trendTxt)
         S.session.listed = (S.session.listed or 0) + 1
         local b = db.book[itemID]
         if b then b.ownUntil = time() + 300 end -- our price is not the market
@@ -900,6 +945,7 @@ end
 -- every deal lands in a profit-sorted feed window (/fsn feed) with BUY buttons.
 
 local TIERS = {
+    DUMP  = { mult = 1.0, sound = 8959, r = 0.75, g = 0.30, b = 1.00 },
     SNIPE = { mult = 5.0, sound = 8959, r = 1.00, g = 0.35, b = 0.15 },
     GREAT = { mult = 3.0, sound = 888,  r = 0.35, g = 0.80, b = 1.00 },
     GOOD  = { mult = 2.0, sound = 3081, r = 0.30, g = 1.00, b = 0.45 },
@@ -1168,7 +1214,10 @@ local function buildFeed()
         row.sellBtn.fs:SetTextColor(0.55, 0.75, 1)
         row.sellBtn:SetScript("OnClick", function(self)
             local r = self:GetParent()
-            if r.itemID and r.market2 then sellAt(r.itemID, r.market2) end
+            if r.itemID and r.market2 then
+                local sp = smartPrice(r.itemID, r.market2)
+                sellAt(r.itemID, sp)
+            end
         end)
         row.buyBtn = CreateFrame("Button", nil, row)
         row.buyBtn:SetSize(40, 18) row.buyBtn:SetPoint("RIGHT", -6, 0)
@@ -1232,7 +1281,9 @@ local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
     local label = link or (infoOf(itemID).name) or ("item " .. tostring(itemID))
     -- the action label: every deal says what to DO with it
     local action
-    if kind == "vendor" then
+    if kind == "dump" then
+        action = "|cffb44cffBUY THE FLOOR|r - a reset: absorb it, relist in stages"
+    elseif kind == "vendor" then
         action = "|cffffd100VENDOR it|r - instant, no relist"
     elseif market and market > 0 then
         action = "|cffffd100relist on the AH at " .. fmtMoney(math.floor(market)) .. "|r"
@@ -1262,7 +1313,7 @@ local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
     playAlertSound()
 
     -- WoWSniper-parity: tiered sound/flash/toast + the deal feed
-    local tier = (kind == "vendor") and "VENDOR" or tierOf(market, unit)
+    local tier = (kind == "vendor") and "VENDOR" or (kind == "dump") and "DUMP" or tierOf(market, unit)
     alertDeal(tier, itemID, link, unit, market, sweep, isNew)
 
     if cfg.popup then
@@ -1843,6 +1894,16 @@ local function processBrowseRows(rows)
                         requestItemLoad(key)
                     elseif q < (cfg.quality or 1) then
                         -- quality below bar: not a clean relist
+                    elseif crowded and qty >= 100 and price <= 0.4 * med then
+                        -- DUMP DETECTOR: a huge wall at a deep discount is a reset
+                        -- (someone quitting, or crashing a market). Goblins buy the
+                        -- floor and relist in stages as the queue clears.
+                        if isNewListing(key, price) then
+                            local cost = qty * price
+                            local est = math.floor(qty * med * (1 - cfg.cut) - cost)
+                            fireAlert("dump", key, nil, price, med,
+                                { units = qty, cost = cost, profit = est, line = price }, true)
+                        end
                     elseif crowded then
                         dbg("skip " .. key .. ": " .. qty .. " units listed, relist would queue behind them")
                     elseif not isNewListing(key, price) then
@@ -1851,6 +1912,10 @@ local function processBrowseRows(rows)
                         local line = dealLine(med, key)
                         local cost = qty * price
                         local est = math.floor(qty * med * (1 - cfg.cut) - cost)
+                        local vol = bookVolatility(key)
+                        if vol and vol > 0.25 then
+                            printf("|cff888888(swings +%d%% - prime flip territory)|r", math.floor(vol * 100 + 0.5))
+                        end
                         local vel = absorbVelocity(key)
                         if vel and vel < 60 then
                             printf("|cff888888(absorbed in %ds last time - HOT)|r", math.floor(vel + 0.5))
