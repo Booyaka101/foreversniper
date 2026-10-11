@@ -104,6 +104,7 @@ end
 local DEBUG = false
 local function dbg(msg) if DEBUG then print("|cff888888[FSN-D]|r " .. msg) end end
 
+
 -- Numbers that may be secret on this client never enter the book or the math.
 local function num(v)
     if type(v) ~= "number" then return nil end
@@ -271,6 +272,28 @@ end
 -- vendor it, instant guaranteed profit, no market risk, no relist wait.
 local function vendorOf(itemID)
     return infoOf(itemID).vendor
+end
+
+-- TSM-STYLE TIERED THRESHOLD (their default sniper formula, classic-scaled):
+-- expensive items only need a small discount, cheap ones need a huge one.
+--   market > 250g -> 20% off | >100g -> 30% | >50g -> 40% | >25g -> 50%
+--   >10g -> 60% | >5g -> 70% | >2g -> 80% | >1g -> 90% | else 95%
+-- The deal line also never falls below the vendor sell price (max(vendorsell, tier*market)).
+local function dealLine(med, itemID)
+    local mult
+    if med > 25000000 then mult = 0.8
+    elseif med > 10000000 then mult = 0.7
+    elseif med > 5000000 then mult = 0.6
+    elseif med > 2500000 then mult = 0.5
+    elseif med > 1000000 then mult = 0.4
+    elseif med > 500000 then mult = 0.3
+    elseif med > 200000 then mult = 0.2
+    elseif med > 100000 then mult = 0.1
+    else mult = 0.05 end
+    local line = mult * med
+    local vs = vendorOf(itemID)
+    if vs > line then line = vs end
+    return line, mult
 end
 
 local function mergeIntoBook(curMins, t)
@@ -1289,8 +1312,9 @@ local function completeScan(reason)
             if not db.blacklist[c.id] and c.unit >= cfg.minUnit then
                 local b = db.book[c.id]
                 local med = b and freshMedian(b.s, t, (cfg.freshMins or 45) * 60, cfg.armAfter) or nil
-                if med and med >= cfg.minUnit and c.unit <= cfg.threshold * med then
-                    local line = cfg.threshold * med
+                local lineR = med and dealLine(med, c.id) or nil
+                if med and med >= cfg.minUnit and lineR and c.unit <= lineR then
+                    local line = lineR
                     -- exact overhang: units listed ABOVE the deal line queue
                     -- ahead of the relist; too many means a slow flip
                     local overhangUnits = 0
@@ -1701,7 +1725,9 @@ local function processBrowseRows(rows)
             -- VENDOR FLIP: priced under the vendor sell price = guaranteed
             -- instant profit. No market gates apply - the vendor always buys.
             local sell = vendorOf(key)
-            if S.gateLog and infoOf(key).stackable ~= true then
+            -- vendor flips ignore the stackable filter: guaranteed profit is
+            -- guaranteed, and gear vendored is gear sold
+            if false then
                 if (S.gateLog.counts["not stackable (skipped)"] or 0) < 6 then
                     why("not stackable (skipped)", key, " (stack=" .. tostring(infoOf(key).maxStack) .. ")")
                 else
@@ -1721,18 +1747,25 @@ local function processBrowseRows(rows)
             local b = db.book[key]
             if b then
                 local med = freshMedian(b.s, t, (cfg.freshMins or 45) * 60, cfg.armAfter)
+                local dealLinePx = nil
                 if not med then
                     if (S.gateLog.counts["no fresh median"] or 0) < 3 then
                         why("no fresh median yet", key)
                     end
                 elseif med < cfg.minUnit then
                     why("market under floor", key)
-                elseif price > cfg.threshold * med then
-                    if (S.gateLog.counts["not cheap enough"] or 0) < 3 then
-                        why("not cheap enough", key, " (" .. fmtMoney(price) .. " vs market " .. fmtMoney(math.floor(med)) .. ")")
+                else
+                    dealLinePx = dealLine(med, key)
+                    if price > dealLinePx then
+                        if (S.gateLog.counts["not cheap enough"] or 0) < 3 then
+                            local _, mult = dealLine(med, key)
+                            why("not cheap enough", key, " (" .. fmtMoney(price) .. " vs line " .. fmtMoney(math.floor(dealLinePx)) .. " @" .. math.floor((1 - mult) * 100 + 0.5) .. "% off)")
+                        end
                     end
                 end
-                if med and med >= cfg.minUnit and price <= cfg.threshold * med then
+                if key == 4338 then
+                end
+                if med and med >= cfg.minUnit and dealLinePx and price <= dealLinePx then
                     -- listability gates: verifiable quality (uncached items get a
                     -- load request and pass on the NEXT sweep - the client caches
                     -- item info asynchronously), a market not buried under
@@ -1755,7 +1788,7 @@ local function processBrowseRows(rows)
                     elseif not isNewListing(key, price) then
                         -- already seen at this price: not a new deal
                     else
-                        local line = cfg.threshold * med
+                        local line = dealLine(med, key)
                         local cost = qty * price
                         local est = math.floor(qty * med * (1 - cfg.cut) - cost)
                         fireAlert("market", key, nil, price, med,
