@@ -2144,6 +2144,12 @@ local function stopSweeping()
 end
 
 
+-- CANCEL CANNON: CancelAuction is addon-callable on this client (no hardware
+-- event required - TSM ships retail auto-cancel on the same API). One command
+-- cancels every owned listing priced above the learned market, pre-armed for
+-- relisting at the 1-copper front.
+local cancelArmed = false
+
 local function onOwnedAuctionsUpdated()
     if C_AuctionHouse.GetNumOwnedAuctions == nil then return end
     local okN, n = pcall(C_AuctionHouse.GetNumOwnedAuctions)
@@ -2172,6 +2178,14 @@ local function onOwnedAuctionsUpdated()
                                 info.itemLink or (infoOf(itemID).name or ("item " .. itemID)),
                                 fmtMoney(unit), fmtMoney(math.floor(med)))
                             playTierSound("SNIPE")
+                        end
+                        if cancelArmed and info.auctionID and C_AuctionHouse.CancelAuction then
+                            local okC = pcall(C_AuctionHouse.CancelAuction, info.auctionID)
+                            if okC then
+                                db.stats.cancels = (db.stats.cancels or 0) + 1
+                                printf("  |cffff4d4dcanceled|r auction %d - relist at |cffffd100%s|r to front the queue.",
+                                    info.auctionID, fmtMoney(math.floor(med)))
+                            end
                         end
                     end
                 end
@@ -2534,6 +2548,7 @@ local HELP = {
     "/fsn feed             deal window (click a row = live prices, BUY = buy)",
     "/fsn profit           money printer stats (session + lifetime)",
     "/fsn undercut         guard your listings (alert when undercut)",
+    "/fsn cancel           cancel every owned listing above market (relist front)",
     "/fsn options          settings panel",
     "/fsn page             scanner monitor window (toggle)",
     "/fsn on | off         enable / disable",
@@ -2790,6 +2805,20 @@ SlashCmdList.FOREVERSNIPER = function(msg)
     elseif cmd == "sound" then
         cfg.sound = not cfg.sound
         printf("alert sound %s.", cfg.sound and "on" or "off")
+
+    elseif cmd == "cancel" then
+        if not S.ahOpen then printf("open the AH first.") return end
+        if not (C_AuctionHouse and C_AuctionHouse.QueryOwnedAuctions) then
+            printf("this client cannot query owned auctions.") return
+        end
+        cancelArmed = true
+        printf("|cffff8800cancel cannon armed|r - canceling every listing above market...")
+        local ok, e = pcall(C_AuctionHouse.QueryOwnedAuctions, {})
+        if not ok then
+            cancelArmed = false
+            err("QueryOwnedAuctions", e)
+        end
+        after(3, function() cancelArmed = false end)
 
     elseif cmd == "undercut" then
         cfg.undercut = not cfg.undercut
