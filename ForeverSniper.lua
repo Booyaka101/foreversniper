@@ -72,6 +72,15 @@ db.shape     = db.shape     or nil  -- first replicate return ever seen, as type
 for k, v in pairs(DEFAULTS) do
     if db.config[k] == nil then db.config[k] = v end
 end
+-- one-time retune: installs from the retail-scale era keep their old gates
+-- (10s unit floor, 1g profit) which silence a classic economy entirely
+if not db.tunedClassic then
+    db.tunedClassic = true
+    db.config.minUnit = 100      -- 1s: the 12-20s tier markets qualify
+    db.config.profit = 0         -- off: prove the pipeline, tighten later
+    db.config.threshold = 0.50
+    print("|cffff7d0aForever Sniper|r: retuned for the classic economy - 1s unit floor, profit gate off. /fsn profit 10s to raise it once deals flow.")
+end
 local cfg = db.config
 
 local CAPS = { errors = 200, alerts = 60, samples = 30, book = 12000 }
