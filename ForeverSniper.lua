@@ -274,6 +274,29 @@ local function vendorOf(itemID)
     return infoOf(itemID).vendor
 end
 
+
+-- ABSORPTION VELOCITY (secret sauce #1): track when each item first goes
+-- below its deal line, and when the cheap stock is gone. The gap is how fast
+-- this realm's buyers absorb deals - a per-item liquidity signal measured
+-- live, not imported from region data nobody here has.
+local absorbMarks = {}
+local function absorbTrack(itemID, belowLine, now)
+    local a = absorbMarks[itemID]
+    if belowLine then
+        if not a then absorbMarks[itemID] = { t = now, price = 0 } end
+    elseif a then
+        local dt = now - a.t
+        local b = db.book[itemID]
+        if b then
+            b.v = b.v or {}
+            local v = b.v
+            v[#v + 1] = dt
+            while #v > 4 do table.remove(v, 1) end
+        end
+            absorbMarks[itemID] = nil
+        end
+    end
+
 -- TSM-STYLE TIERED THRESHOLD (their default sniper formula, classic-scaled):
 -- expensive items only need a small discount, cheap ones need a huge one.
 --   market > 250g -> 20% off | >100g -> 30% | >50g -> 40% | >25g -> 50%
@@ -296,9 +319,22 @@ local function dealLine(med, itemID)
     return line, mult
 end
 
+local function absorbVelocity(itemID)
+    local b = db.book[itemID]
+    if not b or not b.v or #b.v == 0 then return nil end
+    local s = 0
+    for _, dt in ipairs(b.v) do s = s + dt end
+    return s / #b.v
+end
+
+
 local function mergeIntoBook(curMins, t)
     local bookN = countKeys(db.book)
     for key, unit in pairs(curMins) do
+        local eb = db.book[key]
+        if eb and eb.ownUntil and t < eb.ownUntil then
+            -- our own relist is showing: do not learn from it
+        else
         local b = db.book[key]
         if not b then
             b = { lastSeen = t, s = {} }
@@ -312,6 +348,7 @@ local function mergeIntoBook(curMins, t)
         while sampleCount(s) > CAPS.samples do
             table.remove(s, 1)
             table.remove(s, 1)
+        end
         end
     end
     -- Evict stalest items if the book outgrew its cap.
@@ -846,6 +883,8 @@ local function sellAt(itemID, unitPrice)
             qty, infoOf(itemID).name or ("item " .. itemID),
             fmtMoney(unitPrice), fmtMoney(unitPrice * qty))
         S.session.listed = (S.session.listed or 0) + 1
+        local b = db.book[itemID]
+        if b then b.ownUntil = time() + 300 end -- our price is not the market
         return true
     end
     err(isCommodity and "PostCommodity" or "PostItem", e)
@@ -1765,6 +1804,7 @@ local function processBrowseRows(rows)
                 end
                 if key == 4338 then
                 end
+                absorbTrack(key, med ~= nil and dealLinePx ~= nil and price <= dealLinePx, t)
                 if med and med >= cfg.minUnit and dealLinePx and price <= dealLinePx then
                     -- listability gates: verifiable quality (uncached items get a
                     -- load request and pass on the NEXT sweep - the client caches
@@ -1791,6 +1831,12 @@ local function processBrowseRows(rows)
                         local line = dealLine(med, key)
                         local cost = qty * price
                         local est = math.floor(qty * med * (1 - cfg.cut) - cost)
+                        local vel = absorbVelocity(key)
+                        if vel and vel < 60 then
+                            printf("|cff888888(absorbed in %ds last time - HOT)|r", math.floor(vel + 0.5))
+                        elseif vel and vel > 600 then
+                            printf("|cff888888(slow absorber - %dm to sell last time)|r", math.floor(vel / 60 + 0.5))
+                        end
                         fireAlert("market", key, nil, price, med,
                             { units = qty, cost = cost, profit = est, line = line }, true)
                     end
