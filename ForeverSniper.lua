@@ -331,12 +331,34 @@ local function bookVolatility(itemID)
     return math.sqrt(var / n) / mean
 end
 
--- smart relist price: rising market -> ask above median; sinking -> undercut
-local function smartPrice(itemID, med)
+-- smart relist price: rising market -> ask above median; sinking -> undercut.
+-- THE 1-COPPER FRONT (commodities): buyers purchase the cheapest listing
+-- first, so listing 1c under the CURRENT cheapest (not the median) buys the
+-- front of the queue for one copper - the oldest legal edge on any AH.
+-- Items use charm pricing: 3g becomes 2g99s99c (price anchoring).
+local function charmPrice(p)
+    local g = math.floor(p / 10000)
+    if g < 1 then return p end
+    local rem = p - g * 10000
+    if rem > 9900 then return p end -- already charm-y
+    local charmed = (g - 1) * 10000 + 9999
+    if charmed < 10000 then return p end
+    return charmed
+end
+
+local function smartPrice(itemID, med, isCommodity)
     local tr = bookTrend(itemID)
-    if tr > 0.05 then return math.floor(med * 1.10), tr end
-    if tr < -0.05 then return math.floor(med * 0.92), tr end
-    return math.floor(med), tr
+    if isCommodity then
+        local live = lastMinOf(itemID)
+        if live and live > 100 and live <= med * 1.2 then
+            return math.max(1, math.floor(live) - 1), tr, "fronting the queue at 1c under the cheapest"
+        end
+        if tr < -0.05 then return math.max(1, math.floor(med * 0.92)), tr end
+        return math.floor(med), tr
+    end
+    if tr > 0.05 then return charmPrice(math.floor(med * 1.10)), tr end
+    if tr < -0.05 then return charmPrice(math.floor(med * 0.92)), tr end
+    return charmPrice(math.floor(med)), tr
 end
 
 -- TSM-STYLE TIERED THRESHOLD (their default sniper formula, classic-scaled):
@@ -384,6 +406,16 @@ local function mergeIntoBook(curMins, t)
             bookN = bookN + 1
         end
         b.lastSeen = t
+        local hr = serverHour()
+        b.h = b.h or {}
+        local bucket = b.h[hr]
+        if not bucket then bucket = { sum = 0, n = 0 } b.h[hr] = bucket end
+        bucket.sum = bucket.sum + unit
+        bucket.n = bucket.n + 1
+        if bucket.n > 40 then -- rolling: decay old weight
+            bucket.sum = bucket.sum * 0.75
+            bucket.n = 30
+        end
         local s = b.s
         s[#s + 1] = t
         s[#s + 1] = unit
@@ -418,6 +450,40 @@ local S = {
     boughtAt   = db.boughtAt or {}, -- itemID -> { t, price } purchase cooldown (persistent)
     session    = { started = time(), spent = 0, buys = 0, best = nil, realized = 0 }, -- money printer P&L
 }
+
+-- LOOPHOLE LAYER (TOS-legal edges): queue-fronting by 1 copper, deposit
+-- math, hour-of-day arbitrage, and stack-size premium. All use data we
+-- already sweep; none break any rule - they are just math most players
+-- cannot be bothered to do.
+
+local function lastMinOf(itemID)
+    S.lastMin = S.lastMin or {}
+    return S.lastMin[itemID]
+end
+local function noteStack(itemID, qty)
+    S.stackSeen = S.stackSeen or {}
+    local ss = S.stackSeen[itemID] or {}
+    ss[qty] = (ss[qty] or 0) + 1
+    S.stackSeen[itemID] = ss
+end
+
+serverHour = function()
+    if GameTime_GetGameTime then
+        local okH, h = pcall(GameTime_GetGameTime)
+        if okH and type(h) == "number" then return h end
+    end
+    return date("*t").hour
+end
+
+-- hour-of-day memory: markets cycle (raid nights spike consumables, weekends
+-- flood mats). An item 30% under ITS OWN hourly average is time-arbitrage.
+hourAverage = function(itemID, hour)
+    local b = db.book[itemID]
+    if not b or not b.h then return nil end
+    local bucket = b.h[hour]
+    if not bucket or (bucket.n or 0) < 3 then return nil end
+    return bucket.sum / bucket.n
+end
 
 -- Watchlist: split into fast lookups, rebuilt before each scan uses them.
 local watchByID, watchByName = {}, {}
@@ -914,14 +980,37 @@ local function sellAt(itemID, unitPrice)
         local okC, st = pcall(C_AuctionHouse.GetItemCommodityStatus, itemID)
         if okC then isCommodity = (st == true) end
     end
+    -- duration pick: fast absorbers sell inside 12h, so pay the smaller
+    -- deposit; slow movers need the long window. Velocity decides.
+    local vel = absorbVelocity(itemID)
+    local duration = (vel and vel < 120) and 1 or 3
+    local depositTxt = ""
+    if isCommodity and C_AuctionHouse.CalculateCommodityDeposit then
+        local okD, dep = pcall(C_AuctionHouse.CalculateCommodityDeposit, itemID, qty)
+        if okD and type(dep) == "number" and dep > 0 then
+            depositTxt = " (deposit " .. fmtMoney(dep) .. ")"
+        end
+    end
     local ok, e
     if isCommodity and C_AuctionHouse.PostCommodity then
-        ok, e = pcall(C_AuctionHouse.PostCommodity, loc, 3, qty, unitPrice)
+        ok, e = pcall(C_AuctionHouse.PostCommodity, loc, duration, qty, unitPrice)
     else
-        ok, e = pcall(C_AuctionHouse.PostItem, loc, 3, qty, unitPrice * qty)
+        ok, e = pcall(C_AuctionHouse.PostItem, loc, duration, qty, unitPrice * qty)
     end
     if ok then
         local _, tr = smartPrice(itemID, unitPrice)
+        -- stack-split premium: buyers pay more per unit for small stacks; the
+        -- modal size seen in sweeps is what this market actually buys
+        local modal, bestN = nil, 0
+        if S.stackSeen and S.stackSeen[itemID] then
+            for q, c in pairs(S.stackSeen[itemID]) do
+                if c > bestN then bestN = c modal = q end
+            end
+        end
+        if modal and qty > modal * 2 then
+            printf("|cff888888(tip: %d units splits into %d stacks of %d - small stacks sell at a premium)|r",
+                qty, math.floor(qty / modal), modal)
+        end
         local trendTxt = ""
         if tr > 0.05 then trendTxt = " (market climbing - hold for more)"
         elseif tr < -0.05 then trendTxt = " (market sinking - priced to front the queue)" end
@@ -1215,7 +1304,13 @@ local function buildFeed()
         row.sellBtn:SetScript("OnClick", function(self)
             local r = self:GetParent()
             if r.itemID and r.market2 then
-                local sp = smartPrice(r.itemID, r.market2)
+                local isComm = false
+                if C_AuctionHouse and C_AuctionHouse.GetItemCommodityStatus then
+                    local okC, st = pcall(C_AuctionHouse.GetItemCommodityStatus, r.itemID)
+                    if okC then isComm = (st == true) end
+                end
+                local sp, tr, why = smartPrice(r.itemID, r.market2, isComm)
+                if why then printf("|cff888888%s.|r", why) end
                 sellAt(r.itemID, sp)
             end
         end)
@@ -1832,6 +1927,7 @@ local function processBrowseRows(rows)
         local qty = num(r.totalQuantity) or 0
         if key and price and price > 0 then
             mins[key] = price
+            if qty and qty > 0 then noteStack(key, qty) end
             -- VENDOR FLIP: priced under the vendor sell price = guaranteed
             -- instant profit. No market gates apply - the vendor always buys.
             local sell = vendorOf(key)
@@ -1912,6 +2008,12 @@ local function processBrowseRows(rows)
                         local line = dealLine(med, key)
                         local cost = qty * price
                         local est = math.floor(qty * med * (1 - cfg.cut) - cost)
+                        local hr = serverHour()
+                        local hAvg = hourAverage(key, hr)
+                        if hAvg and med < hAvg * 0.7 then
+                            printf("|cff4fc0ff(time arbitrage: %d%% below this hour's usual %s)|r",
+                                math.floor((1 - med / hAvg) * 100 + 0.5), fmtMoney(math.floor(hAvg)))
+                        end
                         local vol = bookVolatility(key)
                         if vol and vol > 0.25 then
                             printf("|cff888888(swings +%d%% - prime flip territory)|r", math.floor(vol * 100 + 0.5))
