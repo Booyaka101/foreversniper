@@ -1496,7 +1496,7 @@ local function updateScanPage()
         statusText = "PAUSED - the Browse tab is up. Switch tabs!"
         r, g, b = 1, 0.35, 0.3
     elseif S.sweepTicker then
-        statusText = "SCANNING - " .. (S.sweepStats.lastCat or "market")
+        statusText = "SCANNING - " .. (S.sweepStats.lastCat or "market") .. " (" .. (S.sweepStats.lastSort or "?") .. ")"
         r, g, b = 0.35, 1, 0.45
     else
         statusText = "STOPPED - no sweep ticker (/fsn on)"
@@ -1572,7 +1572,7 @@ local function requestItemLoad(itemID)
 end
 
 local throttleReady, pagePending, lastQueryAt = true, false, 0
-local sweepCount, watchCursor = 0, 0
+local sweepCount, watchCursor, sortFlip = 0, 0, 0
 S.sweepStats = { sent = 0, rows = 0, yields = 0, lastRows = 0 }
 
 -- one watched item as a search key, or nil when nothing is watched
@@ -1749,10 +1749,18 @@ local function sweepQuery()
     end
     if C_AuctionHouse.SendBrowseQuery == nil then return end
     local cat = nextCategory()
+    sortFlip = sortFlip + 1
+    local newest = (sortFlip % 2 == 0)
     local sorts = {}
     if Enum and Enum.AuctionHouseSortOrder then
         local so = Enum.AuctionHouseSortOrder.Price or Enum.AuctionHouseSortOrder.Buyout
-        if so then sorts = { { sortOrder = so, reverseSort = false } } end -- cheapest first
+        if newest and Enum.AuctionHouseSortOrder.TimeLeft then
+            -- freshest listings first: the sniper's true feed (a price-sorted
+            -- first page is dominated by vendor-junk tier; a 50g item posted
+            -- at 10g never reaches it)
+            so = Enum.AuctionHouseSortOrder.TimeLeft
+        end
+        if so then sorts = { { sortOrder = so, reverseSort = newest } } end
     end
     local query = {
         searchString = "",
@@ -1760,6 +1768,7 @@ local function sweepQuery()
         filters = {},
         itemClassFilters = { { classID = cat.classID } },
     }
+    S.sweepStats.lastSort = newest and "newest" or "cheapest"
     local ok, e = pcall(C_AuctionHouse.SendBrowseQuery, query)
     if not ok then
         err("SendBrowseQuery", e)
