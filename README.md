@@ -91,12 +91,29 @@ closed until the helper exits; its lock cannot prevent you from launching WoW.
 Price changes and listing disappearances describe observations, not guaranteed
 sales or profit. Recheck live prices before buying.
 
+## Purchase safeguards
+
+Purchases still require clicks. Commodity purchases wait for the server's unit
+price and total before enabling Confirm, then recheck the price ceiling, spend
+cap and quote age on that click. Dialogs expire after 15 seconds; quotes expire
+after 10 seconds or sooner if the server reports expiry. Closing the dialog or
+auction house cancels pending purchase state.
+
+Purchase result events must match the requested item and purchase type. Sniper
+background queries and row-click searches pause while a purchase is pending.
+Other addons and Blizzard's own searches are not controlled by these guards.
+Live Forever event compatibility still needs in-game validation. Cached replicate
+snapshot freshness and server-confirmed purchase accounting are separate follow-ups.
+
 ## Development
 
-Run the dependency-free desktop regression tests with Node.js 22 or newer:
+Run the regression tests with Node.js 22 or newer. Fengari is a development-only
+dependency for executing the production Lua purchase path under synthetic APIs;
+the desktop helper itself remains dependency-free.
 
 ```powershell
-node --test test/*.test.mjs
+npm ci
+npm test
 ```
 
 CI also runs the addon linter and simulator. Tests use synthetic SavedVariables,

@@ -554,7 +554,19 @@ local function renderPopup()
     if cfg.popup then popup:Show() end
 end
 
+local confirmFrame
+
+local function purchaseBusy()
+    local q = confirmFrame and confirmFrame.q
+    return (S.buying and GetTime() - S.buying.t <= 15)
+        or (q and GetTime() - q.createdAt <= 15)
+end
+
 local function searchListing(itemID, link, units)
+    if purchaseBusy() then
+        printf("finish or cancel the pending purchase before searching.")
+        return
+    end
     if C_AuctionHouse == nil then
         printf("C_AuctionHouse is gone on this client - cannot search.")
         return
@@ -606,7 +618,29 @@ end
 -- server returned seconds ago, and misses (already-sold listings) are caught
 -- and reported, never guessed around.
 
-local confirmFrame
+local function clearPurchase()
+    local q = S.quote
+    S.quote = nil
+    S.buying = nil
+    if confirmFrame then
+        confirmFrame.q = nil
+        if confirmFrame:IsShown() then confirmFrame:Hide() end
+    end
+    if q and C_AuctionHouse and C_AuctionHouse.CancelCommoditiesPurchase then
+        pcall(C_AuctionHouse.CancelCommoditiesPurchase)
+    end
+end
+
+local function validQuote(q)
+    if C_AuctionHouse.GetQuoteDurationRemaining then
+        local ok, remaining = pcall(C_AuctionHouse.GetQuoteDurationRemaining)
+        if not ok or not num(remaining) or num(remaining) <= 0 then return false end
+    end
+    return q.readyAt and GetTime() - q.readyAt <= 10
+        and q.total and q.total > 0 and q.total <= cfg.maxSpend
+        and q.unit and q.unit > 0 and q.unit <= q.line
+        and q.total <= q.units * q.line
+end
 
 local function buildConfirm()
     if confirmFrame then return confirmFrame end
@@ -630,30 +664,37 @@ local function buildConfirm()
     f.cancel:SetSize(90, 22)
     f.cancel:SetPoint("BOTTOM", 80, 14)
     f.cancel:SetText("Cancel")
-    f.cancel:SetScript("OnClick", function(self)
-        local q = self:GetParent().q
-        if q and q.commodity and q.quoting then
-            pcall(C_AuctionHouse.CancelCommoditiesPurchase)
-        end
-        self:GetParent().q = nil
-        self:GetParent():Hide()
-    end)
+    f.cancel:SetScript("OnClick", clearPurchase)
+    f:SetScript("OnHide", clearPurchase)
     confirmFrame = f
     return f
 end
 
 local function showConfirm(q)
+    clearPurchase()
     local f = buildConfirm()
+    q.createdAt = GetTime()
     f.q = q
     f.buy:SetScript("OnClick", function(self)
         local q2 = self:GetParent().q
         if not q2 then self:GetParent():Hide() return end
+        if not S.ahOpen or GetTime() - q2.createdAt > 15 then
+            clearPurchase()
+            printf("purchase expired - search again for a live price.")
+            return
+        end
 
         if q2.commodity then
             -- Commodities: start the quote now; the dialog flips to Confirm
             -- when the server answers with the exact total, and that press
             -- finalizes. Two presses, same as Blizzard's own flow.
             if q2.quoting then
+                if not q2.readyAt then return end -- a second click cannot outrun the quote
+                if S.quote ~= q2 or not validQuote(q2) then
+                    clearPurchase()
+                    printf("quote expired or exceeded your limits - search again.")
+                    return
+                end
                 local ok, e = pcall(C_AuctionHouse.ConfirmCommoditiesPurchase, q2.itemID, q2.units)
                 if ok then
                     printf("purchased |cffffd100%d units|r of %s.", q2.units, q2.link or ("item " .. q2.itemID))
@@ -664,22 +705,27 @@ local function showConfirm(q)
                         if d.id == q2.itemID then d.bought = true end
                     end
                     refreshFeed()
-                    self:GetParent().q = nil
-                    self:GetParent():Hide()
+                    S.quote = nil -- confirmed quotes must not be cancelled on hide
+                    clearPurchase()
                 else
+                    clearPurchase()
                     err("ConfirmCommoditiesPurchase", e)
                     printf("purchase failed: %s", tostring(e):sub(1, 200))
                 end
             else
+                q2.quoting = true
+                S.quote = q2
+                self:SetText("Waiting...")
+                self:Disable()
                 local ok, e = pcall(C_AuctionHouse.StartCommoditiesPurchase, q2.itemID, q2.units)
                 if ok then
-                    q2.quoting = true
-                    self:SetText("Confirm")
-                    self:GetParent().body:SetText(string.format(
-                        "%d x %s - fetching the exact total ...\n(press Confirm when it appears)",
-                        q2.units, q2.link or ("item " .. q2.itemID)))
-                    S.quote = q2
+                    if not q2.readyAt and S.quote == q2 then
+                        self:GetParent().body:SetText(string.format(
+                            "%d x %s - fetching the exact total ...",
+                            q2.units, q2.link or ("item " .. q2.itemID)))
+                    end
                 else
+                    clearPurchase()
                     err("StartCommoditiesPurchase", e)
                     printf("could not start the purchase: %s", tostring(e):sub(1, 200))
                 end
@@ -691,7 +737,7 @@ local function showConfirm(q)
         -- all inside this press, bounded by the spend cap.
         local spent, bought, misses = 0, 0, 0
         for _, L in ipairs(q2.list or {}) do
-            if spent + L.buyout > cfg.maxSpend then
+            if L.buyout > L.qty * q2.line or spent + L.buyout > cfg.maxSpend then
                 printf("spend cap %s reached - skipped the rest. /fsn max to raise it.", fmtMoney(cfg.maxSpend))
                 break
             end
@@ -727,12 +773,14 @@ local function showConfirm(q)
     end)
     f.body:SetText(q.body or "")
     f.buy:SetText("Purchase")
+    f.buy:Enable()
     f:Show()
 end
 
-local function buyFromResults(kind)
+local function buyFromResults(kind, itemID)
     local b = S.buying
     if not b or GetTime() - b.t > 15 then S.buying = nil return end
+    if itemID ~= b.itemID or (kind == "commodity") ~= b.commodity then return end
     S.buying = nil
     if not S.ahOpen then printf("the AH window closed - buy aborted.") return end
 
@@ -772,7 +820,7 @@ local function buyFromResults(kind)
             return
         end
         showConfirm({
-            commodity = true, itemID = b.itemID, link = b.link,
+            commodity = true, itemID = b.itemID, link = b.link, line = b.line,
             units = units, unit = math.floor(cost / units),
             body = string.format("%d x %s - every unit under %s\nestimated total |cffffd100%s|r (cap %s)",
                 units, b.link or ("item " .. b.itemID), fmtMoney(b.line), fmtMoney(cost), fmtMoney(cfg.maxSpend)),
@@ -790,7 +838,7 @@ local function buyFromResults(kind)
         if ok and type(info) == "table" and info.auctionID then
             local buyout = num(info.buyoutAmount)
             local qty = num(info.quantity) or 1
-            if buyout and buyout > 0 and qty > 0 and math.floor(buyout / qty) <= b.line then
+            if buyout and buyout > 0 and qty > 0 and buyout <= qty * b.line then
                 if cost + buyout > cfg.maxSpend then
                     list.capped = true
                     break
@@ -816,6 +864,10 @@ local function buyFromResults(kind)
 end
 
 local function buySweep(itemID, link, line, market)
+    if S.buying and GetTime() - S.buying.t <= 15 then
+        printf("a live price search is already pending.")
+        return
+    end
     if C_AuctionHouse == nil then
         printf("C_AuctionHouse is gone on this client - cannot buy.")
         return
@@ -848,16 +900,19 @@ local function buySweep(itemID, link, line, market)
     if Enum and Enum.AuctionHouseSortOrder and Enum.AuctionHouseSortOrder.Price then
         sorts = { { sortOrder = Enum.AuctionHouseSortOrder.Price, reverseSort = false } }
     end
+    clearPurchase()
+    S.watchSearch = nil
+    S.pending = nil
+    -- Register ownership before sending: result callbacks may arrive immediately.
+    S.buying = { itemID = itemID, link = link, line = line, market = market,
+                 commodity = commodity, t = GetTime() }
     local ok, e = pcall(C_AuctionHouse.SendSearchQuery, key, sorts, false)
     if not ok then
+        clearPurchase()
         err("SendSearchQuery", e)
         printf("could not search for a live price: %s", tostring(e):sub(1, 200))
         return
     end
-    -- Results events route to the buy path while this is set.
-    S.pending = nil
-    S.buying = { itemID = itemID, link = link, line = line, market = market,
-                 commodity = commodity, t = GetTime() }
     printf("checking live listings under %s ...", fmtMoney(line))
 end
 
@@ -1903,6 +1958,14 @@ end
 
 local function canQuery()
     if not cfg.enabled or not S.ahOpen then return false end
+    if S.buying then
+        if GetTime() - S.buying.t <= 15 then return false end
+        S.buying = nil
+    end
+    if confirmFrame and confirmFrame.q then
+        if GetTime() - confirmFrame.q.createdAt <= 15 then return false end
+        clearPurchase()
+    end
     if pagePending or not throttleReady then return false end
     if GetTime() - lastQueryAt < 1.0 then return false end
     if C_AuctionHouse and C_AuctionHouse.IsThrottledMessageSystemReady then
@@ -2428,6 +2491,9 @@ end)
 
 on("AUCTION_HOUSE_CLOSED", function()
     S.ahOpen = false
+    clearPurchase()
+    S.watchSearch = nil
+    S.pending = nil
     S.scanning = false
     stopSweeping()
     if scanPage then updateScanPage() end
@@ -2529,11 +2595,13 @@ local function printPending(kind)
     if shown == 0 then printf("  results are in - check the AH window; nothing printable.") end
 end
 
-on("ITEM_SEARCH_RESULTS_UPDATED", function()
+on("ITEM_SEARCH_RESULTS_UPDATED", function(itemKey)
+    local itemID = type(itemKey) == "table" and num(itemKey.itemID)
+    if S.buying then buyFromResults("item", itemID) return end
     -- watch-rule search results first: cheapest listing under the rule's
     -- ceiling fires a watch alert immediately
     local ws = S.watchSearch
-    if ws and GetTime() - ws.t < 10 and C_AuctionHouse.GetItemSearchResultInfo then
+    if ws and ws.id == itemID and GetTime() - ws.t < 10 and C_AuctionHouse.GetItemSearchResultInfo then
         S.watchSearch = nil
         local key = { itemID = ws.id }
         if C_AuctionHouse.MakeItemKey then
@@ -2558,24 +2626,31 @@ on("ITEM_SEARCH_RESULTS_UPDATED", function()
         end
         return
     end
-    if S.buying then buyFromResults("item") else printPending("item") end
+    if S.pending and S.pending.itemID == itemID then printPending("item") end
 end)
-on("COMMODITY_SEARCH_RESULTS_UPDATED", function()
-    if S.buying then buyFromResults("commodity") else printPending("commodity") end
+on("COMMODITY_SEARCH_RESULTS_UPDATED", function(itemID)
+    itemID = num(itemID)
+    if S.buying then buyFromResults("commodity", itemID)
+    elseif S.pending and S.pending.itemID == itemID then printPending("commodity") end
 end)
-on("COMMODITY_PRICE_UPDATED", function(total)
+on("COMMODITY_PRICE_UPDATED", function(unitPrice, totalPrice)
     -- The live quote for a pending commodity purchase: keep the confirm
     -- dialog honest with the server's own number.
     local q = S.quote
-    local t = num(total)
-    if q and t and t > 0 then
-        q.total = t
-        if confirmFrame and confirmFrame:IsShown() and confirmFrame.q == q then
-            confirmFrame.body:SetText(string.format("%d x %s\n|cffffd100total %s|r",
-                q.units, q.link or ("item " .. q.itemID), fmtMoney(t)))
-        end
+    if not q or not confirmFrame or confirmFrame.q ~= q then return end
+    q.unit, q.total = num(unitPrice), num(totalPrice)
+    q.readyAt = GetTime()
+    if not S.ahOpen or GetTime() - q.createdAt > 15 or not validQuote(q) then
+        clearPurchase()
+        printf("server quote exceeded your limits or expired - purchase aborted.")
+        return
     end
+    confirmFrame.body:SetText(string.format("%d x %s\n|cffffd100total %s|r",
+        q.units, q.link or ("item " .. q.itemID), fmtMoney(q.total)))
+    confirmFrame.buy:SetText("Confirm")
+    confirmFrame.buy:Enable()
 end)
+onOptional("COMMODITY_PRICE_UNAVAILABLE", clearPurchase)
 
 -- options panel: plain-frame toggles and steppers, no templates needed ------
 local optionsFrame
