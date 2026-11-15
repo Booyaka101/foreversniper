@@ -87,6 +87,15 @@ end
 `;
 function check(body) { run(setup + production + prepared + body); }
 
+test('an in-flight batch summary blocks buying even with a valid complete snapshot', () => check(`
+  S.batchSearch={t=now}
+  offer()
+  assert(calls.start==0 and S.snipePending==nil)
+  S.batchSearch=nil
+  offer()
+  assert(calls.start==1)
+`));
+
 const commands = section('    elseif cmd == "keep" then', '\n    elseif cmd == "thresh" then')
   .replace('elseif cmd', 'if cmd');
 function commandCheck(body) {

@@ -4,12 +4,17 @@ import { section, run } from './lua.mjs';
 const setup = `
 local now, ready, nativeSell, browseVisible = 100, true, false, false
 local cfg = {enabled=true,sweep=2,maxStock=0,undercut=false}
-local db = {stockLimits={},watch={},blacklist={}}
+local db = {stockLimits={},watch={},blacklist={},book={}}
 local S = {ahOpen=true,commoditySnapshots={},deals={},seen={},autoChecked={}}
 local queries, timers, handlers = {}, {}, {}
 local focus, auto, watch, synchronous = nil, {id=123,line=10,market=100}, nil, nil
 local canQuery, lastQueryAt
 local undercutTicker
+local watchByID = {}
+local processed = {}
+local function num(value) return tonumber(value) end
+local function freshMedian(samples) return samples and samples[1] end
+local function processBrowseRows(rows) processed[#processed+1]=rows end
 local function GetTime() return now end
 local function time() return now end
 local function record(kind,id) queries[#queries+1]={kind=kind,id=id,t=now} end
@@ -64,16 +69,19 @@ local C_AuctionHouse = {
     RequestMoreBrowseResults=function() record("deep page") end,
 }
 local function onOptional(event,fn) handlers[event]=fn end
+local on = onOptional
 `;
 
 const production = section('local SCAN_CATEGORIES =', '\nif db.boughtAt == nil')
   + section('local throttleReady, pagePending', '\nS.autoChecked =')
   + section('local function queryPacing()', '\nlocal function requestItemSearch')
   + section('canQuery = function(paging)', '\nlocal function discoveryScope')
+  + section('do\n    function S.failBatch', '\nlocal function sweepQuery()')
   + section('local function sweepQuery()', '\n-- DEEP')
   + section('-- DEEP SCAN (/fsn deepscan', '\nfunction S.wakeSweep()')
   + section('function S.wakeSweep()', '\n\n-- BATCH RELIST:')
   + section('stopRelisting = function()', '\nlocal function startRelisting')
+  + section('do\nlocal function readDeepBrowse', '\n-- Event-driven throttle')
   + section('onOptional("OWNED_AUCTIONS_UPDATED"', '\nlocal function onReplicateUpdated()');
 const helpers = `
 local function complete()
@@ -92,6 +100,194 @@ local function slots(n)
 end
 `;
 function check(code) { run(setup + production + helpers + code); }
+
+const batchSetup = `
+  cfg.batch=true; cfg.minUnit=1; cfg.freshMins=45; cfg.armAfter=2
+  local resultRows, full, submit = {}, true, nil
+  C_AuctionHouse.MakeItemKey=function(id) return {itemID=id} end
+  C_AuctionHouse.SearchForItemKeys=function(keys)
+    record("batch",#keys)
+    if submit then submit(keys) end
+  end
+  C_AuctionHouse.GetBrowseResults=function() return resultRows end
+  C_AuctionHouse.HasFullBrowseResults=function() return full end
+  for id=1,205 do db.book[id]={s={100}} end
+`;
+function batchCheck(code) { check(batchSetup + code); }
+
+test('owner-approved default enables batching without overriding explicit saved choices', () => {
+  const init = section('local DEFAULTS =', '\n-- one-time retune:');
+  for (const setting of ['nil', 'false', 'true']) run(`
+    ForeverSniperDB={config={batch=${setting}}}
+    ${init}
+    assert(db.config.batch==${setting === 'nil' ? 'true' : setting})
+  `);
+});
+
+test('batch command toggles future requests without abandoning an in-flight owner', () => {
+  const command = section('    elseif cmd == "batch" then', '\n    elseif cmd == "sweep" then')
+    .replace('elseif cmd', 'if cmd');
+  batchCheck(`
+    local function command(rest)
+      local cmd="batch"
+      ${command}
+      end
+    end
+    S.batchDisabled="failed"
+    command("invalid"); assert(S.batchDisabled=="failed")
+    command("on"); assert(cfg.batch and not S.batchDisabled)
+    assert(S.startBatch()); local owner=S.batchSearch
+    command("off"); assert(not cfg.batch and S.batchSearch==owner)
+    S.readBatch(); assert(not S.batchSearch)
+  `);
+});
+
+test('batch requests are bounded, deterministic and rotate across known keys', () => batchCheck(`
+  local batches={}
+  submit=function(keys) batches[#batches+1]=keys end
+  slots(5)
+  -- Complete each summary before allowing the next target opportunity.
+  assert(count("batch")==1 and #batches[1]==100)
+  assert(batches[1][1].itemID==1 and batches[1][100].itemID==100)
+  S.readBatch(); now=now+1; assert(S.startBatch())
+  assert(#batches[2]==100 and batches[2][1].itemID==101)
+  S.readBatch(); now=now+1; assert(S.startBatch())
+  assert(#batches[3]==5 and batches[3][1].itemID==201)
+  S.readBatch(); assert(not S.startBatch())
+  assert(S.sweepStats.batchKeys==205)
+`));
+
+test('batch mode preserves broad discovery opportunities', () => batchCheck(`
+  submit=function() S.readBatch() end
+  slots(8)
+  assert(count("batch")==3 and count("browse")==4 and count("target")==1)
+`));
+
+test('batch replies use the shared candidate pipeline, never a tier snapshot', () => batchCheck(`
+  submit=function(keys)
+    assert(S.batchSearch and S.batchSearch.ids[keys[1].itemID])
+    resultRows={{itemKey=keys[1], minPrice=10,totalQuantity=50}}
+    handlers.AUCTION_HOUSE_BROWSE_RESULTS_UPDATED()
+  end
+  slots(1)
+  assert(S.batchSearch==nil and #processed==1)
+  assert(processed[1][1].minPrice==10)
+  assert(next(S.commoditySnapshots)==nil and #S.deals==0)
+  assert(S.sweepStats.batchCompleted==1 and S.sweepStats.batchRows==1)
+`));
+
+test('missing or disabled batch API preserves individual checks', () => {
+  for (const change of [
+    'cfg.batch=false', 'C_AuctionHouse.SearchForItemKeys=nil',
+    'C_AuctionHouse.MakeItemKey=nil', 'C_AuctionHouse.HasFullBrowseResults=nil',
+  ]) batchCheck(`${change}; slots(1); assert(count("target")==1 and count("batch")==0)`);
+});
+
+test('batch eligibility excludes watches, blacklist, stale history and noncommodities', () => batchCheck(`
+  db.book={ [1]={s={100}},[2]={s={100}},[3]={s={100}},[4]={s={}},[5]={s={100}} }
+  watchByID[1]={}; db.blacklist[2]=true
+  commodityFor=function(id) return id~=3 end
+  submit=function(keys) assert(#keys==1 and keys[1].itemID==5) end
+  assert(S.startBatch())
+`));
+
+test('uncached or invalid item keys cannot starve later valid batch keys', () => batchCheck(`
+  C_AuctionHouse.MakeItemKey=function(id)
+    if id<=100 then error("uncached") end
+    return {itemID=id}
+  end
+  submit=function(keys)
+    assert(#keys==100 and keys[1].itemID==101 and keys[100].itemID==200)
+  end
+  assert(S.startBatch())
+`));
+
+test('batch ownership blocks new searches, inspection gates and deep requests', () => batchCheck(`
+  slots(1)
+  assert(S.batchSearch and not canQuery() and not canQuery(true))
+  now=now+1; sweepQuery(); assert(#queries==1)
+  startDeepScan(true); now=now+1; S.deepScan.ticker.fn()
+  assert(#queries==1)
+`));
+
+test('batch mode still honours all purchase, readiness and native-form gates', () => {
+  for (const change of [
+    'S.snipePending={}', 'db.unsettledPurchase={}', 'S.quote={}',
+    'S.batchBuy={pending=true}', 'nativeSell=true', 'ready=false',
+    'S.pending={}', 'S.buying=true', 'cfg.enabled=false', 'S.ahOpen=false',
+  ]) batchCheck(`${change}; slots(1); assert(#queries==0)`);
+});
+
+test('manual watches and displayed deal refreshes keep priority over batches', () => batchCheck(`
+  watch=456; slots(1)
+  assert(count("target",456)==1 and count("batch")==0)
+  focus={id=999,line=10,market=100}; S.dealFocus={deal=focus}
+  slots(2)
+  assert(count("target",999)==1 and count("batch")==0)
+`));
+
+test('bad, foreign, duplicate and incomplete summaries trigger fallback without processing', () => {
+  for (const reply of [
+    'full=false', 'resultRows=false', 'resultRows={false}',
+    'resultRows={{itemKey={itemID=999},minPrice=1,totalQuantity=1}}',
+    'resultRows={{itemKey={itemID=1},minPrice=-1,totalQuantity=1}}',
+    'resultRows={{itemKey={itemID=1},minPrice=1,totalQuantity=0.5}}',
+    'resultRows={{itemKey={itemID=1},minPrice=1,totalQuantity=1},{itemKey={itemID=1},minPrice=1,totalQuantity=1}}',
+  ]) batchCheck(`
+    slots(1); ${reply}
+    handlers.AUCTION_HOUSE_BROWSE_RESULTS_UPDATED()
+    assert(S.batchDisabled and not S.batchSearch and #processed==0)
+    assert(next(S.batchChecked)==nil)
+    slots(2); assert(count("target")==1 and count("batch")==1)
+  `);
+});
+
+test('batch submission errors, timeouts and dropped requests use paced individual fallback', () => {
+  for (const failure of [
+    'submit=function() error("unsupported") end; slots(1)',
+    'slots(1); now=now+5; sweepQuery()',
+    'slots(1); handlers.AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED()',
+    'slots(1); handlers.AUCTION_HOUSE_BROWSE_FAILURE()',
+  ]) batchCheck(`
+    ${failure}
+    assert(S.batchDisabled and not S.batchSearch)
+    local before=#queries; sweepQuery(); assert(#queries==before)
+    slots(2); assert(count("batch")==1 and count("target")>=1)
+    assert(S.sweepStats.batchFailures==1)
+  `);
+});
+
+test('turning off batches or stopping does not leave a stale owner', () => batchCheck(`
+  startSweeping(); advance(100.01); assert(S.batchSearch)
+  cfg.batch=false
+  assert(not canQuery())
+  S.readBatch(); assert(not S.batchSearch)
+  cfg.batch=true; now=now+1; assert(S.startBatch())
+  stopSweeping(); assert(S.batchSearch) -- a timer restart must retain ownership
+  S.ahOpen=false; stopSweeping(); assert(not S.batchSearch)
+`));
+
+test('unchanged summaries remain eligible on the next revisit, including quantity changes below 1%', () => batchCheck(`
+  db.book={[1]={s={100}}}
+  resultRows={{itemKey={itemID=1},minPrice=10,totalQuantity=1000}}
+  assert(S.startBatch()); S.readBatch()
+  now=now+10
+  assert(S.startBatch()); S.readBatch()
+  now=now+10; resultRows[1].totalQuantity=1001
+  assert(S.startBatch()); S.readBatch()
+  assert(#processed==3)
+`));
+
+test('candidate value boost is bounded so aging prevents starvation', () => check(`
+  S.liveCandidates={
+    [1]={id=1,t=now,line=10,profit=1000000},
+    [2]={id=2,t=now,line=10,profit=1},
+  }
+  slots(1); assert(count("target",1)==1)
+  S.liveCandidates[1]={id=1,t=now+10,line=10,profit=100000000}
+  complete(); now=now+11; sweepQuery(); complete(); now=now+1; sweepQuery()
+  assert(count("target",2)==1)
+`));
 
 test('weighted category rotation spreads classes without changing their shares', () => check(`
   local counts,previous={},nil

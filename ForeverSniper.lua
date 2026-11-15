@@ -19,6 +19,7 @@ local DEFAULTS = {
     threshold = 0.50,    -- deal if unit price <= 50% of learned market
     every     = 45,      -- seconds between full scans while the AH is open
     sweep     = 2,       -- fallback scheduler tick; ready events also wake paced searches
+    batch     = true,    -- owner-approved rollout; failures retain individual fallback
     freshMins = 45,      -- market age: older price samples do not arm alerts
     overhang  = 500,     -- max competing units above the deal; more = slow flip (0 = off)
     armAfter  = 2,       -- require two learned observations before market alerts
@@ -2015,6 +2016,7 @@ quickBuy = function(r)
     if not (r.itemID and r.line) then return end
     if not S.offerAvailable(r.offer) then printf("that displayed position was retired - nothing purchased.") return end
     if not S.ahOpen or not cfg.enabled then printf("open the auction house with the scanner enabled first.") return end
+    if S.batchSearch then printf("a summary search is in progress - press BUY again after it finishes.") return end
     if db.blacklist[r.itemID] then printf("that item is blacklisted - nothing purchased.") return end
     if S.snipePending or S.quote or (S.batchBuy and S.batchBuy.pending) then
         printf("a purchase is already in progress - wait for its quote.")
@@ -2713,7 +2715,8 @@ local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
         S.liveCandidates = S.liveCandidates or {}
         local queued = S.liveCandidates[itemID]
         S.liveCandidates[itemID] = { kind = kind, id = itemID, link = link,
-            line = sweep.line or unit, market = market, t = queued and queued.t or GetTime(), refresh = queued and queued.refresh }
+            line = sweep.line or unit, market = market, profit = sweep.profit,
+            t = queued and queued.t or GetTime(), refresh = queued and queued.refresh }
         if not queued then recordGate("offer", "queued for live tiers", itemID) end
         return
     end
@@ -3087,7 +3090,7 @@ function requestReplicate()
     if focusedDeal() then return end
     if S.nativeSellActive() then return end
     if S.snipePending or db.unsettledPurchase or S.pending or S.buying or S.quote
-        or S.autoSearch or S.watchSearch or S.liveCandidate or not throttleGate() then return end
+        or S.autoSearch or S.watchSearch or S.liveCandidate or S.batchSearch or not throttleGate() then return end
     if C_AuctionHouse == nil then return end
     if S.lastScan and time() - S.lastScan < math.min(cfg.every, 60) then return end
     local okN, n = pcall(C_AuctionHouse.GetNumReplicateItems)
@@ -3434,6 +3437,7 @@ end
 
 canQuery = function(paging)
     if not cfg.enabled or not S.ahOpen then return false end
+    if S.batchSearch then return false end
     if S.nativeSellActive() then return false end
     if S.scanning or S.harvestOwner or S.harvestTicker then return false end
     if S.snipePending or db.unsettledPurchase or S.quote or (S.batchBuy and S.batchBuy.pending) then return false end
@@ -3646,8 +3650,109 @@ local function processBrowseRows(rows, added, source)
     S.browseRecorded = #rows
 end
 
+do
+    function S.failBatch(reason)
+        S.batchSearch = nil
+        S.batchDisabled = reason
+        S.sweepStats.batchFailures = (S.sweepStats.batchFailures or 0) + 1
+        recordGate("batch", reason)
+        S.wakeSweep()
+    end
+
+    function S.startBatch()
+        if not cfg.batch or S.batchDisabled or S.deepScan or blizzardBrowseActive()
+            or type(C_AuctionHouse.SearchForItemKeys) ~= "function"
+            or type(C_AuctionHouse.MakeItemKey) ~= "function"
+            or type(C_AuctionHouse.HasFullBrowseResults) ~= "function" then return false end
+        S.batchChecked = S.batchChecked or {}
+        local candidates, now = {}, GetTime()
+        for rawID, b in pairs(db.book) do
+            local id = num(rawID)
+            local checked = id and (S.batchChecked[id] or -60)
+            if id and id > 0 and id % 1 == 0 and not watchByID[id] and not db.blacklist[id] and commodityFor(id) == true
+                and now - checked >= 10 then
+                local market = freshMedian(b.s, time(), (cfg.freshMins or 45) * 60, cfg.armAfter)
+                if market and market >= cfg.minUnit then
+                    candidates[#candidates + 1] = {id=id, checked=checked}
+                end
+            end
+        end
+        table.sort(candidates, function(a, b)
+            if a.checked ~= b.checked then return a.checked < b.checked end
+            return a.id < b.id
+        end)
+        local keys, ids = {}, {}
+        for _, candidate in ipairs(candidates) do
+            if #keys >= 100 then break end
+            local id = candidate.id
+            local ok, key = pcall(C_AuctionHouse.MakeItemKey, id)
+            if ok and type(key) == "table" and key.itemID == id and not ids[id] then
+                keys[#keys + 1], ids[id] = key, true
+            end
+        end
+        if #keys == 0 then return false end
+        -- Own the browse channel before calling into clients with cached replies.
+        S.sweeping = false
+        S.batchSearch = {t=now, ids=ids, count=#keys}
+        noteQueryAttempt()
+        S.sweepStats.batchSent = (S.sweepStats.batchSent or 0) + 1
+        local ok = pcall(C_AuctionHouse.SearchForItemKeys, keys, {})
+        if not ok then S.failBatch("submission failed; individual fallback") end
+        return true -- failed submissions still consume the pacing slot
+    end
+
+    function S.readBatch()
+        local owner = S.batchSearch
+        if not owner then return false end
+        if not S.ahOpen or not cfg.enabled then S.batchSearch = nil return true end
+        local ok, rows = pcall(C_AuctionHouse.GetBrowseResults)
+        local fullOK, full = pcall(C_AuctionHouse.HasFullBrowseResults)
+        if not ok or type(rows) ~= "table" or not fullOK or full ~= true then
+            S.failBatch("unreadable or incomplete summary; individual fallback")
+            return true
+        end
+        local seen = {}
+        for _, row in ipairs(rows) do
+            local id = type(row) == "table" and type(row.itemKey) == "table" and num(row.itemKey.itemID)
+            local price = type(row) == "table" and num(row.minPrice)
+            local quantity = type(row) == "table" and num(row.totalQuantity)
+            if not id or not owner.ids[id] or seen[id] or not price or price < 0
+                or price % 1 ~= 0 or not quantity or quantity < 0 or quantity % 1 ~= 0 then
+                S.failBatch("unexpected summary rows; individual fallback")
+                return true
+            end
+            seen[id] = true
+        end
+        S.batchSearch = nil
+        for id in pairs(owner.ids) do S.batchChecked[id] = GetTime() end
+        local stats = S.sweepStats
+        stats.batchCompleted = (stats.batchCompleted or 0) + 1
+        stats.batchKeys = (stats.batchKeys or 0) + owner.count
+        stats.batchRows = (stats.batchRows or 0) + #rows
+        stats.batchLatency = GetTime() - owner.t
+        -- Reuse existing candidate gates. Summary quantities never become a
+        -- purchase snapshot; fireAlert still queues complete live tier checks.
+        local sort = stats.lastSort
+        stats.lastSort = "batch"
+        processBrowseRows(rows, false, "batch")
+        stats.lastSort = sort
+        S.wakeSweep()
+        return true
+    end
+
+    function S.candidatePriority(candidate)
+        local age = math.max(0, GetTime() - candidate.t)
+        local profit = math.max(0, candidate.profit or 0)
+        -- A bounded value boost cannot starve older candidates indefinitely.
+        return age + math.min(5, math.log(1 + profit / 10000))
+    end
+end
+
 local function sweepQuery()
     if S.snipePending or S.pending or S.buying then return end
+    if S.batchSearch and GetTime() - S.batchSearch.t >= 5 then
+        S.failBatch("summary timed out; individual fallback")
+    end
     -- Expiry is local housekeeping, not a query. A busy AH must not retain
     -- dead owners or hide the real wait behind a checking-item label.
     for _, field in ipairs({"liveCandidate", "autoSearch", "watchSearch"}) do
@@ -3707,7 +3812,8 @@ local function sweepQuery()
             if GetTime() - candidate.t >= 30 then
                 S.liveCandidates[id] = nil
                 recordGate("preparation", "expired before search", id)
-            elseif not oldest or candidate.t < oldest.t or (candidate.t == oldest.t and candidate.id < oldest.id) then
+            elseif not oldest or S.candidatePriority(candidate) > S.candidatePriority(oldest)
+                or (S.candidatePriority(candidate) == S.candidatePriority(oldest) and candidate.id < oldest.id) then
                 oldest = candidate
             end
         end
@@ -3721,6 +3827,7 @@ local function sweepQuery()
     -- target slot, never the discovery slot or an in-flight search's pages.
     if sweepCount % 2 == 1 and C_AuctionHouse.SendSearchQuery then
         local key, id, w = watchKey, watchID, watchRule
+        if not key and S.startBatch() then return end
         local target = not key and nextAutoTarget() or nil
         if target then id = target.id end
         if key or target then
@@ -4014,6 +4121,7 @@ local stopRelisting -- forward: defined with the batch-relist block below
 local function stopSweeping()
     observeQueryPressure(false)
     S.sweepWake = nil
+    if not S.ahOpen or not cfg.enabled then S.batchSearch = nil end
     if S.sweepTicker then
         S.sweepTicker:Cancel()
         S.sweepTicker = nil
@@ -4127,7 +4235,7 @@ do
             return false, "purchase or inspection busy"
         end
         if S.scanning or S.harvestOwner or S.harvestTicker then return false, "snapshot busy" end
-        if S.autoSearch or S.watchSearch or S.liveCandidate or S.deepScan then return false, "scanner search busy" end
+        if S.autoSearch or S.watchSearch or S.liveCandidate or S.deepScan or S.batchSearch then return false, "scanner search busy" end
         local ready, reason = throttleGate()
         if not ready then return false, reason == "unavailable" and "auction readiness unavailable" or "auction throttle busy" end
         if not (C_AuctionHouse and C_AuctionHouse.QueryOwnedAuctions) then return false, "owned query API unavailable" end
@@ -4735,6 +4843,7 @@ local function readDeepBrowse(added)
 end
 
 on("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", function()
+    if S.readBatch() then return end
     -- a fresh result set answers our sweep (or any manual search); read it
     if S.deepScan and not S.deepScan.needsSend and S.deepScan.lastReq and C_AuctionHouse.GetBrowseResults then
         readDeepBrowse(false)
@@ -4758,6 +4867,7 @@ on("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", function()
 end)
 
 on("AUCTION_HOUSE_BROWSE_RESULTS_ADDED", function()
+    if S.readBatch() then return end
     -- the next page landed: process it, keep paging until full
     if S.deepScan and not S.deepScan.needsSend and S.deepScan.lastReq and C_AuctionHouse.GetBrowseResults then
         readDeepBrowse(true)
@@ -4780,9 +4890,13 @@ onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_RESPONSE_RECEIVED", function() throt
 onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_SENT", function() throttleReady = false end)
 onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_QUEUED", function() throttleReady = false end)
 onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED", function()
+    if S.batchSearch then S.failBatch("request dropped; individual fallback") end
     throttleReady = true
     pagePending = false -- wake a paced retry rather than waiting for the watchdog
     S.wakeSweep()
+end)
+onOptional("AUCTION_HOUSE_BROWSE_FAILURE", function()
+    if S.batchSearch then S.failBatch("browse failed; individual fallback") end
 end)
 
 local function onReplicateUpdated()
@@ -5227,6 +5341,7 @@ local HELP = {
     "|cffffd100tuning|r",
     "/fsn thresh 50        alert at %% of learned market (1-99)",
     "/fsn sweep 3          fallback tick seconds (2-30); ready events wake paced searches",
+    "/fsn batch on|off     experimental 100-key summaries; failures fall back to item checks",
     "/fsn max 250g         spend cap per Buy click",
     "/fsn keep 10g         keep this gold untouched (5% wallet buffer also applies)",
     "/fsn stock 200        default per-item exposure cap (0 = off)",
@@ -5400,6 +5515,10 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             cfg.enabled and "|cff7cff4fon|r" or "|cffff4d4doff|r",
             S.scansDone, db.stats.book or 0, db.stats.deals or 0)
         local ss = S.sweepStats or { sent = 0, rows = 0, yields = 0 }
+        printf("batch discovery: %s; %d sent, %d completed, %d keys covered, %d rows, %d failures; last response %.2fs.",
+            S.batchDisabled or (cfg.batch and "enabled (experimental)" or "off"),
+            ss.batchSent or 0, ss.batchCompleted or 0, ss.batchKeys or 0,
+            ss.batchRows or 0, ss.batchFailures or 0, ss.batchLatency or 0)
         printf("automatic item checks: %d sent, %d completed, %d distinct targets; last target: %s (stock movement is not confirmed sales).",
             ss.autoSent or 0, ss.autoCompleted or 0, ss.autoUnique or 0, tostring(ss.lastTarget or "none"))
         printf("last discovery scope: %s; sort: %s. Routine discovery alternates broad categories and available subcategories, one page per query.",
@@ -5570,6 +5689,16 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             cfg.every = math.floor(v)
             printf("scanning every %ds while the AH is open.", cfg.every)
         else printf("usage: /fsn every 45  (seconds, 15-900)") end
+
+    elseif cmd == "batch" then
+        if rest == "on" or rest == "off" then
+            cfg.batch = rest == "on"
+            -- Do not abandon ownership mid-reply. Turning off stops new batches;
+            -- the current request completes or times out through its usual gates.
+            if cfg.batch and not S.batchSearch then S.batchDisabled = nil end
+            printf("batch discovery %s (experimental; full live tiers still required).", cfg.batch and "on" or "off")
+            S.wakeSweep()
+        else printf("usage: /fsn batch on|off; current: %s", cfg.batch and "on" or "off") end
 
     elseif cmd == "sweep" then
         local v = tonumber(rest)
