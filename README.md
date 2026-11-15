@@ -28,8 +28,9 @@ live-client detection speed or guarantee winning a contested listing.
 ## Experimental batch discovery
 
 `/fsn batch on` enables known-commodity summary searches of up to 100 unique item
-keys per request. It is **off by default** until Forever's live response semantics
-have been verified. `/fsn batch off` stops new batches; an in-flight request keeps
+keys per request. It is **on by default** for the owner-approved rollout; Forever's
+live response semantics still need validation. Existing explicit off settings are
+preserved. `/fsn batch off` stops new batches; an in-flight request keeps
 ownership until it completes or times out. `/fsn status` reports sent/completed
 batches, requested keys in completed batches (including repeat visits), returned
 rows, failures, and the last response time.
@@ -59,7 +60,7 @@ There is no 1% change cutoff: unchanged summaries and small quantity changes
 remain eligible on later visits. Existing duplicate-alert checks still apply.
 
 Local tests establish scheduling and fallback behaviour, not a live speedup.
-Before considering default-on operation, compare batches on/off with the same
+During the default-on rollout, compare batches on/off with the same
 known items: completed keys per minute, revisit delays, candidate-to-alert time,
 timeouts and stale-result rejections. Last response time is not listing age.
 

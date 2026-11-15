@@ -109,3 +109,13 @@ notices, and the static checker reports zero errors/warnings. Full test output:
 `C:/Users/cbosc/AppData/Local/Temp/opencode/forever-batch-tests.log`.
 Next action: open a stacked PR against `fix/forever-scan-latency`, check exact-commit
 CI and leave both PRs unmerged. No version bump, deployment or saved-data edits.
+
+### Owner-approved enabled deployment
+
+The owner subsequently requested deployment with all new discovery features
+enabled. Batch discovery now defaults to true; existing explicit off settings are
+preserved. The installed saved configuration has no batch override, so the default
+will apply on reload without editing saved data. This approval changes rollout
+policy, not the live-validation evidence above. Failure fallback, purchase gates,
+stock/reserve settings and query spacing remain unchanged. Deployment must use the
+exact updated commit after CI passes, with backup and hash verification.

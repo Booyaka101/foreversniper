@@ -19,7 +19,7 @@ local DEFAULTS = {
     threshold = 0.50,    -- deal if unit price <= 50% of learned market
     every     = 45,      -- seconds between full scans while the AH is open
     sweep     = 2,       -- fallback scheduler tick; ready events also wake paced searches
-    batch     = false,   -- opt-in until summary-search semantics are verified live
+    batch     = true,    -- owner-approved rollout; failures retain individual fallback
     freshMins = 45,      -- market age: older price samples do not arm alerts
     overhang  = 500,     -- max competing units above the deal; more = slow flip (0 = off)
     armAfter  = 2,       -- require two learned observations before market alerts

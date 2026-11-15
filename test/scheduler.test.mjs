@@ -115,6 +115,15 @@ const batchSetup = `
 `;
 function batchCheck(code) { check(batchSetup + code); }
 
+test('owner-approved default enables batching without overriding explicit saved choices', () => {
+  const init = section('local DEFAULTS =', '\n-- one-time retune:');
+  for (const setting of ['nil', 'false', 'true']) run(`
+    ForeverSniperDB={config={batch=${setting}}}
+    ${init}
+    assert(db.config.batch==${setting === 'nil' ? 'true' : setting})
+  `);
+});
+
 test('batch command toggles future requests without abandoning an in-flight owner', () => {
   const command = section('    elseif cmd == "batch" then', '\n    elseif cmd == "sweep" then')
     .replace('elseif cmd', 'if cmd');
