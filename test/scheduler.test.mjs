@@ -367,6 +367,49 @@ test('server readiness is checked again when a scheduled wake fires', () => chec
   assert(#queries==0 and #timers==0)
 `));
 
+test('a stale sent-event flag cannot veto live readiness after minimum spacing', () => check(`
+  S.sweepTicker={}; lastQueryAt=now
+  handlers.AUCTION_HOUSE_THROTTLED_MESSAGE_SENT()
+  now=100.9; sweepQuery(); assert(#queries==0)
+  now=101; sweepQuery(); assert(#queries==1)
+`));
+
+test('out-of-order queued events cannot add a five-second wait after a ready wake', () => check(`
+  S.sweepTicker={}; lastQueryAt=now
+  handlers.AUCTION_HOUSE_THROTTLED_SYSTEM_READY()
+  handlers.AUCTION_HOUSE_THROTTLED_MESSAGE_QUEUED()
+  advance(101)
+  assert(#queries==1)
+`));
+
+test('live busy readiness still blocks queries regardless of cached readiness', () => check(`
+  S.sweepTicker={}; lastQueryAt=now
+  handlers.AUCTION_HOUSE_THROTTLED_SYSTEM_READY()
+  ready=false
+  advance(101); assert(#queries==0)
+  now=106; sweepQuery(); assert(#queries==0)
+`));
+
+test('feed distinguishes owned batch and browse replies from idle throttle waits', () => {
+  check(`
+    local function countKeys(t) local n=0 for _ in pairs(t) do n=n+1 end return n end
+    local function recentGateReasons() return nil,{} end
+    local function fmtMoney(v) return tostring(v) end
+    local function historyReadiness() return {ready=0,warming=0,stale=0} end
+    S.session={}; cfg.armAfter=2
+    ${section('local function feedOverview(visibleCount)', '\nlocal function refreshFeed()')}
+    ready=false
+    S.batchSearch={t=now}
+    assert(feedOverview(0):find("Waiting for batch summaries",1,true))
+    S.batchSearch=nil; S.sweeping=true
+    assert(feedOverview(0):find("Waiting for discovery results",1,true))
+    S.sweeping=false
+    assert(feedOverview(0):find("Waiting for AH throttle",1,true))
+    S.batchSearch={t=now}; S.snipePending={}
+    assert(feedOverview(0):find("Purchase pending",1,true))
+  `);
+});
+
 test('all purchase, disabled, closed, ownership, and native-form gates survive event wakes', () => {
   for (const change of [
     'S.snipePending={}', 'db.unsettledPurchase={}', 'S.quote={}',

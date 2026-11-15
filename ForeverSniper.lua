@@ -2240,6 +2240,10 @@ local function feedOverview(visibleCount)
         stage = "Validating a complete position"
     elseif S.autoSearch or S.watchSearch then
         stage = "Checking live item tiers"
+    elseif S.batchSearch then
+        stage, guidance = "Waiting for batch summaries", "An owned summary request is in flight. Complete live tiers are still required before buying."
+    elseif S.sweeping then
+        stage = "Waiting for discovery results"
     elseif not ready then
         stage = readinessReason == "unavailable" and "AH readiness unavailable" or "Waiting for AH throttle"
         guidance = readinessReason == "unavailable"
@@ -3448,10 +3452,9 @@ canQuery = function(paging)
         if GetTime() - lastQueryAt < 5 then return false end
         pagePending = false -- dropped browse request: allow a fresh query
     end
-    if not throttleReady then
-        if GetTime() - lastQueryAt < 5 then return false end
-        throttleReady = true
-    end
+    -- The live API is authoritative. Shared SENT/QUEUED events can leave the
+    -- cached flag false when a ready event is missing or arrives out of order.
+    throttleReady = true
     if GetTime() - lastQueryAt < queryPacing().interval then return false end
     return true
 end
