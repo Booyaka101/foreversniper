@@ -74,3 +74,38 @@ Full test output is retained locally as
 
 Next gates: open a PR and check CI. Do not merge, release or deploy this follow-up
 without owner approval. Live latency validation remains outstanding.
+
+## Batch-discovery follow-up
+
+Branch: `feat/forever-batch-discovery`, stacked on PR #3 commit `abbb53f`.
+The owner approved implementation following the competitor review, not deployment.
+
+Implemented opt-in 100-key commodity summaries, oldest-check-first key rotation,
+retained broad discovery/watch/candidate slots, strict summary membership/shape/
+completeness validation, five-second timeout and session-disabled individual
+fallback. Candidate ordering adds a bounded profit hint to aging. Summary data
+still flows through the existing unverified-candidate path; it cannot create
+purchase snapshots. In-flight ownership covers searches, full scans, sell-query
+preparation and Buy. Timer restarts retain batch ownership; close/disable clears it.
+
+Inspected the complete production diff plus existing browse candidate processing,
+quickBuy, requestItemSearch, replicate ownership, deep-scan dispatch, stop/close,
+and slash-command paths. Deterministic tests exercise production batch functions,
+browse-event dispatch, pacing/ownership, invalid replies, synchronous replies,
+key rotation, fallback, command toggles and purchase blocking. The scheduler test
+stubs the downstream candidate processor; the existing depth suite separately
+executes real purchase validation. This is not end-to-end live server validation.
+
+Remaining before deployment: live API completeness/event behaviour, competing
+scanner interference, coverage/revisit/detection latency measurements. Membership
+checks cannot distinguish overlapping searches because browse events have no
+request token. Batching remains default-off. Auctionator-style cache-ready retries
+and cross-addon coordination are deferred, not claimed as implemented. Existing
+baseline AH-scenario failures remain excluded from passing gates.
+
+Final local checks: all 56 tests pass (40 prior tests plus 16 new batch/priority/
+purchase regressions), strict load/lifecycle simulation is clean with unknown-event
+notices, and the static checker reports zero errors/warnings. Full test output:
+`C:/Users/cbosc/AppData/Local/Temp/opencode/forever-batch-tests.log`.
+Next action: open a stacked PR against `fix/forever-scan-latency`, check exact-commit
+CI and leave both PRs unmerged. No version bump, deployment or saved-data edits.

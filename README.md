@@ -25,6 +25,44 @@ Server delays, pagination, stock refreshes, history availability, and other addo
 still affect coverage. These scheduling changes do not establish a measured
 live-client detection speed or guarantee winning a contested listing.
 
+## Experimental batch discovery
+
+`/fsn batch on` enables known-commodity summary searches of up to 100 unique item
+keys per request. It is **off by default** until Forever's live response semantics
+have been verified. `/fsn batch off` stops new batches; an in-flight request keeps
+ownership until it completes or times out. `/fsn status` reports sent/completed
+batches, requested keys in completed batches (including repeat visits), returned
+rows, failures, and the last response time.
+
+Batches use automatic target opportunities after queued candidates, watches and
+due displayed-deal refreshes. Broad category discovery keeps its reserved slots
+to find unfamiliar items. Keys with fresh market history rotate oldest-check-first
+with a minimum ten-second revisit interval. Deep scans retain their own browse
+channel; batch requests do not run alongside them. Item checks resume when no
+batch keys are due or the required APIs are absent.
+
+Unreadable, incomplete, unexpected or duplicate rows, submission errors, dropped
+requests and five-second timeouts disable batches for the current UI session.
+Individual checks then resume through the usual readiness and spacing gates.
+After investigating the failure, `/fsn batch on` can explicitly retry. Empty,
+complete replies are accepted because none of the requested items may be listed.
+The browse events have no request token; membership checks reject foreign keys
+but cannot prove ownership against another addon's overlapping search. Avoid
+running competing scanners during live validation.
+
+Summary rows go through existing candidate gates, never directly into purchase
+snapshots. Complete live tiers, quote checks, stock limits and reserves remain
+mandatory. In-flight batches block purchases, inspection, full-scan requests and
+sell-query preparation. Candidate validation uses age plus a bounded estimated
+profit boost; summary profit is only a priority hint, not validated earnings.
+There is no 1% change cutoff: unchanged summaries and small quantity changes
+remain eligible on later visits. Existing duplicate-alert checks still apply.
+
+Local tests establish scheduling and fallback behaviour, not a live speedup.
+Before considering default-on operation, compare batches on/off with the same
+known items: completed keys per minute, revisit delays, candidate-to-alert time,
+timeouts and stale-result rejections. Last response time is not listing age.
+
 ## Depth-based deal selection
 
 Market and dump candidates compare every complete price-tier prefix below the
