@@ -7,4 +7,5 @@
 ## SavedVariables: ForeverSniperDB
 ## X-Flavor-Note: Built for the WoW Forever beta 1.60.x (wow_classic_beta). API surface confirmed via the ForeverBeacon probe, 2026-09-17.
 
+DepthOptimizer.lua
 ForeverSniper.lua

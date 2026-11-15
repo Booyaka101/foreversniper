@@ -27,6 +27,8 @@ local DEFAULTS = {
     cut       = 0.05,    -- AH cut assumed when estimating resale profit
     profit    = 1000,    -- deals must clear 10s estimated profit (classic scale)
     maxSpend  = 1000000, -- spend cap per Buy click (100g default)
+    keepGold  = 0,       -- explicit reserve, in addition to the existing 5% wallet buffer
+    maxStock  = 0,       -- per-item known exposure cap; 0 leaves existing behaviour unchanged
     sound     = true,
     popup     = true,
     flash     = true,    -- tier-colored screen flash on deals
@@ -70,6 +72,9 @@ if not db.tunedClassic then
     print("|cffff7d0aForever Sniper|r: retuned for the classic economy - 1s unit floor, 10s profit floor, 5% snipe tolerance. /fsn options to adjust.")
 end
 local cfg = db.config
+
+db.stockLimits = db.stockLimits or {}
+db.stockPending = db.stockPending or {}
 
 local CAPS = { errors = 200, alerts = 60, samples = 30, book = 12000 }
 
@@ -936,13 +941,62 @@ local function offerKind(itemID, line, kind)
     end
 end
 
-local function commodityPositionTerms(itemID, line, units, cost, market, kind, snapshot)
+function S.purchaseBudget()
+    local wallet, reserve, cap = num(GetMoney()), num(cfg.keepGold), num(cfg.maxSpend)
+    if not wallet or not reserve or reserve < 0 or not cap or cap < 0 then return 0 end
+    return math.max(0, math.min(math.floor(wallet * 0.95), wallet - reserve, cap))
+end
+
+function S.stockAllowance(itemID)
+    local cap = db.stockLimits[tostring(itemID)]
+    if cap == nil then cap = cfg.maxStock end
+    cap = num(cap)
+    if not cap or cap < 0 or cap % 1 ~= 0 then return nil, "stockinfo" end
+    if cap == 0 then return math.huge end
+    local getter = C_Item and C_Item.GetItemCount or GetItemCount
+    if not getter then return nil, "stockinfo" end
+    local ok, held = pcall(getter, itemID, true)
+    held = ok and num(held)
+    if not held or held < 0 or held % 1 ~= 0 then return nil, "stockinfo" end
+    if not S.sellingOwnedUpdated or GetTime() < S.sellingOwnedUpdated
+        or GetTime() - S.sellingOwnedUpdated > 20 then return nil, "stockinfo" end
+    local ah = C_AuctionHouse
+    if not (ah and ah.GetNumOwnedAuctions and ah.GetOwnedAuctionInfo) then return nil, "stockinfo" end
+    local read, count = pcall(ah.GetNumOwnedAuctions)
+    count = read and num(count)
+    if not count or count < 0 or count % 1 ~= 0 then return nil, "stockinfo" end
+    for i = 1, count do
+        local good, row = pcall(ah.GetOwnedAuctionInfo, i)
+        if not good or type(row) ~= "table" or not row.itemKey or not num(row.itemKey.itemID) then
+            return nil, "stockinfo"
+        end
+        if row.itemKey.itemID == itemID then
+            local qty = num(row.quantity)
+            if not qty or qty < 0 or qty % 1 ~= 0 then return nil, "stockinfo" end
+            held = held + qty
+        end
+    end
+    local pending = num(db.stockPending[tostring(itemID)] or 0)
+    if not pending or pending < 0 or pending % 1 ~= 0 then return nil, "stockinfo" end
+    return math.max(0, cap - held - pending)
+end
+
+local function commodityPositionTerms(itemID, line, units, cost, market, kind, snapshot, lot, policy)
     line = num(line)
     if not line or line <= 0 then return nil, "invalid" end
-    local liveUnits, liveCost, first, competing, competingUnits = commodityLot(snapshot, line)
+    local liveUnits, liveCost, first, competing, competingUnits
+    if lot then
+        liveUnits, liveCost, first, competing, competingUnits = lot.units, lot.cost, lot.first, lot.competing, lot.competingUnits
+    else
+        liveUnits, liveCost, first, competing, competingUnits = commodityLot(snapshot, line)
+    end
     if not num(liveUnits) or not num(liveCost) then return nil, "invalid" end
     if (units and (not num(units) or units < liveUnits)) or (cost and (not num(cost) or cost < liveCost)) then return nil, "grown" end
     if liveUnits < 1 then return nil, "empty" end
+    local allowance, stockReason
+    if policy then allowance = policy.allowance else allowance, stockReason = S.stockAllowance(itemID) end
+    if not allowance then return nil, stockReason end
+    if liveUnits > allowance then return nil, "stocklimit" end
     kind = offerKind(itemID, line, kind) or (market ~= nil and "market" or "watch")
     if kind == "market" or kind == "dump" then
         local info = infoOf(itemID)
@@ -960,7 +1014,7 @@ local function commodityPositionTerms(itemID, line, units, cost, market, kind, s
     local deposit = kind == "vendor" and 0 or (depositPerUnit(itemID, true) or math.ceil(liveCost / liveUnits * 0.05))
     local reserve = deposit * liveUnits
     if not num(reserve) or reserve < 0 then return nil, "invalid" end
-    local budget = math.min(math.floor((num(GetMoney()) or 0) * 0.95), cfg.maxSpend or 0)
+    local budget = policy and policy.budget or S.purchaseBudget()
     if liveCost + reserve > budget then return nil, "budget" end
     local profit, resale
     if market ~= nil then
@@ -972,6 +1026,22 @@ local function commodityPositionTerms(itemID, line, units, cost, market, kind, s
         if profit < math.max(1, kind == "vendor" and (cfg.vendorMin or 5000) or (cfg.profit or 0)) then return nil, "profit" end
     end
     return {units=liveUnits, cost=liveCost, reserve=reserve, walletCap=budget - reserve, profit=profit, first=first, resale=resale, kind=kind}
+end
+
+function S.optimizedCommodityTerms(itemID, line, market, kind, snapshot)
+    if kind ~= "market" and kind ~= "dump" then
+        return commodityPositionTerms(itemID, line, nil, nil, market, kind, snapshot)
+    end
+    line = num(line)
+    if not line or line < 1 then return nil, "invalid" end
+    local allowance, stockReason = S.stockAllowance(itemID)
+    if not allowance then return nil, stockReason end
+    local policy = {allowance=allowance, budget=S.purchaseBudget()}
+    -- Only fresh-history candidates reach this path. An empty order book never
+    -- invents an exit price; the existing market reference remains the upper bound.
+    return ForeverSniperDepthOptimizer.choose(snapshot.tiers, math.floor(line), function(ceiling, lot)
+        return commodityPositionTerms(itemID, ceiling, nil, nil, market, kind, snapshot, lot, policy)
+    end)
 end
 
 local function commodityOfferTerms(itemID, line, units, cost, market, kind)
@@ -1800,6 +1870,8 @@ commodityActionState = function(itemID, link, line, units, cost, market, kind)
     end
     local ready, reason = commodityOfferReady(itemID, link, line, units, cost, market, kind)
     if reason == "budget" then return "Cost", false, "The complete position plus deposit reserve exceeds your wallet or spend cap." end
+    if reason == "stocklimit" then return "Stock", false, "The complete position exceeds your per-item stock limit, including uncollected purchases." end
+    if reason == "stockinfo" then return "Stock", false, "Stock data is unavailable or stale. Refresh owned auctions with /fsn sell; buying remains blocked." end
     if reason == "profit" then return "Net", false, "Estimated net after competition, cut and deposit is below your profit floor." end
     if reason == "invalid" then return "Hold", false, "Position data is invalid. Nothing will be purchased." end
     if reason == "iteminfo" then return "Info", false, "Item quality or stack metadata is still loading. Nothing will be purchased." end
@@ -1917,6 +1989,8 @@ local function finishPurchase(p, source)
     S.boughtAt[tostring(id)] = {t=time(), price=total / units, source=source, kind=p.kind, ceiling=p.maxUnit}
     db.purchases = db.purchases or {}
     push(db.purchases, 200, {t=time(), id=id, units=units, total=total, source=source, kind=p.kind, ceiling=p.maxUnit})
+    local stockKey = tostring(id)
+    db.stockPending[stockKey] = (num(db.stockPending[stockKey]) or 0) + units
     S.commoditySnapshots[id] = nil
     S.sellingOwnedDisplay = nil -- a newly settled ceiling changes the owned-listing filter
     for _, d in ipairs(S.deals) do
@@ -2005,6 +2079,8 @@ quickBuy = function(r)
             grown="the full lot grew beyond the displayed offer - refreshing it, nothing purchased.",
             empty="no units remain under the approved line - nothing purchased.",
             budget="full deal plus deposit reserve exceeds the budget - no partial wall purchased.",
+            stocklimit="full deal exceeds your per-item stock limit - nothing purchased.",
+            stockinfo="stock data is unavailable or stale - refresh /fsn sell before buying.",
             profit="full live deal does not clear the profit floor after fees - nothing purchased.",
             iteminfo="item eligibility is still loading - nothing purchased.",
             quality="item quality is below your market floor - nothing purchased.",
@@ -3255,7 +3331,7 @@ S.sweepStats = { sent = 0, rows = 0, yields = 0, lastRows = 0 }
 S.autoChecked = {}
 local function nextAutoTarget()
     local now, best, bestScore = time(), nil, nil
-    local budget = math.min(math.floor((num(GetMoney()) or 0) * 0.95), cfg.maxSpend or 0)
+    local budget = S.purchaseBudget()
     for rawID, b in pairs(db.book) do
         local id = tonumber(rawID)
         if id and not watchByID[id] and not db.blacklist[id] and commodityFor(id) == true then
@@ -3574,6 +3650,13 @@ local function sweepQuery()
     end
     if not canQuery() then return end
     if C_AuctionHouse == nil then return end
+    if (cfg.maxStock > 0 or next(db.stockLimits))
+        and (not S.sellingOwnedUpdated or GetTime() - S.sellingOwnedUpdated > 15)
+        and (not S.stockRefreshAt or GetTime() - S.stockRefreshAt >= 5)
+        and not (S.liveCandidate or S.autoSearch or S.watchSearch) then
+        S.stockRefreshAt = GetTime()
+        if S.requestSellingOwned() then return end
+    end
     local focus = focusedDeal()
     for _, field in ipairs({"liveCandidate", "autoSearch", "watchSearch"}) do
         local owner = S[field]
@@ -4851,15 +4934,16 @@ local function onCommodityResults(itemID)
             recordGate("validation", reason or "no snapshot", itemID)
             return
         end
-        local terms, rejected = commodityPositionTerms(itemID, c.line, nil, nil, c.market, c.kind, snapshot)
+        local terms, rejected = S.optimizedCommodityTerms(itemID, c.line, c.market, c.kind, snapshot)
         if terms then
             fireAlert(c.kind, itemID, c.link, terms.first, terms.resale,
-                {units=terms.units,cost=terms.cost,profit=terms.profit,line=c.line,verified=true}, true)
+                {units=terms.units,cost=terms.cost,profit=terms.profit,line=terms.line or c.line,verified=true}, true)
         else
             local reasons = {empty="no units below ceiling", budget="complete position exceeds budget",
                 profit="net after competition and deposit below floor", invalid="invalid position data",
                 quality="quality below floor", stackable="not stackable", iteminfo="item info loading",
-                overhang="live competing stock over limit"}
+                overhang="live competing stock over limit", stocklimit="per-item stock limit reached",
+                stockinfo="stock data unavailable or stale"}
             recordGate("validation", reasons[rejected] or rejected, itemID)
             if c.refresh then markDealGone(itemID, math.huge) end
         end
@@ -4887,7 +4971,7 @@ on("COMMODITY_PRICE_UPDATED", function(unitPrice, totalPrice)
         local u = num(unitPrice)
         local ceiling = sp.maxUnit or (sp.tolTotal / math.max(1, sp.units))
         local budget = math.min(sp.walletCap or math.huge,
-            math.min(math.floor((num(GetMoney()) or 0) * 0.95), cfg.maxSpend or 0) - (sp.reserve or 0))
+            S.purchaseBudget() - (sp.reserve or 0))
         if not cfg.enabled or not S.ahOpen or db.blacklist[sp.deal.id] or not S.offerAvailable(sp.offer)
             or GetTime() - sp.t > 2 or not u or u < 1 or u % 1 ~= 0 or not t or t < sp.units or t < u or t % 1 ~= 0
             or u > ceiling or t > sp.tolTotal or t > budget then
@@ -5084,7 +5168,13 @@ local function buildOptions()
     stepper(320, "snipe tolerance %", function() return cfg.tolerance or 5 end,
         function(v) cfg.tolerance = math.min(50, math.max(0, math.floor(v))) end,
         function(v) return tostring(v) .. "% quote leeway" end, 1)
-    optionsFrame:SetHeight(380)
+    stepper(376, "keep gold", function() return cfg.keepGold / 10000 end,
+        function(v) cfg.keepGold = math.max(0, math.floor(v)) * 10000 end,
+        function(v) return tostring(v) .. "g reserved" end, 1)
+    stepper(432, "stock per item", function() return cfg.maxStock end,
+        function(v) cfg.maxStock = math.max(0, math.floor(v)) end,
+        function(v) return v == 0 and "off" or (tostring(v) .. " units") end, 20)
+    optionsFrame:SetHeight(490)
 end
 -- Slash commands ---------------------------------------------------------------------
 
@@ -5112,6 +5202,10 @@ local HELP = {
     "/fsn thresh 50        alert at %% of learned market (1-99)",
     "/fsn sweep 3          seconds between live sweeps (2-30)",
     "/fsn max 250g         spend cap per Buy click",
+    "/fsn keep 10g         keep this gold untouched (5% wallet buffer also applies)",
+    "/fsn stock 200        default per-item exposure cap (0 = off)",
+    "/fsn stock <ID> 100   item override; use inherit instead of 100 to remove it",
+    "/fsn received <ID>    acknowledge ALL reserved purchases collected; never clears holdings",
     "/fsn min 10s          ignore deals under this per-unit price",
     "/fsn quality 2        minimum rarity for market alerts (0 = any)",
     "/fsn profit 1g        minimum estimated resale profit (0 = off)",
@@ -5196,6 +5290,9 @@ _G.ForeverSniperTest = {
     commodityFor = commodityFor,
     ready = commodityOfferReady,
     smartPrice = smartPrice,
+    optimize = S.optimizedCommodityTerms,
+    stockAllowance = S.stockAllowance,
+    budget = S.purchaseBudget,
     merge = mergeIntoBook,
     popupRows = popupRows,
     quickBuy = quickBuy,
@@ -5333,6 +5430,8 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             math.floor(cfg.cut * 100 + 0.5), cfg.profit > 0 and fmtMoney(cfg.profit) or "off")
         printf("spend cap per Buy click: |cffffd100%s|r. every purchase is your click - never automatic.",
             fmtMoney(cfg.maxSpend))
+        printf("gold reserve %s; default per-item stock cap %s; %d item override(s). /fsn stock for limits and uncollected reservations.",
+            fmtMoney(cfg.keepGold), cfg.maxStock == 0 and "off" or tostring(cfg.maxStock), countKeys(db.stockLimits))
         printf("AH window %s. %d watch rules, %d blacklisted. /fsn help for everything.",
             S.ahOpen and "open" or "closed", countKeys(db.watch), countKeys(db.blacklist))
 
@@ -5387,6 +5486,50 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             else printf("stored purchase details are invalid; buying remains locked. Do not mark bought without valid details.") end
             printf("verify mail, bags and gold first; then /fsn purchase bought OR /fsn purchase failed. These are your assertions, not server verification.")
         end
+
+    elseif cmd == "keep" then
+        local text = rest:gsub("%s", ""):lower()
+        local value = not text:find("[^%dgsc]") and parseMoney(text)
+        if text:match("^0+[gsc]?$") then value = 0 end
+        if value and value >= 0 then
+            cfg.keepGold = math.floor(value)
+            refreshDealPresentation()
+            printf("gold reserve set to %s. The existing 5%% wallet buffer also applies.", fmtMoney(cfg.keepGold))
+        else printf("usage: /fsn keep 10g (0 = no additional reserve)") end
+
+    elseif cmd == "stock" then
+        if rest == "" then
+            printf("default stock cap %s; client-known bags/bank + fresh owned auctions + reserved purchases.",
+                cfg.maxStock == 0 and "off" or tostring(cfg.maxStock))
+            for id, cap in pairs(db.stockLimits) do printf("item %s: cap %d", id, cap) end
+            for id, qty in pairs(db.stockPending) do printf("item %s: %d units reserved until /fsn received %s", id, qty, id) end
+            printf("collect older mail before enabling caps. Reservations can double-count collected purchases until acknowledged.")
+            return
+        end
+        local target, amount = rest:match("^(.-)%s+(%S+)$")
+        if target then
+            local id = tonumber(target:match("item:(%d+)") or target)
+            local cap = tonumber(amount)
+            if id and id > 0 and id % 1 == 0 and (amount == "inherit" or (cap and cap >= 0 and cap % 1 == 0)) then
+                db.stockLimits[tostring(id)] = amount ~= "inherit" and cap or nil
+                printf("item %d stock cap: %s.", id, amount == "inherit" and "inherited" or tostring(cap))
+            else printf("usage: /fsn stock <item ID or link> <units|inherit>") return end
+        else
+            local cap = tonumber(rest)
+            if not cap or cap < 0 or cap % 1 ~= 0 then printf("usage: /fsn stock 200 (0 = off)") return end
+            cfg.maxStock = cap
+            printf("default per-item stock cap %d (0 = off). Collect older mail before enabling caps.", cap)
+        end
+        refreshDealPresentation()
+        if S.ahOpen then S.requestSellingOwned() end
+
+    elseif cmd == "received" then
+        local id = tonumber(rest:match("item:(%d+)") or rest)
+        if not id or id <= 0 or id % 1 ~= 0 then printf("usage: /fsn received <item ID or link>, only after collecting ALL reserved purchases") return end
+        if S.snipePending or db.unsettledPurchase then printf("resolve the pending purchase first; reservations unchanged.") return end
+        db.stockPending[tostring(id)] = nil
+        refreshDealPresentation()
+        printf("item %d reservations cleared by your acknowledgment. Bags/bank and owned auctions still count toward its cap.", id)
 
     elseif cmd == "thresh" then
         local v = tonumber(rest)
