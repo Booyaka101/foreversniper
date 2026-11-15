@@ -11,6 +11,9 @@ timer. Event bursts are coalesced and deferred, including synchronous cached
 replies. Every query still passes the existing minimum one-second spacing,
 server-readiness, ownership, native-form, and purchase-lock checks. `/fsn sweep`
 sets the fallback tick (2-30 seconds), not the event-driven request interval.
+The live readiness API is authoritative: stale SENT/QUEUED event flags do not add
+a five-second delay after the server reports ready. The feed distinguishes owned
+batch/browse replies from idle shared-throttle waits.
 
 Routine scheduling alternates target checks and discovery opportunities instead
 of allocating only one discovery slot in four. Watches retain one slot in four.

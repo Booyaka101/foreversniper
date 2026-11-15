@@ -119,3 +119,25 @@ will apply on reload without editing saved data. This approval changes rollout
 policy, not the live-validation evidence above. Failure fallback, purchase gates,
 stock/reserve settings and query spacing remain unchanged. Deployment must use the
 exact updated commit after CI passes, with backup and hash verification.
+
+## Reported throttle-wait follow-up
+
+Branch `fix/forever-throttle-waits`, based on deployed batch commit `6abcc69`.
+The user reports spending most time waiting for AH throttle. Read-only inspection
+found no persisted live throttle diagnostics; live `/fsn status` output is still
+needed to quantify the wait. Installed Auctionator uses the live readiness API
+as authoritative, while our canQuery also let a stale SENT/QUEUED event flag veto
+ready requests for five seconds. Removed that redundant veto, not live readiness
+or one-second spacing. Batch/browse ownership now has explicit feed labels rather
+than falling through to the generic throttle message. Purchase stages retain
+precedence. Regression tests cover stale/out-of-order events, true busy readiness,
+spacing and feed stage classification. No live speedup is claimed.
+
+Bounded pass: inspect readiness and status paths, add regressions, run tests/static/
+lifecycle checks and exact-commit CI, open a PR. No deployment or release in this
+pass; live status evidence and server-side contention remain unresolved.
+
+Local gates passed: all 61 tests (57 prior plus four wait/status regressions),
+strict load/lifecycle simulation with unknown-event notices, static checker with
+zero errors/warnings, and diff whitespace check. Full test output is retained at
+`C:/Users/cbosc/AppData/Local/Temp/opencode/forever-throttle-tests.log`.
