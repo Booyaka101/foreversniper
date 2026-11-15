@@ -1,129 +1,174 @@
 # Forever Sniper
 
-Auction deal sniper for **WoW: Forever 1.60.1** (interface `16001`). It learns
-prices from full auction-house scans and alerts the moment something is listed
-under market value — sound, chat line, and a popup whose rows can inspect or
-**buy the whole lot in one press**.
+Local auction deal finder for WoW: Forever. It learns prices from auction
+observations, validates complete live commodity tiers, and presents positions
+you can choose to buy. TradeSkillMaster is not required.
 
-## How it works
+## Scan scheduling
 
-1. **Learn** — every time you open the AH, the addon pulls the full listing
-   snapshot (`C_AuctionHouse.ReplicateItems`) and records each item's cheapest
-   unit price. Market value = median of the last 8 scan minimums, so one
-   mislisted 1c item cannot define a market.
-2. **Snipe** — each scan is diffed against the previous one. A *newly listed*
-   auction at or under `threshold`% of market (default 50%) triggers a **depth
-   sweep**: every unit of that item currently listed under the price line,
-   totalled into one lot — "240 units under market, 58g total" — so
-   stackables are bought as one purchase, not one listing at a time.
-3. **Profit gate** — a deal only fires if the sweep's estimated resale profit
-   (market value after the AH cut, minus cost) clears the floor
-    (`/fsn profit 10s` to set a floor) and the item clears the rarity floor
-   (`/fsn quality 1` — gray filtered by default). No more junk pings.
-4. **Watchlist** — absolute rules that fire from the very first scan:
-   `/fsn watch [Linen Cloth] 50s`. Swept against the rule's own ceiling, no
-   profit guess — the rule is the decision.
+Server-ready and result events wake the scanner without waiting for its fallback
+timer. Event bursts are coalesced and deferred, including synchronous cached
+replies. Every query still passes the existing minimum one-second spacing,
+server-readiness, ownership, native-form, and purchase-lock checks. `/fsn sweep`
+sets the fallback tick (2-30 seconds), not the event-driven request interval.
+The live readiness API is authoritative: stale SENT/QUEUED event flags do not add
+a five-second delay after the server reports ready. The feed distinguishes owned
+batch/browse replies from idle shared-throttle waits.
 
-Alerts arm after 2 scans of history by default (`/fsn arm N`), so day one is
-for learning, not for guessing.
+Routine scheduling alternates target checks and discovery opportunities instead
+of allocating only one discovery slot in four. Watches retain one slot in four.
+Weighted categories are spread across the rotation rather than clustered.
+A displayed deal can use a target slot for a refresh no more often than once
+every 15 seconds; it no longer pauses unrelated discovery. An in-flight search
+can finish its pages before the next search starts. Deep discovery also continues
+with a displayed deal, but pending or unresolved purchases still stop queries.
 
-The existing one-time Classic-economy migration sets the profit gate to zero,
-the minimum unit price to 1s and the threshold to 50%. Inspect `/fsn` and set
-your preferred profit floor explicitly. This update does not change that migration.
+This trades some automatic target-check slots per cycle for broader discovery.
+Server delays, pagination, stock refreshes, history availability, and other addons
+still affect coverage. These scheduling changes do not establish a measured
+live-client detection speed or guarantee winning a contested listing.
 
-## Quick start
+## Experimental batch discovery
 
-**Buying:** every purchase happens strictly inside a click you make on an
-alert row's **Buy** button — never automatically, never on a timer (Blizzard's
-hardware-event gate on the purchase calls is the security model, and it is
-honored). A Buy click:
+`/fsn batch on` enables known-commodity summary searches of up to 100 unique item
+keys per request. It is **on by default** for the owner-approved rollout; Forever's
+live response semantics still need validation. Existing explicit off settings are
+preserved. `/fsn batch off` stops new batches; an in-flight request keeps
+ownership until it completes or times out. `/fsn status` reports sent/completed
+batches, requested keys in completed batches (including repeat visits), returned
+rows, failures, and the last response time.
 
-1. re-searches the item live and re-computes what is under your price line
-   *right now* — stale alert data is never trusted,
-2. buys every unit under the line, cheapest first, bounded by the spend cap
-   (`/fsn max 100g` default),
-3. for commodities (stackables), opens the quantity-filled purchase for your
-   final press; for item listings it buys out directly on your click and
-   reports exactly what was spent.
+Batches use automatic target opportunities after queued candidates, watches and
+due displayed-deal refreshes. Broad category discovery keeps its reserved slots
+to find unfamiliar items. Keys with fresh market history rotate oldest-check-first
+with a minimum ten-second revisit interval. Deep scans retain their own browse
+channel; batch requests do not run alongside them. Item checks resume when no
+batch keys are due or the required APIs are absent.
 
+Unreadable, incomplete, unexpected or duplicate rows, submission errors, dropped
+requests and five-second timeouts disable batches for the current UI session.
+Individual checks then resume through the usual readiness and spacing gates.
+After investigating the failure, `/fsn batch on` can explicitly retry. Empty,
+complete replies are accepted because none of the requested items may be listed.
+The browse events have no request token; membership checks reject foreign keys
+but cannot prove ownership against another addon's overlapping search. Avoid
+running competing scanners during live validation.
+
+Summary rows go through existing candidate gates, never directly into purchase
+snapshots. Complete live tiers, quote checks, stock limits and reserves remain
+mandatory. In-flight batches block purchases, inspection, full-scan requests and
+sell-query preparation. Candidate validation uses age plus a bounded estimated
+profit boost; summary profit is only a priority hint, not validated earnings.
+There is no 1% change cutoff: unchanged summaries and small quantity changes
+remain eligible on later visits. Existing duplicate-alert checks still apply.
+
+Local tests establish scheduling and fallback behaviour, not a live speedup.
+During the default-on rollout, compare batches on/off with the same
+known items: completed keys per minute, revisit delays, candidate-to-alert time,
+timeouts and stale-result rejections. Last response time is not listing age.
+
+## Depth-based deal selection
+
+Market and dump candidates compare every complete price-tier prefix below the
+existing approved ceiling. The highest estimated net profit wins; ties favour
+less capital committed. Equal-price rows stay together. The optimiser never
+raises the ceiling, splits a tier to fit a budget, or invents a higher resale
+price when no competing listing exists.
+
+Estimates use the lower of the supplied fresh market reference and the next
+competing price minus one copper, less the configured AH cut and deposit reserve.
+They are estimates, not proof of demand or realised profit. Existing quality,
+competition, profit, complete-result, and freshness checks still apply. Absolute
+watch rules and vendor exits retain their existing full-lot selection.
+
+## Spending and stock controls
+
+```text
+/fsn keep 10g             reserve at least 10g
+/fsn max 100g             existing per-purchase spend cap
+/fsn stock 200            default exposure cap of 200 units per item
+/fsn stock 2589 100        override Linen Cloth to 100 units
+/fsn stock 2589 inherit   remove the override
+/fsn stock 2589 0         disable the cap for this item
+/fsn stock                show settings and uncollected-purchase reservations
+/fsn received 2589        acknowledge ALL reserved Linen Cloth purchases collected
 ```
-/fsn                  status
-/fsn thresh 50        alert at <= 50% of market
-/fsn every 45         scan cadence while the AH is open (15-900s)
-/fsn profit 1g        minimum estimated resale profit per deal (0 = off)
-/fsn quality 2        rarity floor for market alerts (0 any .. 4 epic)
-/fsn cut 5            AH cut assumed in profit estimates (percent)
-/fsn max 250g         spend cap per Buy click
-/fsn watch [Item] 3g  absolute price rule, swept across all units under it
-/fsn ignore [Item]    silence a false-deal item forever
-/fsn help             everything
-```
 
-## Installation
+Item links also work instead of numeric IDs. `keep` and the default stock cap
+start at zero, so upgrading does not silently impose new limits. Options exposes
+the reserve and default stock cap; item overrides use slash commands.
 
-Copy `ForeverSniper.lua` and `ForeverSniper.toc` into
-`World of Warcraft/_forever_/Interface/AddOns/ForeverSniper/`, then restart WoW.
-Keep your existing `WTF` files to preserve learned prices and settings.
+The purchase budget is the smallest of the spend cap, 95% of your wallet, and
+your wallet minus the explicit reserve. The purchase **plus** relist deposit
+reserve must fit. The original 5% wallet buffer remains in force.
 
-## Desktop briefing
+Stock caps count client-reported inventory (including bank items known to the
+client), fresh owned-auction quantities, and persistent reservations for purchases
+settled by this version. This is not a complete account-wide inventory. Collect
+older purchase mail before enabling caps. Unavailable inventory or owned-auction
+data blocks capped items rather than assuming zero holdings. The scanner refreshes
+owned auctions through its existing query pacing while caps are enabled.
 
-With Node.js 22 or newer, run the optional helper **only while all WoW clients
-are closed**:
-
-```powershell
-node tools/forever-desktop.mjs --wow-root "D:/WoW/World of Warcraft"
-```
-
-It discovers a single account's `ForeverSniper.lua` under `_forever_/WTF/Account`.
-If several accounts have sniper data, select one explicitly:
-
-```powershell
-node tools/forever-desktop.mjs --sv "D:/WoW/World of Warcraft/_forever_/WTF/Account/YOUR_ACCOUNT/SavedVariables/ForeverSniper.lua"
-```
-
-The helper adds a briefing for next login without rewriting the price database.
-It keeps a `.desktop-bak` backup and a per-account `.desktop-state.json` beside
-the selected SavedVariables file. It refuses writes when a WoW client is running,
-process detection fails, input is malformed, another helper holds the lock, or
-the source changes during analysis. There is no `--force` bypass. Keep the game
-closed until the helper exits; its lock cannot prevent you from launching WoW.
-
-Price changes and listing disappearances describe observations, not guaranteed
-sales or profit. Recheck live prices before buying.
+Reservations are deliberately conservative: they survive reloads and may
+double-count collected items until you acknowledge receipt. Only use
+`/fsn received <ID>` after collecting **all** that item's reserved purchases.
+It clears reservations, not inventory or owned-auction counts, and refuses to run
+while a purchase outcome is unresolved. Selling or consuming items does not
+automatically clear these reservations.
 
 ## Purchase safeguards
 
-Purchases still require clicks. Commodity purchases wait for the server's unit
-price and total before enabling Confirm, then recheck the price ceiling, spend
-cap and quote age on that click. Dialogs expire after 15 seconds; quotes expire
-after 10 seconds or sooner if the server reports expiry. Closing the dialog or
-auction house cancels pending purchase state.
+A hardware Buy press approves one complete commodity position. Stock and budget
+are checked before starting and again when the live quote arrives. The existing
+price, age, ownership, enable/disable, and unknown-outcome locks remain in place.
+Only a server outcome (or the existing explicit user reconciliation) settles a
+purchase and reserves its units. API acceptance alone is not a purchase receipt.
+Individual-listing purchases remain disabled.
 
-Purchase result events must match the requested item and purchase type. Sniper
-background queries and row-click searches pause while a purchase is pending.
-Other addons and Blizzard's own searches are not controlled by these guards.
-Live Forever event compatibility still needs in-game validation. Cached replicate
-snapshot freshness and server-confirmed purchase accounting are separate follow-ups.
+```text
+/fsn feed             live deal window
+/fsn watch [Item] 3g  absolute price rule
+/fsn profit 10s       minimum estimated net profit
+/fsn sell             selling view and owned-auction refresh
+/fsn purchase         inspect an unresolved purchase
+/fsn help             all commands
+```
+
+## Desktop briefing helper
+
+With every WoW client closed, run the dependency-free helper with Node.js 22 or
+newer:
+
+```powershell
+node tools/forever-desktop.mjs
+node tools/forever-desktop.mjs --sv "D:/path/to/account/SavedVariables/ForeverSniper.lua"
+```
+
+By default it discovers accounts under `D:/WoW/World of Warcraft/_forever_`.
+Use `--wow-root <path>` for a different installation or `--sv <path>` when more
+than one account exists. It refuses writes if WoW is running or process detection
+fails; there is no force override. Process detection requires Windows.
+
+The helper parses SavedVariables as data, preserves the database text, and writes
+only `ForeverSniperBriefing`. It uses a helper lock, rechecks the process list and
+source before replacing the file, and saves a `.desktop-bak` backup plus per-account
+`.desktop-state.json` history alongside it. Keep WoW closed throughout the run:
+the helper lock cannot prevent the game from starting. Listing disappearances
+are observations, not confirmed sales. Recheck live prices before buying.
 
 ## Development
 
-Run the regression tests with Node.js 22 or newer. Fengari is a development-only
-dependency for executing the production Lua purchase path under synthetic APIs;
-the desktop helper itself remains dependency-free.
+Version **0.6.50** preserves the owner's installed **0.6.49** as its baseline,
+including changes that were absent from the older main branch. Saved data is
+preserved when installing the release.
 
-```powershell
+```text
 npm ci
 npm test
+node <path-to-wow-addon-sim>/wow-addon-sim.mjs . --strict
 ```
 
-CI also runs the addon linter and simulator. Tests use synthetic SavedVariables,
-not your real account data. Passing them is not a substitute for an in-game check.
-
-## Client compatibility notes
-
-- Every `C_AuctionHouse` call is pcall-wrapped; failures are recorded for
-  `/fsn errors`, and the addon goes quiet instead of throwing mid-AH.
-- `/fsn shape` shows what the replicate API actually returned, so a changed
-  return order is visible without guessing.
-- If the completion event never fires, a stability watchdog calls the scan
-  done once the listing count holds still for 6 seconds.
+Tests execute production Lua with Fengari, including depth selection, all risk
+gates, quote-time policy changes, complete-search events, and outcome accounting.
+They also compare the optimiser against exhaustive prefix evaluation. Simulation
+cannot establish the real client's protected-call contract or live trading results.

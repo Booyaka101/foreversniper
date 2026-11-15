@@ -2,10 +2,6 @@
   "name": "foreversniper-tests",
   "private": true,
   "type": "module",
-  "scripts": {
-    "test": "node --test test/*.test.mjs"
-  },
-  "devDependencies": {
-    "fengari": "0.1.5"
-  }
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "devDependencies": { "fengari": "0.1.5" }
 }
