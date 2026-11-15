@@ -141,3 +141,20 @@ Local gates passed: all 61 tests (57 prior plus four wait/status regressions),
 strict load/lifecycle simulation with unknown-event notices, static checker with
 zero errors/warnings, and diff whitespace check. Full test output is retained at
 `C:/Users/cbosc/AppData/Local/Temp/opencode/forever-throttle-tests.log`.
+## PR #1 reconciliation onto scanner main
+
+Merged current main into the older reliability branch without changing
+`ForeverSniper.lua`, the depth optimiser, scanner tests, package dependencies or
+CI gates relative to main. Kept version 0.6.50 and declared the desktop briefing
+SavedVariable. Retained the data-only parser and guarded desktop writer, including
+account discovery, process checks, lock/recheck/backup and per-account history.
+Updated README instructions to describe the helper without old purchase claims.
+
+Replaced obsolete two-click/item-buy tests with nine tests of the current owned
+quote lifecycle: cancellation ordering, unknown-outcome locks, unsolicited and
+duplicate quotes, exact ceilings, expiry/revocation, changed complete positions,
+and unavailable quotes/errors. Existing depth tests retain complete-tier,
+stock/reserve and server-only accounting coverage. All 83 tests pass locally;
+static checker reports zero errors/warnings; strict load/lifecycle simulation is
+clean with known unknown-event notices. Extended AH simulation is not a passing
+gate and is not claimed here. No live deployment, release or saved-data write.

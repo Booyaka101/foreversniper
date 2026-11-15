@@ -134,6 +134,28 @@ Individual-listing purchases remain disabled.
 /fsn help             all commands
 ```
 
+## Desktop briefing helper
+
+With every WoW client closed, run the dependency-free helper with Node.js 22 or
+newer:
+
+```powershell
+node tools/forever-desktop.mjs
+node tools/forever-desktop.mjs --sv "D:/path/to/account/SavedVariables/ForeverSniper.lua"
+```
+
+By default it discovers accounts under `D:/WoW/World of Warcraft/_forever_`.
+Use `--wow-root <path>` for a different installation or `--sv <path>` when more
+than one account exists. It refuses writes if WoW is running or process detection
+fails; there is no force override. Process detection requires Windows.
+
+The helper parses SavedVariables as data, preserves the database text, and writes
+only `ForeverSniperBriefing`. It uses a helper lock, rechecks the process list and
+source before replacing the file, and saves a `.desktop-bak` backup plus per-account
+`.desktop-state.json` history alongside it. Keep WoW closed throughout the run:
+the helper lock cannot prevent the game from starting. Listing disappearances
+are observations, not confirmed sales. Recheck live prices before buying.
+
 ## Development
 
 Version **0.6.50** preserves the owner's installed **0.6.49** as its baseline,
