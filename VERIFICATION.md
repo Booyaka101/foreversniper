@@ -5,7 +5,7 @@
 Branch: `feat/forever-depth-optimizer`. Baseline commit `31902e9` preserves
 the approved installed 0.6.49 Lua and TOC. That import is intentionally separate
 from the feature commit because the installed addon was ahead of tracked main.
-The live installation and saved variables have not been modified.
+The implementation pass did not modify the live installation or saved variables.
 
 ## Completed checks
 
@@ -33,9 +33,10 @@ the player explicitly acknowledges collection.
 
 ## Remaining gates
 
-- CI must pass on the exact feature commit before any release.
+- CI must pass on the exact release commit before publication.
 - Live-client protected execution and real auction trading are not validated.
 - Review the baseline import alongside existing reliability PR #1 before merge.
-- No merge, release, version bump, or live installation is authorized by this PR.
+- The owner subsequently authorized tagging, pushing, release and deployment of
+  0.6.50. Deployment must back up installed files and preserve saved variables.
 
 No further simulator investigation is included in this bounded feature pass.

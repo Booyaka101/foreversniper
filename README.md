@@ -73,9 +73,9 @@ Individual-listing purchases remain disabled.
 
 ## Development
 
-This branch preserves the owner's installed **0.6.49** as its baseline, including
-changes that were absent from the older main branch. It does not replace the live
-installation or alter saved data. The version is not bumped for a release.
+Version **0.6.50** preserves the owner's installed **0.6.49** as its baseline,
+including changes that were absent from the older main branch. Saved data is
+preserved when installing the release.
 
 ```text
 npm ci
