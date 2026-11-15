@@ -18,7 +18,7 @@ local DEFAULTS = {
     enabled   = true,    -- master switch
     threshold = 0.50,    -- deal if unit price <= 50% of learned market
     every     = 45,      -- seconds between full scans while the AH is open
-    sweep     = 2,       -- seconds between live browse sweeps (the sniper feed)
+    sweep     = 2,       -- fallback scheduler tick; ready events also wake paced searches
     freshMins = 45,      -- market age: older price samples do not arm alerts
     overhang  = 500,     -- max competing units above the deal; more = slow flip (0 = off)
     armAfter  = 2,       -- require two learned observations before market alerts
@@ -2230,8 +2230,6 @@ local function feedOverview(visibleCount)
         stage, guidance = "Auction House closed", "Open the Auction House to resume scanning and buying."
     elseif not cfg.enabled then
         stage, guidance = "Scanner disabled", "Use /fsn on to resume. Buying is disabled."
-    elseif focusedDeal() then
-        stage, guidance = "Deal priority: discovery paused", "BUY when ready or skip the deal. Only its live tiers are refreshed."
     elseif S.scanning or S.harvestOwner or S.harvestTicker then
         stage = "Learning full snapshot"
     elseif S.deepScan then
@@ -2249,6 +2247,9 @@ local function feedOverview(visibleCount)
         stage = "Scanner pacing"
     elseif countKeys(db.book) == 0 then
         stage = "Learning local prices"
+    end
+    if S.ahOpen and cfg.enabled and not S.snipePending and not db.unsettledPurchase and focusedDeal() then
+        guidance = "Discovery continues while the displayed deal receives bounded refresh priority."
     end
     local ss = S.sweepStats or {}
     local g, reasons = recentGateReasons()
@@ -3212,9 +3213,6 @@ local function updateScanPage()
     elseif S.ahOpen and S.nativeSellActive() then
         statusText = "SELL FORM - review fields, then click Post"
         r, g, b = 1, 0.82, 0.3
-    elseif S.ahOpen and focusedDeal() then
-        statusText = "DEAL PRIORITY - discovery paused"
-        r, g, b = 1, 0.82, 0.3
     elseif S.scanning or S.harvestOwner or S.harvestTicker then
         statusText = S.harvestTicker and "LEARNING - harvesting full snapshot" or "LEARNING - waiting for full snapshot"
         if S.harvestProgress then
@@ -3280,8 +3278,20 @@ local SCAN_CATEGORIES = {
     { name = "Enhancements", classID = 8, priority = 2 },
 }
 local rotationList, rotationIndex = {}, 0
-for _, cat in ipairs(SCAN_CATEGORIES) do
-    for p = 1, cat.priority do rotationList[#rotationList + 1] = cat end
+do
+    local weights, total = {}, 0
+    for i, cat in ipairs(SCAN_CATEGORIES) do weights[i], total = 0, total + cat.priority end
+    -- Smooth weighted rotation avoids spending consecutive discovery slots on
+    -- the same class while preserving each class's share of a full pass.
+    for slot = 1, total do
+        local best
+        for i, cat in ipairs(SCAN_CATEGORIES) do
+            weights[i] = weights[i] + cat.priority
+            if not best or weights[i] > weights[best] then best = i end
+        end
+        rotationList[slot] = SCAN_CATEGORIES[best]
+        weights[best] = weights[best] - total
+    end
 end
 local function nextCategory()
     rotationIndex = rotationIndex + 1
@@ -3657,13 +3667,9 @@ local function sweepQuery()
         S.stockRefreshAt = GetTime()
         if S.requestSellingOwned() then return end
     end
-    local focus = focusedDeal()
     for _, field in ipairs({"liveCandidate", "autoSearch", "watchSearch"}) do
         local owner = S[field]
         if owner then
-            -- An already-sent unrelated search can finish or time out, but
-            -- must not request further pages while a deal owns priority.
-            if focus and owner.id ~= focus.id then return end
             if owner.needsPage then
                 owner.needsPage = false
                 noteQueryAttempt()
@@ -3677,7 +3683,9 @@ local function sweepQuery()
             return
         end
     end
-    if focus then
+    sweepCount = sweepCount + 1
+    local focus = focusedDeal()
+    if focus and sweepCount % 4 == 3 then
         local snapshot = S.commoditySnapshots[focus.id]
         local priority = S.dealFocus
         if (not snapshot or GetTime() - snapshot.t >= 15)
@@ -3687,14 +3695,13 @@ local function sweepQuery()
             priority.lastRefresh = GetTime()
             sendTargetSearch("liveCandidate", {id=focus.id, link=focus.link,
                 line=focus.line, market=focus.market, kind=focus.kind, refresh=true})
+            return
         end
-        return
     end
-    sweepCount = sweepCount + 1
     rebuildWatch()
     local watchKey, watchID, watchRule
     if sweepCount % 4 == 1 then watchKey, watchID, watchRule = nextWatchKey() end
-    if sweepCount % 4 ~= 0 and not watchKey then
+    if sweepCount % 2 == 1 and not watchKey then
         local oldest
         for id, candidate in pairs(S.liveCandidates or {}) do
             if GetTime() - candidate.t >= 30 then
@@ -3710,9 +3717,9 @@ local function sweepQuery()
             return -- failed attempts also consume a pacing slot
         end
     end
-    -- Three target slots per discovery slot. Manual watches retain a slot;
-    -- without a watchlist all three are learned automatically from our book.
-    if sweepCount % 4 ~= 0 and C_AuctionHouse.SendSearchQuery then
+    -- Alternate target validation and discovery. A displayed deal may use a
+    -- target slot, never the discovery slot or an in-flight search's pages.
+    if sweepCount % 2 == 1 and C_AuctionHouse.SendSearchQuery then
         local key, id, w = watchKey, watchID, watchRule
         local target = not key and nextAutoTarget() or nil
         if target then id = target.id end
@@ -3785,6 +3792,7 @@ local function maybeMorePages()
     -- Routine discovery always releases after one page, including when a deep
     -- scan is waiting to acquire the browse connection.
     pagePending, S.sweeping = false, false
+    S.wakeSweep()
 end
 
 -- DEEP SCAN (/fsn deepscan, auto every 15 min with the AH open): page every
@@ -3847,7 +3855,6 @@ end
 local function deepPage()
     local d = S.deepScan
     if not d then return end
-    if focusedDeal() then return end
     d.wantsPage = false
     local full = false
     local okF, f = pcall(C_AuctionHouse.HasFullBrowseResults)
@@ -3868,7 +3875,6 @@ deepSend = function()
     local d = S.deepScan
     if not d or not d.cat then return end
     d.needsSend = true
-    if focusedDeal() then return end
     if S.autoSearch or S.watchSearch or S.liveCandidate or S.pending or S.buying or not canQuery() then return end
     d.needsSend = false
     d.received, d.wantsPage = false, false
@@ -3929,9 +3935,9 @@ startDeepScan = function(force)
         if not d then return end
         if not S.ahOpen then deepAbort(true) return end
         if not cfg.enabled then deepAbort(false) return end
-        if focusedDeal() or S.snipePending or db.unsettledPurchase then
+        if S.snipePending or db.unsettledPurchase then
             -- Pause the deep-scan lifetime as well as requests. Do not time
-            -- out an otherwise healthy scan while the player handles a deal.
+            -- out an otherwise healthy scan while a purchase is unresolved.
             local now = GetTime()
             d.started = d.started + now - (d.pauseTick or now)
             d.pauseTick = now
@@ -3971,6 +3977,23 @@ startDeepScan = function(force)
     deepSend()
 end
 
+function S.wakeSweep()
+    if not S.sweepTicker or not S.ahOpen or not cfg.enabled or S.sweepWake then return end
+    local owner = S.sweepTicker
+    local wake = {}
+    S.sweepWake = wake
+    -- Defer even synchronous cached replies. Coalesce event bursts and share
+    -- the same spacing gate with the watchdog and every other query lane.
+    after(math.max(0.01, lastQueryAt + queryPacing().interval - GetTime()), function()
+        if S.sweepWake ~= wake then return end
+        S.sweepWake = nil
+        if S.sweepTicker ~= owner or not S.ahOpen or not cfg.enabled then return end
+        sweepQuery()
+        feedTick()
+        updateScanPage()
+    end)
+end
+
 local function startSweeping()
     if S.sweepTicker or not cfg.enabled then return end
     if cfg.undercut and not undercutTicker and C_AuctionHouse and C_AuctionHouse.QueryOwnedAuctions then
@@ -3982,14 +4005,15 @@ local function startSweeping()
         feedTick() -- apply deferred feed refreshes
         updateScanPage()
     end)
-    after(1, sweepQuery)
-    dbg("live sweep armed: category rotation every " .. period .. "s")
+    S.wakeSweep()
+    dbg("live sweep armed: ready-driven queries, fallback tick " .. period .. "s")
 end
 
 local stopRelisting -- forward: defined with the batch-relist block below
 
 local function stopSweeping()
     observeQueryPressure(false)
+    S.sweepWake = nil
     if S.sweepTicker then
         S.sweepTicker:Cancel()
         S.sweepTicker = nil
@@ -4751,13 +4775,14 @@ end
 
 -- Event-driven throttle (WoWSniper's approach: never guess, listen)
 onOptional("OWNED_AUCTIONS_UPDATED", function() onOwnedAuctionsUpdated() end)
-onOptional("AUCTION_HOUSE_THROTTLED_SYSTEM_READY", function() throttleReady = true end)
-onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_RESPONSE_RECEIVED", function() throttleReady = true end)
+onOptional("AUCTION_HOUSE_THROTTLED_SYSTEM_READY", function() throttleReady = true S.wakeSweep() end)
+onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_RESPONSE_RECEIVED", function() throttleReady = true S.wakeSweep() end)
 onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_SENT", function() throttleReady = false end)
 onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_QUEUED", function() throttleReady = false end)
 onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED", function()
     throttleReady = true
-    pagePending = false -- retry on the next tick
+    pagePending = false -- wake a paced retry rather than waiting for the watchdog
+    S.wakeSweep()
 end)
 
 local function onReplicateUpdated()
@@ -4872,6 +4897,7 @@ local function onCommodityResults(itemID)
     if not S.ahOpen then return end
     itemID = num(itemID)
     if not itemID or itemID < 1 or itemID % 1 ~= 0 then return end
+    S.wakeSweep()
     local snapshot, reason = readCommodityTiers(itemID)
     if snapshot then
         S.commoditySnapshots[itemID] = snapshot
@@ -5150,7 +5176,7 @@ local function buildOptions()
     stepper(34, "deal threshold", function() return cfg.threshold end,
         function(v) cfg.threshold = math.min(0.99, math.max(0.01, v)) end,
         function(v) return math.floor(v * 100 + 0.5) .. "% of market" end, 0.05)
-    stepper(96, "sweep seconds", function() return cfg.sweep end,
+    stepper(96, "fallback seconds", function() return cfg.sweep end,
         function(v)
             cfg.sweep = math.min(30, math.max(2, math.floor(v)))
             if S.sweepTicker then stopSweeping() startSweeping() end
@@ -5200,7 +5226,7 @@ local HELP = {
     "/fsn unwatch <link>|all",
     "|cffffd100tuning|r",
     "/fsn thresh 50        alert at %% of learned market (1-99)",
-    "/fsn sweep 3          seconds between live sweeps (2-30)",
+    "/fsn sweep 3          fallback tick seconds (2-30); ready events wake paced searches",
     "/fsn max 250g         spend cap per Buy click",
     "/fsn keep 10g         keep this gold untouched (5% wallet buffer also applies)",
     "/fsn stock 200        default per-item exposure cap (0 = off)",
@@ -5396,7 +5422,7 @@ SlashCmdList.FOREVERSNIPER = function(msg)
         local focus = focusedDeal()
         if focus then
             local snapshot = S.commoditySnapshots[focus.id]
-            printf("deal priority: %s; unrelated scanning paused; completed tiers %.0fs old. BUY when ready, skip or Clear to resume.",
+            printf("deal priority: %s; discovery continues between bounded refreshes; completed tiers %.0fs old.",
                 focus.link or (infoOf(focus.id).name or ("item " .. focus.id)),
                 snapshot and math.max(0, GetTime() - snapshot.t) or 0)
         end
@@ -5550,7 +5576,7 @@ SlashCmdList.FOREVERSNIPER = function(msg)
         if v and v >= 2 and v <= 30 then
             cfg.sweep = math.floor(v)
             if S.sweepTicker then stopSweeping(); startSweeping() end
-            printf("live sweep every %ds while the AH is open.", cfg.sweep)
+            printf("fallback sweep tick every %ds; ready events wake searches with the existing minimum spacing.", cfg.sweep)
         else printf("usage: /fsn sweep 3  (seconds, 2-30)") end
 
     elseif cmd == "fresh" then

@@ -2,27 +2,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import fengari from 'fengari';
+import { source, section, run } from './lua.mjs';
 
-const source = fs.readFileSync(new URL('../ForeverSniper.lua', import.meta.url), 'utf8');
 const optimizer = fs.readFileSync(new URL('../DepthOptimizer.lua', import.meta.url), 'utf8');
-function section(start, end) {
-  const first = source.indexOf(start);
-  const last = source.indexOf(end, first + start.length);
-  assert.ok(first >= 0 && last > first, `Missing test boundary: ${start}`);
-  return source.slice(first, last);
-}
-
-function run(code) {
-  const L = fengari.lauxlib.luaL_newstate();
-  fengari.lualib.luaL_openlibs(L);
-  try {
-    const status = fengari.lauxlib.luaL_dostring(L, fengari.to_luastring(code));
-    const error = status === fengari.lua.LUA_OK ? '' : fengari.to_jsstring(fengari.lua.lua_tostring(L, -1));
-    assert.equal(status, fengari.lua.LUA_OK, error);
-  } finally {
-    fengari.lua.lua_close(L);
-  }
-}
 
 const setup = `
 local now, wallet, held, deposit = 100, 100000, 0, 2
@@ -78,6 +60,7 @@ local buyFailUntil = {}
 local quickBuy
 function S.offerAvailable() return true end
 function S.refreshPurchasePresentation() end
+function S.wakeSweep() end
 local function retirePurchase() S.snipePending=nil end
 local function purchaseDetails(p) return p.deal.id,p.units,p.total end
 local function on(event,fn) handlers[event]=fn end

@@ -4,6 +4,27 @@ Local auction deal finder for WoW: Forever. It learns prices from auction
 observations, validates complete live commodity tiers, and presents positions
 you can choose to buy. TradeSkillMaster is not required.
 
+## Scan scheduling
+
+Server-ready and result events wake the scanner without waiting for its fallback
+timer. Event bursts are coalesced and deferred, including synchronous cached
+replies. Every query still passes the existing minimum one-second spacing,
+server-readiness, ownership, native-form, and purchase-lock checks. `/fsn sweep`
+sets the fallback tick (2-30 seconds), not the event-driven request interval.
+
+Routine scheduling alternates target checks and discovery opportunities instead
+of allocating only one discovery slot in four. Watches retain one slot in four.
+Weighted categories are spread across the rotation rather than clustered.
+A displayed deal can use a target slot for a refresh no more often than once
+every 15 seconds; it no longer pauses unrelated discovery. An in-flight search
+can finish its pages before the next search starts. Deep discovery also continues
+with a displayed deal, but pending or unresolved purchases still stop queries.
+
+This trades some automatic target-check slots per cycle for broader discovery.
+Server delays, pagination, stock refreshes, history availability, and other addons
+still affect coverage. These scheduling changes do not establish a measured
+live-client detection speed or guarantee winning a contested listing.
+
 ## Depth-based deal selection
 
 Market and dump candidates compare every complete price-tier prefix below the
