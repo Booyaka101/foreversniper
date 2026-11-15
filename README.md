@@ -1,65 +1,89 @@
 # Forever Sniper
 
-Auction deal sniper for the **WoW: Forever beta** (`wow_classic_beta`). It learns
-prices from full auction-house scans and alerts the moment something is listed
-under market value — sound, chat line, and a popup whose rows can inspect or
-**buy the whole lot in one press**.
+Local auction deal finder for WoW: Forever. It learns prices from auction
+observations, validates complete live commodity tiers, and presents positions
+you can choose to buy. TradeSkillMaster is not required.
 
-## How it works
+## Depth-based deal selection
 
-1. **Learn** — every time you open the AH, the addon pulls the full listing
-   snapshot (`C_AuctionHouse.ReplicateItems`) and records each item's cheapest
-   unit price. Market value = median of the last 8 scan minimums, so one
-   mislisted 1c item cannot define a market.
-2. **Snipe** — each scan is diffed against the previous one. A *newly listed*
-   auction at or under `threshold`% of market (default 50%) triggers a **depth
-   sweep**: every unit of that item currently listed under the price line,
-   totalled into one lot — "240 units under market, 58g total" — so
-   stackables are bought as one purchase, not one listing at a time.
-3. **Profit gate** — a deal only fires if the sweep's estimated resale profit
-   (market value after the AH cut, minus cost) clears the floor
-   (`/fsn profit 1g` default) and the item clears the rarity floor
-   (`/fsn quality 1` — gray filtered by default). No more junk pings.
-4. **Watchlist** — absolute rules that fire from the very first scan:
-   `/fsn watch [Linen Cloth] 50s`. Swept against the rule's own ceiling, no
-   profit guess — the rule is the decision.
+Market and dump candidates compare every complete price-tier prefix below the
+existing approved ceiling. The highest estimated net profit wins; ties favour
+less capital committed. Equal-price rows stay together. The optimiser never
+raises the ceiling, splits a tier to fit a budget, or invents a higher resale
+price when no competing listing exists.
 
-Alerts arm after 2 scans of history by default (`/fsn arm N`), so day one is
-for learning, not for guessing.
+Estimates use the lower of the supplied fresh market reference and the next
+competing price minus one copper, less the configured AH cut and deposit reserve.
+They are estimates, not proof of demand or realised profit. Existing quality,
+competition, profit, complete-result, and freshness checks still apply. Absolute
+watch rules and vendor exits retain their existing full-lot selection.
 
-## Quick start
+## Spending and stock controls
 
-**Buying:** every purchase happens strictly inside a click you make on an
-alert row's **Buy** button — never automatically, never on a timer (Blizzard's
-hardware-event gate on the purchase calls is the security model, and it is
-honored). A Buy click:
-
-1. re-searches the item live and re-computes what is under your price line
-   *right now* — stale alert data is never trusted,
-2. buys every unit under the line, cheapest first, bounded by the spend cap
-   (`/fsn max 100g` default),
-3. for commodities (stackables), opens the quantity-filled purchase for your
-   final press; for item listings it buys out directly on your click and
-   reports exactly what was spent.
-
-```
-/fsn                  status
-/fsn thresh 50        alert at <= 50% of market
-/fsn every 45         scan cadence while the AH is open (15-900s)
-/fsn profit 1g        minimum estimated resale profit per deal (0 = off)
-/fsn quality 2        rarity floor for market alerts (0 any .. 4 epic)
-/fsn cut 5            AH cut assumed in profit estimates (percent)
-/fsn max 250g         spend cap per Buy click
-/fsn watch [Item] 3g  absolute price rule, swept across all units under it
-/fsn ignore [Item]    silence a false-deal item forever
-/fsn help             everything
+```text
+/fsn keep 10g             reserve at least 10g
+/fsn max 100g             existing per-purchase spend cap
+/fsn stock 200            default exposure cap of 200 units per item
+/fsn stock 2589 100        override Linen Cloth to 100 units
+/fsn stock 2589 inherit   remove the override
+/fsn stock 2589 0         disable the cap for this item
+/fsn stock                show settings and uncollected-purchase reservations
+/fsn received 2589        acknowledge ALL reserved Linen Cloth purchases collected
 ```
 
-## Notes for the beta client
+Item links also work instead of numeric IDs. `keep` and the default stock cap
+start at zero, so upgrading does not silently impose new limits. Options exposes
+the reserve and default stock cap; item overrides use slash commands.
 
-- Every `C_AuctionHouse` call is pcall-wrapped; failures are recorded for
-  `/fsn errors`, and the addon goes quiet instead of throwing mid-AH.
-- `/fsn shape` shows what the replicate API actually returned, so a changed
-  return order is visible without guessing.
-- If the completion event never fires, a stability watchdog calls the scan
-  done once the listing count holds still for 6 seconds.
+The purchase budget is the smallest of the spend cap, 95% of your wallet, and
+your wallet minus the explicit reserve. The purchase **plus** relist deposit
+reserve must fit. The original 5% wallet buffer remains in force.
+
+Stock caps count client-reported inventory (including bank items known to the
+client), fresh owned-auction quantities, and persistent reservations for purchases
+settled by this version. This is not a complete account-wide inventory. Collect
+older purchase mail before enabling caps. Unavailable inventory or owned-auction
+data blocks capped items rather than assuming zero holdings. The scanner refreshes
+owned auctions through its existing query pacing while caps are enabled.
+
+Reservations are deliberately conservative: they survive reloads and may
+double-count collected items until you acknowledge receipt. Only use
+`/fsn received <ID>` after collecting **all** that item's reserved purchases.
+It clears reservations, not inventory or owned-auction counts, and refuses to run
+while a purchase outcome is unresolved. Selling or consuming items does not
+automatically clear these reservations.
+
+## Purchase safeguards
+
+A hardware Buy press approves one complete commodity position. Stock and budget
+are checked before starting and again when the live quote arrives. The existing
+price, age, ownership, enable/disable, and unknown-outcome locks remain in place.
+Only a server outcome (or the existing explicit user reconciliation) settles a
+purchase and reserves its units. API acceptance alone is not a purchase receipt.
+Individual-listing purchases remain disabled.
+
+```text
+/fsn feed             live deal window
+/fsn watch [Item] 3g  absolute price rule
+/fsn profit 10s       minimum estimated net profit
+/fsn sell             selling view and owned-auction refresh
+/fsn purchase         inspect an unresolved purchase
+/fsn help             all commands
+```
+
+## Development
+
+Version **0.6.50** preserves the owner's installed **0.6.49** as its baseline,
+including changes that were absent from the older main branch. Saved data is
+preserved when installing the release.
+
+```text
+npm ci
+npm test
+node <path-to-wow-addon-sim>/wow-addon-sim.mjs . --strict
+```
+
+Tests execute production Lua with Fengari, including depth selection, all risk
+gates, quote-time policy changes, complete-search events, and outcome accounting.
+They also compare the optimiser against exhaustive prefix evaluation. Simulation
+cannot establish the real client's protected-call contract or live trading results.
