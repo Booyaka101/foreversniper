@@ -16,7 +16,7 @@ local ADDON = ...
 
 local DEFAULTS = {
     enabled   = true,    -- master switch
-    threshold = 0.50,    -- deal if unit price <= 50% of learned market
+    threshold = 0.70,    -- discovery ceiling; live depth and net-profit gates still apply
     every     = 45,      -- seconds between full scans while the AH is open
     sweep     = 2,       -- fallback scheduler tick; ready events also wake paced searches
     batch     = true,    -- owner-approved rollout; failures retain individual fallback
@@ -73,6 +73,16 @@ if not db.tunedClassic then
     print("|cffff7d0aForever Sniper|r: retuned for the classic economy - 1s unit floor, 10s profit floor, 5% snipe tolerance. /fsn options to adjust.")
 end
 local cfg = db.config
+
+-- Retune only the old default once. Subsequent /fsn thresh choices survive reloads.
+if not db.selectionRetuned then
+    db.selectionRetuned = true
+    if cfg.threshold == 0.50 then
+        db.previousThreshold = cfg.threshold
+        cfg.threshold = 0.70
+        print("|cffff7d0aForever Sniper|r: discovery ceiling changed from 50% to 70% of reference; live risk checks unchanged. /fsn thresh 50 restores the old setting.")
+    end
+end
 
 db.stockLimits = db.stockLimits or {}
 db.stockPending = db.stockPending or {}
@@ -204,32 +214,36 @@ end
 
 -- Book -------------------------------------------------------------------------
 
-local function medianOfSamples(s)
-    local vals, n = {}, 0
-    for i = 2, #s, 2 do
-        n = n + 1
-        vals[n] = s[i]
-    end
-    if n == 0 then return nil end
-    table.sort(vals)
-    if n % 2 == 1 then return vals[(n + 1) / 2] end
-    return math.floor((vals[n / 2] + vals[n / 2 + 1]) / 2)
-end
+local HISTORY_SPACING = 90 -- 30 observations cover roughly the 45-minute freshness window
 
-local function sampleCount(s) return math.floor(#s / 2) end
+local function freshPricePoints(s, now, maxAge)
+    local raw, points = {}, {}
+    for i = 1, #s - 1, 2 do
+        local stamp, price = num(s[i]), num(s[i + 1])
+        if stamp and price and price > 0 and stamp <= now and now - stamp <= maxAge then
+            raw[#raw + 1] = {t=stamp, price=price}
+        end
+    end
+    table.sort(raw, function(a, b) return a.t < b.t end)
+    for _, point in ipairs(raw) do
+        local last = points[#points]
+        if last and point.t - last.t < HISTORY_SPACING then
+            -- Conservative aggregation also de-clusters legacy dense samples.
+            last.price = math.min(last.price, point.price)
+        else
+            points[#points + 1] = point
+        end
+    end
+    return points
+end
 
 -- Median over FRESH samples only: a price seen an hour ago is not a market you
 -- can list into today. Returns nil when fewer than `need` fresh samples exist.
 local function freshMedian(s, now, maxAge, need)
     local vals, n = {}, 0
-    local observed = {}
-    for i = 1, #s - 1, 2 do
-        local stamp, price = num(s[i]), num(s[i + 1])
-        if stamp and price and price > 0 and stamp <= now and now - stamp <= maxAge and not observed[stamp] then
-            observed[stamp] = true
-            n = n + 1
-            vals[n] = price
-        end
+    for _, point in ipairs(freshPricePoints(s, now, maxAge)) do
+        n = n + 1
+        vals[n] = point.price
     end
     if n < need then return nil, n end
     table.sort(vals)
@@ -595,18 +609,11 @@ local function absorbTrack(itemID, belowLine, now)
 
 local function freshBookPrices(itemID)
     local b = db.book[itemID]
-    local points, seen = {}, {}
     local now, maxAge = time(), (cfg.freshMins or 45) * 60
-    for i = 1, #(b and b.s or {}) - 1, 2 do
-        local stamp, price = num(b.s[i]), num(b.s[i + 1])
-        if stamp and price and price > 0 and stamp <= now and now - stamp <= maxAge and not seen[stamp] then
-            seen[stamp] = true
-            points[#points + 1] = {t=stamp, price=price}
-        end
-    end
-    table.sort(points, function(a, b2) return a.t < b2.t end)
     local prices = {}
-    for _, point in ipairs(points) do prices[#prices + 1] = point.price end
+    for _, point in ipairs(freshPricePoints(b and b.s or {}, now, maxAge)) do
+        prices[#prices + 1] = point.price
+    end
     return prices
 end
 
@@ -680,7 +687,7 @@ end
 --   /fsn thresh 70 -> cheap items fire at 70% - easy mode, a lot more hits
 -- The deal line still never falls below the vendor sell price.
 local function dealLine(med, itemID)
-    local base = num(cfg.threshold) or 0.5
+    local base = num(cfg.threshold) or 0.7
     base = math.min(0.99, math.max(0.01, base))
     local mult
     if med > 10000000 then mult = math.max(base, 0.8)      -- >1000g: at least 20% off
@@ -777,7 +784,7 @@ local function mergeIntoBook(curMins, t)
     local bookN = countKeys(db.book)
     for key, unit in pairs(curMins) do
         local eb = db.book[key]
-        local latest = eb and eb.s and num(eb.s[#eb.s - 1])
+        local latest = eb and num(eb.lastSeen or (eb.s and eb.s[#eb.s - 1]))
         if not num(t) or t > time() or not num(unit) or unit <= 0 or (latest and t <= latest)
             or (eb and eb.ownUntil and t < eb.ownUntil) then
             -- Same-second replies are one observation, not extra evidence.
@@ -801,9 +808,14 @@ local function mergeIntoBook(curMins, t)
             bucket.n = 30
         end
         local s = b.s
-        s[#s + 1] = t
-        s[#s + 1] = unit
-        while sampleCount(s) > CAPS.samples do
+        local stamp = num(s[#s - 1])
+        if stamp and t - stamp < HISTORY_SPACING then
+            s[#s] = math.min(s[#s], unit)
+        else
+            s[#s + 1] = t
+            s[#s + 1] = unit
+        end
+        while math.floor(#s / 2) > CAPS.samples do
             table.remove(s, 1)
             table.remove(s, 1)
         end
@@ -1853,7 +1865,10 @@ end
 -- Start needs a press, Confirm does not). Tolerance-checked against the deal
 -- snapshot - over the cap it is refused, never overpaid.
 commodityActionState = function(itemID, link, line, units, cost, market, kind)
-    if S.snipePending then return "Wait", false, "A purchase is awaiting its quote or server outcome." end
+    if S.snipePending then
+        return S.snipePending.confirmed and "Result" or "Quote", false,
+            "A purchase is awaiting its quote or server outcome."
+    end
     if db.unsettledPurchase then return "Lock", false, "Purchase outcome unknown. Check mail, bags and gold, then /fsn purchase." end
     if not S.ahOpen then return "AH", false, "Open the Auction House to buy." end
     if not cfg.enabled then return "Off", false, "Scanner disabled. Use /fsn on to resume." end
@@ -1865,7 +1880,7 @@ commodityActionState = function(itemID, link, line, units, cost, market, kind)
     end
     local ready, readinessReason = throttleGate()
     if not ready then
-        return "Wait", false, readinessReason == "unavailable"
+        return readinessReason == "unavailable" and "N/A" or "Busy", false, readinessReason == "unavailable"
             and "Auction House readiness is unavailable. Buying remains paused."
             or "The Auction House throttle is busy."
     end
@@ -1943,6 +1958,7 @@ end
 
 function S.refreshPurchasePresentation()
     refreshDealPresentation()
+    if S.refreshBuyButtons then S.refreshBuyButtons() end
     if S.refreshSelling then S.refreshSelling() end
 end
 
@@ -2249,13 +2265,17 @@ local function feedOverview(visibleCount)
         guidance = readinessReason == "unavailable"
             and "The readiness API failed or returned an unknown value. Searches remain paused for safety."
             or "The shared AH system is busy. This does not identify who caused the wait."
+    elseif S.dealFocus and S.dealFocus.buyWindowUntil and GetTime() < S.dealFocus.buyWindowUntil then
+        stage = "Buy opportunity"
     elseif lastQueryAt and GetTime() - lastQueryAt < queryPacing().interval then
         stage = "Scanner pacing"
     elseif countKeys(db.book) == 0 then
         stage = "Learning local prices"
     end
     if S.ahOpen and cfg.enabled and not S.snipePending and not db.unsettledPurchase and focusedDeal() then
-        guidance = "Discovery continues while the displayed deal receives bounded refresh priority."
+        guidance = stage == "Buy opportunity"
+            and "Routine searches briefly yield for your click. The live quote and all risk checks still apply."
+            or "Discovery continues while the displayed deal receives bounded refresh priority."
     end
     local ss = S.sweepStats or {}
     local g, reasons = recentGateReasons()
@@ -2271,7 +2291,7 @@ local function feedOverview(visibleCount)
         queryRequestCount(), p.interval, p.busyEpisodes)
     local progress = string.format("Live item checks %d/%d completed | %d distinct targets | discovery %d\nFS search attempts %d/60s | minimum spacing %.1fs",
         ss.autoCompleted or 0, ss.autoSent or 0, ss.autoUnique or 0, ss.sent or 0, queryRequestCount(), p.interval)
-    local learning = string.format("Local history: %d ready | %d learning | %d stale\nMarket alerts require %d distinct fresh observations per item.",
+    local learning = string.format("Local history: %d ready | %d learning | %d stale\nMarket alerts require %d time-spaced fresh observations per item.",
         history.ready, history.warming, history.stale, cfg.armAfter)
     local empty = "|cffffd100" .. stage .. "|r\n\nNo qualifying complete positions to show.\n" .. guidance
         .. "\n\n" .. progress .. "\n\n" .. learning
@@ -2364,8 +2384,22 @@ end
 -- called from the OnUpdate ticker: applies a deferred refresh when one was
 -- requested during the throttle window
 S.feedRefresh = refreshFeed -- runtime hook for code defined above the feed
+function S.refreshBuyButtons()
+    -- Readiness windows can be shorter than the full feed's repaint interval.
+    -- Update only the existing rows, without rebuilding or changing their offers.
+    for _, row in ipairs(feedRows) do
+        if row:IsShown() and row.itemID then
+            local label, ready, hint = commodityActionState(row.itemID, row.link, row.line,
+                row.units, row.cost, row.market2, row.kind)
+            row.buyBtn:SetEnabled(ready and not row.gone)
+            row.buyBtn.fs:SetText(strupper(label))
+            row.buyHint = hint
+        end
+    end
+end
 local function feedTick()
     retireSnipePresentation()
+    S.refreshBuyButtons()
     if feedDirty or (S.ahOpen and GetTime() - feedLastRefresh >= 3) then
         refreshFeed()
         renderPopup()
@@ -3791,8 +3825,15 @@ local function sweepQuery()
             return
         end
     end
-    sweepCount = sweepCount + 1
     local focus = focusedDeal()
+    if focus and S.dealFocus then
+        local priority = S.dealFocus
+        if not priority.buyWindowUntil then priority.buyWindowUntil = GetTime() + 5 end
+        -- One bounded human-click opportunity per focus, starting only once the
+        -- live API is ready. Never abandon owned pages or pause discovery forever.
+        if GetTime() < priority.buyWindowUntil then return end
+    end
+    sweepCount = sweepCount + 1
     if focus and sweepCount % 4 == 3 then
         local snapshot = S.commoditySnapshots[focus.id]
         local priority = S.dealFocus
@@ -4888,8 +4929,16 @@ end
 
 -- Event-driven throttle (WoWSniper's approach: never guess, listen)
 onOptional("OWNED_AUCTIONS_UPDATED", function() onOwnedAuctionsUpdated() end)
-onOptional("AUCTION_HOUSE_THROTTLED_SYSTEM_READY", function() throttleReady = true S.wakeSweep() end)
-onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_RESPONSE_RECEIVED", function() throttleReady = true S.wakeSweep() end)
+onOptional("AUCTION_HOUSE_THROTTLED_SYSTEM_READY", function()
+    throttleReady = true
+    if S.refreshPurchasePresentation then S.refreshPurchasePresentation() end
+    S.wakeSweep()
+end)
+onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_RESPONSE_RECEIVED", function()
+    throttleReady = true
+    if S.refreshPurchasePresentation then S.refreshPurchasePresentation() end
+    S.wakeSweep()
+end)
 onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_SENT", function() throttleReady = false end)
 onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_QUEUED", function() throttleReady = false end)
 onOptional("AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED", function()
@@ -5547,6 +5596,10 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             printf("deal priority: %s; discovery continues between bounded refreshes; completed tiers %.0fs old.",
                 focus.link or (infoOf(focus.id).name or ("item " .. focus.id)),
                 snapshot and math.max(0, GetTime() - snapshot.t) or 0)
+            local label, _, hint = commodityActionState(focus.id, focus.link, focus.line,
+                focus.units, focus.cost, focus.market, focus.kind)
+            printf("focused Buy: %s; %s Routine click window: %.1fs remaining.", label, hint,
+                math.max(0, (S.dealFocus.buyWindowUntil or GetTime()) - GetTime()))
         end
         local p = queryPacing()
         printf("FS live-search attempts: %d in the last 60s; minimum spacing %.1fs (fixed). Shared readiness waits: %d; observed wait span %.1fs. Shared waits do not identify their source.",
