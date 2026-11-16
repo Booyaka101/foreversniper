@@ -56,6 +56,7 @@ local C_AuctionHouse={
 }
 `;
 const production = history + merge
+  + section('function S.noteRevisit(', '\nS.autoChecked =')
   + section('function S.marketReference(', '\nlocal COMMODITY_SNAPSHOT_AGE')
   + section('local function dealLine(', '\n-- TOOLTIP INTELLIGENCE:')
   + fs.readFileSync(new URL('../DepthOptimizer.lua', import.meta.url), 'utf8')
@@ -142,6 +143,22 @@ test('TSM commands inspect a reference and preserve an explicit local-only choic
   command('off'); assert(cfg.tsm==false and S.marketReference(123)==nil)
   command('bad'); assert(cfg.tsm==false)
   command('on'); assert(S.marketReference(123)==10000)
+`));
+
+test('every deep-scan page evaluates new rows before learning and still needs live tiers', () => tsmCheck(`
+  market(); S.deepScan={rows=0}; local pages=0
+  local function deepMore() pages=pages+1 end
+  ${section('local function readDeepBrowse(', '\non("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED"')}
+  rows={{itemKey={itemID=123},minPrice=6500,totalQuantity=20}}
+  C_AuctionHouse.GetBrowseResults=function() return rows end
+  readDeepBrowse(false)
+  assert(S.deepScan.received and S.deepScan.rows==1 and pages==1)
+  assert(S.liveCandidates[123] and #admitted==0)
+  assert(db.book[123].s[2]==6500)
+  readDeepBrowse(true); assert(S.deepScan.rows==1 and S.browseRecorded==1)
+  now=now+2; complete(6500,10,10000,10)
+  assert(#admitted==1 and admitted[1].sweep.verified)
+  assert(S.sweepStats.validationLast==2 and S.sweepStats.validationMax==2)
 `));
 
 test('moderate discount flows from summary through real live-depth validation to admission', () => check(`

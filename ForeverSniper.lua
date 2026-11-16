@@ -954,7 +954,8 @@ local function prepareCommodityDeal(itemID, link, line, market, kind)
                 break
             end
         end
-        S.liveCandidates[itemID] = {kind=inferred, id=itemID, link=link, line=line, market=market, t=GetTime(), refresh=true}
+        S.liveCandidates[itemID] = {kind=inferred, id=itemID, link=link, line=line, market=market,
+            t=GetTime(), detectedAt=GetTime(), refresh=true}
     end
 end
 
@@ -2767,6 +2768,7 @@ local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
         local queued = S.liveCandidates[itemID]
         S.liveCandidates[itemID] = { kind = kind, id = itemID, link = link,
             line = sweep.line or unit, market = market, profit = sweep.profit,
+            detectedAt = queued and (queued.detectedAt or queued.t) or GetTime(),
             t = queued and queued.t or GetTime(), refresh = queued and queued.refresh }
         if not queued then recordGate("offer", "queued for live tiers", itemID) end
         return
@@ -3391,6 +3393,21 @@ lastQueryAt = 0
 local sweepCount, watchCursor = 0, 0
 S.sweepStats = { sent = 0, rows = 0, yields = 0, lastRows = 0 }
 
+function S.noteRevisit(id)
+    S.checkedAt = S.checkedAt or {}
+    S.revisitByID = S.revisitByID or {}
+    local now, previous = GetTime(), S.checkedAt[id]
+    local stats = S.sweepStats
+    if previous then
+        stats.revisitLast = math.max(0, now - previous)
+        S.revisitByID[id] = stats.revisitLast
+        stats.revisitMax = math.max(stats.revisitMax or 0, stats.revisitLast)
+        stats.revisitCount = (stats.revisitCount or 0) + 1
+        stats.revisitTotal = (stats.revisitTotal or 0) + stats.revisitLast
+    end
+    S.checkedAt[id] = now
+end
+
 S.autoChecked = {}
 local function nextAutoTarget()
     local now, best, bestScore = time(), nil, nil
@@ -3719,12 +3736,18 @@ do
                 and now - checked >= 10 then
                 local market = S.marketReference(id)
                 if market and market >= cfg.minUnit then
-                    candidates[#candidates + 1] = {id=id, checked=checked}
+                    local samples = b.s or {}
+                    local stamp, price = num(samples[#samples - 1]), num(samples[#samples])
+                    -- A small, bounded near-line boost improves hot-item revisits
+                    -- without letting them continually displace older coverage.
+                    local hot = stamp and stamp <= time() and time() - stamp <= 120
+                        and price and price > 0 and price <= market * 0.85
+                    candidates[#candidates + 1] = {id=id, checked=checked, priority=checked - (hot and 5 or 0)}
                 end
             end
         end
         table.sort(candidates, function(a, b)
-            if a.checked ~= b.checked then return a.checked < b.checked end
+            if a.priority ~= b.priority then return a.priority < b.priority end
             return a.id < b.id
         end)
         local keys, ids = {}, {}
@@ -3770,7 +3793,10 @@ do
             seen[id] = true
         end
         S.batchSearch = nil
-        for id in pairs(owner.ids) do S.batchChecked[id] = GetTime() end
+        for id in pairs(owner.ids) do
+            S.batchChecked[id] = GetTime()
+            S.noteRevisit(id)
+        end
         local stats = S.sweepStats
         stats.batchCompleted = (stats.batchCompleted or 0) + 1
         stats.batchKeys = (stats.batchKeys or 0) + owner.count
@@ -3858,8 +3884,8 @@ local function sweepQuery()
     end
     rebuildWatch()
     local watchKey, watchID, watchRule
-    if sweepCount % 4 == 1 then watchKey, watchID, watchRule = nextWatchKey() end
-    if sweepCount % 2 == 1 and not watchKey then
+    local targetSlot = sweepCount % 4 ~= 0
+    if targetSlot then
         local oldest
         for id, candidate in pairs(S.liveCandidates or {}) do
             if GetTime() - candidate.t >= 30 then
@@ -3876,9 +3902,10 @@ local function sweepQuery()
             return -- failed attempts also consume a pacing slot
         end
     end
-    -- Alternate target validation and discovery. A displayed deal may use a
-    -- target slot, never the discovery slot or an in-flight search's pages.
-    if sweepCount % 2 == 1 and C_AuctionHouse.SendSearchQuery then
+    -- Three monitoring slots per discovery slot. Queued bargains go first;
+    -- watch rules precede speculative checks and discovery cannot be starved.
+    if sweepCount % 4 == 1 then watchKey, watchID, watchRule = nextWatchKey() end
+    if targetSlot and C_AuctionHouse.SendSearchQuery then
         local key, id, w = watchKey, watchID, watchRule
         if not key and S.startBatch() then return end
         local target = not key and nextAutoTarget() or nil
@@ -3957,28 +3984,10 @@ end
 
 -- DEEP SCAN (/fsn deepscan, auto every 15 min with the AH open): page every
 -- listing of each scan category into the book. Modeled on ForeverForge's
--- 15-minute scan: auto-paging up to 40 pages per category, alerts stay OFF
--- (the live sweep re-finds anything actionable in minutes), the sweep is
--- paused while it runs, and server drops are survived by the watchdog.
+-- Auto-paging up to 40 pages per category. Every page evaluates candidates;
+-- live item validation continues between pages without replacing browse state.
 local DEEP_MAX_PAGES, DEEP_INTERVAL = 40, 900
 local deepSend, deepNext, deepMore
-
-local function bookRows(rows, added)
-    local first = added and (S.browseRecorded or 0) + 1 or 1
-    local mins, t = {}, time()
-    for i = first, #rows do
-        local r = rows[i]
-        local key = num(r.itemKey and r.itemKey.itemID)
-        local price = num(r.minPrice)
-        if key and price and price > 0 then
-            mins[key] = price
-            local qty = num(r.totalQuantity) or 0
-            if qty > 0 then noteStack(key, qty) end
-        end
-    end
-    if next(mins) then mergeIntoBook(mins, t) end
-    S.browseRecorded = #rows
-end
 
 local function deepAbort(say)
     local d = S.deepScan
@@ -4117,6 +4126,17 @@ startDeepScan = function(force)
         -- Item searches can interrupt between browse pages, but never replace
         -- the deep scan's browse result set or race its next page request.
         if S.autoSearch or S.watchSearch or S.liveCandidate or S.pending or S.buying or not canQuery(true) then return end
+        -- Reserve time for live validations and the same bounded click window
+        -- as the routine scheduler. Browse pages retain their existing owner.
+        if focusedDeal() and S.dealFocus then
+            local focus = S.dealFocus
+            if not focus.buyWindowUntil then focus.buyWindowUntil = GetTime() + 5 end
+            if GetTime() < focus.buyWindowUntil then return end
+        end
+        if GetTime() - (d.lastReq or 0) < 4 then return end
+        for _, candidate in pairs(S.liveCandidates or {}) do
+            if GetTime() - candidate.t < 30 then return end
+        end
         if d.needsSend then deepSend() return end
         if d.wantsPage then deepPage() return end
         -- a page request the server dropped sends no event: re-request, or
@@ -4888,7 +4908,7 @@ local function readDeepBrowse(added)
     if ok and type(rows) == "table" then
         local extra = added and math.max(0, #rows - (S.browseRecorded or 0)) or #rows
         if not added then S.browseRecorded = 0 end
-        bookRows(rows, added)
+        processBrowseRows(rows, added, "deep discovery")
         owner.rows = (owner.rows or 0) + extra
         if not added then owner.received = true end
         deepMore()
@@ -5076,6 +5096,7 @@ local function onCommodityResults(itemID)
     local snapshot, reason = readCommodityTiers(itemID)
     if snapshot then
         S.commoditySnapshots[itemID] = snapshot
+        S.noteRevisit(itemID)
     elseif reason == "unreadable" then
         S.commoditySnapshots[itemID] = nil
     elseif reason == "empty" then
@@ -5137,6 +5158,11 @@ local function onCommodityResults(itemID)
         end
         local terms, rejected = S.optimizedCommodityTerms(itemID, c.line, c.market, c.kind, snapshot)
         if terms then
+            if c.detectedAt then
+                local stats = S.sweepStats
+                stats.validationLast = math.max(0, GetTime() - c.detectedAt)
+                stats.validationMax = math.max(stats.validationMax or 0, stats.validationLast)
+            end
             fireAlert(c.kind, itemID, c.link, terms.first, terms.resale,
                 {units=terms.units,cost=terms.cost,profit=terms.profit,line=terms.line or c.line,verified=true}, true)
         else
@@ -5579,6 +5605,9 @@ SlashCmdList.FOREVERSNIPER = function(msg)
         printf("market reference: %s. /fsn tsm <itemID> inspects an item's reference.",
             cfg.tsm == false and "TSM disabled; local history only" or ForeverSniperTSM.status(time()))
         local ss = S.sweepStats or { sent = 0, rows = 0, yields = 0 }
+        printf("monitor timing: completed-check revisit last/mean/max %.1f/%.1f/%.1fs (%d repeats); detected-to-validated last/max %.1f/%.1fs. Not listing age or a Buy guarantee.",
+            ss.revisitLast or 0, (ss.revisitTotal or 0) / math.max(1, ss.revisitCount or 0), ss.revisitMax or 0,
+            ss.revisitCount or 0, ss.validationLast or 0, ss.validationMax or 0)
         printf("batch discovery: %s; %d sent, %d completed, %d keys covered, %d rows, %d failures; last response %.2fs.",
             S.batchDisabled or (cfg.batch and "enabled (experimental)" or "off"),
             ss.batchSent or 0, ss.batchCompleted or 0, ss.batchKeys or 0,
@@ -5766,6 +5795,11 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             if not id or id <= 0 or id % 1 ~= 0 then printf("usage: /fsn tsm [on|off|itemID]") return end
             local value, source = S.marketReference(id)
             printf("item %d reference: %s (%s).", id, value and fmtMoney(value) or "unavailable", source or "no trusted reference")
+            local checked = S.checkedAt and S.checkedAt[id]
+            local revisit = S.revisitByID and S.revisitByID[id]
+            printf("item %d monitoring: last completed check %s; last revisit interval %s.", id,
+                checked and string.format("%.1fs ago", math.max(0, GetTime() - checked)) or "not observed",
+                revisit and string.format("%.1fs", revisit) or "not yet measured")
         end
         printf("TSM reference: %s", cfg.tsm == false and "disabled; local history only" or ForeverSniperTSM.status(time()))
 

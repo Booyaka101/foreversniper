@@ -73,6 +73,7 @@ local function snapshot(tiers)
 end
 `;
 const production = optimizer
+  + section('function S.noteRevisit(', '\nS.autoChecked =')
   + section('local COMMODITY_SNAPSHOT_AGE', 'local function prepareCommodityDeal')
   + section('function S.purchaseBudget()', 'local function purchaseAPIAvailable()')
   + section('local function finishPurchase(p, source)', '\nmarkDealGone =')

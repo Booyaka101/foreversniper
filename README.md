@@ -120,6 +120,31 @@ automatically clear these reservations.
 
 ### Candidate selection and history
 
+#### Continuous monitoring and pricing mistakes
+
+The routine scheduler now reserves three of every four available query slots for
+monitoring, with the fourth reserved for broad discovery. Queued bargains receive
+the next monitoring slot ahead of speculative searches. Existing owned result
+pages and the bounded five-second focused Buy window still take precedence.
+These are scheduling priorities, not faster server requests or instant alerts.
+
+Batch summaries revisit up to 100 known eligible items per request. Oldest checks
+lead, with a bounded five-second priority boost for a fresh near-reference-floor
+sighting. The existing ten-second per-item batch cooldown remains. Unknown items
+still enter through broad discovery and full/deep scans, not a guessed item list.
+Every deep-scan page now evaluates candidates before learning its own prices;
+complete live tiers are still mandatory before admission. Deep browse requests
+are spaced at least four seconds apart and yield to queued validation and the
+focused click window. They retain browse ownership, so batches resume after the
+deep scan rather than destroying its page set. Deep scans remain time-bounded.
+
+`/fsn status` reports completed-check revisit last/mean/max and observed
+candidate-to-validation delays. `/fsn tsm <itemID>` also shows that item's last
+completed check and last revisit interval. These measurements do not establish
+listing age, sale demand, or guaranteed detection-to-Buy time. Server readiness
+and purchase locks can still delay a valid opportunity. No listing-created event
+or promise of beating other buyers is implied.
+
 #### TSM-backed first-scan discovery
 
 When TSM and its AppHelper are enabled, Forever Sniper can use verified realm

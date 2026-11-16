@@ -257,3 +257,35 @@ Remaining live check: `/fsn tsm` must confirm observed realm data after reload;
 may cause AppHelper data to arrive before our observer; this deliberately leaves
 TSM unavailable rather than trusting a timestamp we cannot verify. There is no
 claim of first-second results, actual missed-trade recovery or guaranteed resale.
+## Continuous monitor scheduler, 2026-11-16
+
+Follow-up authorized scope: implement the monitoring redesign on PR #7, merge
+after CI and deploy the exact tested main commit with backup and unchanged saved
+data. Bounded pass retains all request-pacing, readiness and purchase safeguards.
+
+Routine scheduling changes from alternating target/discovery slots to three
+monitoring slots per reserved discovery slot. Queued bargains precede speculative
+rechecks and manual watches precede batches when no bargain is queued. Batch
+coverage stays oldest-first with a bounded five-second near-line boost, the same
+100-key limit and ten-second per-key cooldown. Unknown items still need discovery;
+there is no assumed global item catalogue or server listing-created event.
+
+Deep results now use the shared candidate pipeline before history learning and
+only process new rows on added pages. Its ticker yields to fresh candidate queues
+and the focused click window and spaces browse requests at least four seconds
+apart. Item checks continue; batches cannot replace its owned browse result set.
+The existing two-minute bound can stop a partial deep scan, so this is not a claim
+of exhaustive all-item coverage each cycle.
+
+Session-only diagnostics record completed-check revisit intervals, per-item last
+check/revisit and candidate-detection-to-validation latency. They do not measure
+time since listing creation or promise that the Buy API is ready at validation.
+Regression tests include the new 3:1 reservation, next-slot bargain priority,
+bounded batch hotness, actual revisit measurements, deep page evaluation and
+deduplication, live-tier admission and background yielding/spacing. Existing
+purchase locks, pagination ownership and server-pressure tests remain mandatory.
+
+Local gates: all 123 tests pass, including all three Lua chunks compiling; secret
+lint reports zero errors/warnings; strict load/lifecycle simulation passes. Exact
+PR-head and merged-main CI must both pass before deployment. Live timing and the
+installed AppHelper observer still require confirmation after `/reload`.
