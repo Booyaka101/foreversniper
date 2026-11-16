@@ -383,12 +383,63 @@ test('manual watches retain their slot while discovery and automatic checks cont
   assert(count("target",456)==4 and count("target",123)==8 and count("browse")==4)
 `));
 
-test('queued candidates cannot consume reserved discovery slots', () => check(`
+test('continuous candidates can defer discovery by only one slot', () => check(`
   S.liveCandidates={}
   for id=1,20 do S.liveCandidates[id]={id=id,t=now,line=10,market=100} end
-  slots(8)
-  assert(count("browse")==2 and count("target")==6)
+  slots(9)
+  assert(count("browse")==2 and count("target")==7)
+  assert(queries[4].kind=="target" and queries[5].kind=="browse")
+  assert(queries[8].kind=="target" and queries[9].kind=="browse")
 `));
+
+test('a fresh bargain borrows discovery then repays before another candidate', () => check(`
+  slots(3)
+  S.liveCandidates={[789]={id=789,t=now,detectedAt=now,line=10,market=100}}
+  slots(1)
+  assert(count("target",789)==1 and count("browse")==0 and S.discoveryDue)
+  assert(S.sweepStats.queueLast==1 and S.sweepStats.queueMax==1)
+  S.liveCandidates[790]={id=790,t=now,line=10,market=100}
+  slots(1)
+  assert(count("browse")==1 and count("target",790)==0 and not S.discoveryDue)
+  slots(1); assert(count("target",790)==1)
+`));
+
+test('queued bargains precede background refresh after the existing click window', () => check(`
+  slots(2)
+  focus={id=999,line=10,market=100}; S.dealFocus={deal=focus,buyWindowUntil=now}
+  S.liveCandidates={[789]={id=789,t=now,line=10,market=100}}
+  slots(1); assert(count("target",789)==1 and count("target",999)==0)
+`));
+
+test('borrowing never bypasses throttle or an owned search', () => check(`
+  slots(3)
+  S.liveCandidates={[789]={id=789,t=now,line=10,market=100}}
+  complete(); ready=false; now=now+1; sweepQuery()
+  assert(#queries==3 and not S.discoveryDue)
+  ready=true; S.autoSearch={id=123,t=now}; sweepQuery()
+  assert(#queries==3 and not S.discoveryDue)
+  complete(); sweepQuery(); assert(count("target",789)==1 and S.discoveryDue)
+`));
+
+test('failed borrowed validation still reserves the next discovery slot', () => check(`
+  slots(3)
+  S.liveCandidates={[789]={id=789,t=now,line=10,market=100}}
+  requestItemSearch=function() error("submission failed") end
+  slots(1); assert(S.discoveryDue and not S.liveCandidate)
+  S.liveCandidates[790]={id=790,t=now,line=10,market=100}
+  slots(1); assert(count("browse")==1 and not S.discoveryDue)
+`));
+
+test('discovery borrowing is disabled while deep or native browse owns the channel', () => {
+  for (const owner of ['S.deepScan={}', 'browseVisible=true']) check(`
+    slots(3)
+    S.liveCandidates={[789]={id=789,t=now,line=10,market=100}}
+    ${owner}
+    slots(1)
+    assert(not S.discoveryDue and count("target",789)==0 and S.liveCandidates[789])
+    slots(1); assert(count("target",789)==1)
+  `);
+});
 
 test('queued bargains use the next monitoring slot ahead of watches and speculative searches', () => check(`
   watch=456

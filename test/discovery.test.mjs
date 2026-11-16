@@ -220,6 +220,15 @@ test('moderate discount flows from summary through real live-depth validation to
   assert(admitted[1].sweep.profit==29970)
 `));
 
+test('validation timing separates submitted search response from earlier queue wait', () => check(`
+  seed(); observe(6500,20)
+  local candidate=S.liveCandidates[123]
+  candidate.detectedAt=now-3; candidate.searchStartedAt=now-1
+  complete(6500,10,10000,10)
+  assert(#admitted==1 and S.sweepStats.validationLast==3)
+  assert(S.sweepStats.responseLast==1 and S.sweepStats.responseMax==1)
+`));
+
 test('restored strict threshold still rejects the same moderate discount', () => check(`
   seed(); cfg.threshold=0.5; observe(6500,20)
   assert(not S.liveCandidates and #admitted==0)

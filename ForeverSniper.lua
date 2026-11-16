@@ -3572,6 +3572,12 @@ end
 
 local function sendTargetSearch(field, target)
     target.t = GetTime()
+    target.searchStartedAt = target.t
+    if field == "liveCandidate" and target.detectedAt then
+        local stats = S.sweepStats
+        stats.queueLast = math.max(0, target.t - target.detectedAt)
+        stats.queueMax = math.max(stats.queueMax or 0, stats.queueLast)
+    end
     target.commodity = commodityFor(target.id)
     S[field] = target
     noteQueryAttempt()
@@ -3920,7 +3926,9 @@ local function sweepQuery()
         if GetTime() < priority.buyWindowUntil then return end
     end
     sweepCount = sweepCount + 1
-    if focus and sweepCount % 4 == 3 then
+    local discoveryDue = S.discoveryDue
+    S.discoveryDue = nil
+    if focus and sweepCount % 4 == 3 and not discoveryDue and not next(S.liveCandidates or {}) then
         local snapshot = S.commoditySnapshots[focus.id]
         local priority = S.dealFocus
         if (not snapshot or GetTime() - snapshot.t >= 15)
@@ -3935,8 +3943,9 @@ local function sweepQuery()
     end
     rebuildWatch()
     local watchKey, watchID, watchRule
-    local targetSlot = sweepCount % 4 ~= 0
-    if targetSlot then
+    local targetSlot = not discoveryDue and sweepCount % 4 ~= 0
+    if not discoveryDue and (targetSlot or (not S.deepScan and not blizzardBrowseActive()
+        and C_AuctionHouse.SendBrowseQuery)) then
         local oldest
         for id, candidate in pairs(S.liveCandidates or {}) do
             if GetTime() - candidate.t >= 30 then
@@ -3948,13 +3957,19 @@ local function sweepQuery()
             end
         end
         if oldest then
+            -- Borrow only one discovery slot, then repay it before any more
+            -- candidates. Fresh bargains save a round trip without starving coverage.
+            if not targetSlot then
+                S.discoveryDue = true
+                S.sweepStats.discoveryBorrowed = (S.sweepStats.discoveryBorrowed or 0) + 1
+            end
             S.liveCandidates[oldest.id] = nil
             sendTargetSearch("liveCandidate", oldest)
             return -- failed attempts also consume a pacing slot
         end
     end
-    -- Three monitoring slots per discovery slot. Queued bargains go first;
-    -- watch rules precede speculative checks and discovery cannot be starved.
+    -- Three monitoring slots per discovery slot, with at most one outstanding
+    -- borrowed slot. Watch rules precede speculative checks.
     if sweepCount % 4 == 1 then watchKey, watchID, watchRule = nextWatchKey() end
     if targetSlot and C_AuctionHouse.SendSearchQuery then
         local key, id, w = watchKey, watchID, watchRule
@@ -5214,6 +5229,10 @@ local function onCommodityResults(itemID)
                 local stats = S.sweepStats
                 stats.validationLast = math.max(0, GetTime() - c.detectedAt)
                 stats.validationMax = math.max(stats.validationMax or 0, stats.validationLast)
+                if c.searchStartedAt then
+                    stats.responseLast = math.max(0, GetTime() - c.searchStartedAt)
+                    stats.responseMax = math.max(stats.responseMax or 0, stats.responseLast)
+                end
             end
             fireAlert(c.kind, itemID, c.link, terms.first, terms.resale,
                 {units=terms.units,cost=terms.cost,profit=terms.profit,line=terms.line or c.line,verified=true}, true)
@@ -5686,6 +5705,9 @@ SlashCmdList.FOREVERSNIPER = function(msg)
         printf("monitor timing: completed-check revisit last/mean/max %.1f/%.1f/%.1fs (%d repeats); detected-to-validated last/max %.1f/%.1fs. Not listing age or a Buy guarantee.",
             ss.revisitLast or 0, (ss.revisitTotal or 0) / math.max(1, ss.revisitCount or 0), ss.revisitMax or 0,
             ss.revisitCount or 0, ss.validationLast or 0, ss.validationMax or 0)
+        printf("validation timing: queue wait last/max %.2f/%.2fs; response last/max %.2f/%.2fs; %d discovery slots borrowed (next slot reserved for discovery).",
+            ss.queueLast or 0, ss.queueMax or 0, ss.responseLast or 0, ss.responseMax or 0,
+            ss.discoveryBorrowed or 0)
         printf("batch discovery: %s; %d sent, %d completed, %d keys covered, %d rows, %d failures; last response %.2fs.",
             S.batchDisabled or (cfg.batch and "enabled (experimental)" or "off"),
             ss.batchSent or 0, ss.batchCompleted or 0, ss.batchKeys or 0,

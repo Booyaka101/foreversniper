@@ -441,3 +441,43 @@ actual 296-copper/173-unit raw values, reject wrong/missing/malformed identities
 and mixed-item walls, block Buy and cached fallback, and prevent automatic history
 or live admission from a wrong-item cheap result. The initial source of cheap
 tiers remains an unresolved live question. No purchase guard has been weakened.
+
+### Fresh bargain scheduling (stacked on PR #9)
+
+Based on deployed `288c993`, isolated branch `feat/fresh-bargain-latency`.
+Inspection found two avoidable scheduling waits: a queued candidate could lose
+the next pacing slot to discovery (every fourth slot), or to background refresh
+of an older focused offer (every fourth slot's third position).
+
+Queued candidates now precede background focused refresh after its existing
+five-second click window. A candidate may borrow a discovery slot only when
+routine discovery is available. The following eligible scheduling slot is then
+reserved for discovery before any additional candidate or speculative check.
+There is at most one outstanding borrowed slot; even a failed submission repays
+it. No borrowing during deep scans or native browse ownership. Existing candidate
+aging/value/liquidity ranking and 30-second expiry are unchanged.
+
+Deterministic scheduler example: after three target slots, a queued bargain now
+gets slot four rather than waiting for slot five; discovery moves to slot five.
+With continuous queued candidates, discovery occurs in slots five and nine.
+This removes one discovery-request wait in that scenario. It is not a measured
+live millisecond improvement, a listing-age estimate or a claim of fastest-client
+performance. Existing in-flight ownership, pacing limits, stock freshness, click
+window, full tiers, price identity, quote ceilings and unknown-outcome locks stay
+authoritative. The code does not automatically start purchases.
+
+`/fsn status` now separates detected-to-search queue wait from submitted-search
+response time (including pages), alongside detected-to-validation timing. Response
+timing is recorded only for a submitted candidate, not for an unsolicited result.
+Last/max values are session diagnostics, not matched samples or percentiles; they
+do not measure human reaction time or guarantee that Buy is immediately ready.
+Live validation should capture these values and Buy readiness under real throttle
+pressure before claiming improved successful-purchase rates.
+
+Validation: 167 tests pass, secret lint zero errors/warnings, strict load/lifecycle
+simulation clean, and whitespace check clean. New regressions cover borrowing and
+repayment under continuous arrivals, failed submissions, throttle/owned-request
+gates, candidate-before-background refresh and separate response timing. The full
+existing purchase/identity/liquidity suite still passes. Extended AH simulation
+remains outside this passing lifecycle gate. No game files or saved data changed;
+deployment requires exact-commit CI and owner approval.
