@@ -364,3 +364,26 @@ Remaining gates: PR review and CI; actual in-game per-item API coverage, observe
 delivery, protected execution and resale performance remain unverified. The known
 strict AH scenario failures described above were not re-investigated or claimed
 as passing. Stop at the review PR; do not merge or deploy this feature in this pass.
+
+### Owner-authorized test deployment and quote diagnostics
+
+The owner subsequently requested a test deployment. PR #9 commit `16b6bf9`
+passed CI run `43885700112` and was installed from a git archive with verified
+runtime hashes, a verified prior-runtime backup and unchanged SavedVariables hash.
+Receipt: `D:/WoW/AddonBackups/ForeverSniper/pre-tsm-sales-20261116-222736/deployment-receipt.json`.
+The PR remains unmerged and no release was created.
+
+The owner then reported two generic quote refusals for 11 units of item 2592
+under 14 copper/unit (154 copper total). This message originates before the sales
+policy revalidation. Neither the screenshot nor the on-disk saved file establishes
+which guard failed. The follow-up replaces the combined boolean with equivalent,
+ordered rejection reasons and logs numeric unit/total quotes, approved caps,
+current budget and quote age to chat and `/fsn diagnostics`. No permission,
+price, age, stock, profit, outcome or sales-policy limit is relaxed.
+
+All 154 local tests pass, including a regression covering each of the ten
+unchanged quote guards and retained diagnostic evidence. Static lint has zero
+errors/warnings and strict load/lifecycle simulation is clean. The actual live
+cause remains unresolved pending the next quote's evidence; this is a diagnostic
+repair, not a claim that purchases are fixed. The owner was told this diagnostic
+update would be deployed only after its exact-commit CI passes.

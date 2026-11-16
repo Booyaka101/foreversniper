@@ -50,6 +50,7 @@ local function prepareCommodityDeal() end
 local function purchaseAPIAvailable() return true end
 local function markDealGone() end
 local function recordGate() end
+local function diagnostic() end
 local function printPending() end
 local function renderPopup() end
 local function checkWatchCommodity() end

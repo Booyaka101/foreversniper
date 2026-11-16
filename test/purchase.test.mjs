@@ -10,11 +10,13 @@ local db = {blacklist={}}
 local S = {ahOpen=true}
 local handlers, buyFailUntil = {}, {}
 local calls = {cancel=0,confirm=0}
+local diagnostics={}
 local function GetTime() return now end
 local function num(v) if type(v)=="number" and v==v then return v end end
 local function printf() end
 local function err() end
 local function recordGate() end
+local function diagnostic(domain,message) diagnostics[#diagnostics+1]={domain=domain,message=message} end
 local function markDealGone() end
 local function finishPurchase() end
 local function on(event,fn) handlers[event]=fn end
@@ -73,6 +75,26 @@ test('expired quotes and revoked permissions cannot confirm', () => {
     check(`offer(); ${change}; handlers.COMMODITY_PRICE_UPDATED(10,100)
       assert(calls.confirm==0 and not S.snipePending)`);
   }
+});
+
+test('quote refusals identify the exact unchanged guard and retain numeric evidence', () => {
+  for (const [change, quote, reason] of [
+    ['', '11,100', 'unit price above approved ceiling'],
+    ['', '10,101', 'total above approved purchase cost'],
+    ['', 'nil,100', 'unreadable unit price'],
+    ['', '10,nil', 'unreadable total price'],
+    ['now=103', '10,100', 'quote older than 2 seconds'],
+    ['cfg.enabled=false', '10,100', 'scanner disabled'],
+    ['S.ahOpen=false', '10,100', 'auction house closed'],
+    ['db.blacklist[123]=true', '10,100', 'item blacklisted'],
+    ['function S.offerAvailable() return false end', '10,100', 'displayed offer retired'],
+    ['function S.purchaseBudget() return 99 end', '10,100', 'total above current budget'],
+  ]) check(`offer(); ${change}; handlers.COMMODITY_PRICE_UPDATED(${quote})
+    assert(calls.confirm==0 and calls.cancel==1 and not S.snipePending)
+    assert(#diagnostics==1 and diagnostics[1].domain=='purchase quote')
+    local message=diagnostics[1].message
+    assert(message:find('${reason}',1,true) and message:find('item 123 x10',1,true)
+      and message:find('quote unit/total',1,true) and message:find('age ',1,true))`);
 });
 
 test('a changed complete position prevents quote confirmation', () => check(`

@@ -5243,11 +5243,25 @@ on("COMMODITY_PRICE_UPDATED", function(unitPrice, totalPrice)
         local ceiling = sp.maxUnit or (sp.tolTotal / math.max(1, sp.units))
         local budget = math.min(sp.walletCap or math.huge,
             S.purchaseBudget() - (sp.reserve or 0))
-        if not cfg.enabled or not S.ahOpen or db.blacklist[sp.deal.id] or not S.offerAvailable(sp.offer)
-            or GetTime() - sp.t > 2 or not u or u < 1 or u % 1 ~= 0 or not t or t < sp.units or t < u or t % 1 ~= 0
-            or u > ceiling or t > sp.tolTotal or t > budget then
-            retirePurchase("quote refused")
-            printf("quote refused: permission revoked, stale, unreadable, or above the approved price/budget; nothing confirmed.")
+        local age = GetTime() - sp.t
+        local rejected
+        if not cfg.enabled then rejected = "scanner disabled"
+        elseif not S.ahOpen then rejected = "auction house closed"
+        elseif db.blacklist[sp.deal.id] then rejected = "item blacklisted"
+        elseif not S.offerAvailable(sp.offer) then rejected = "displayed offer retired"
+        elseif age > 2 then rejected = "quote older than 2 seconds"
+        elseif not u or u < 1 or u % 1 ~= 0 then rejected = "unreadable unit price"
+        elseif not t or t < sp.units or t < u or t % 1 ~= 0 then rejected = "unreadable total price"
+        elseif u > ceiling then rejected = "unit price above approved ceiling"
+        elseif t > sp.tolTotal then rejected = "total above approved purchase cost"
+        elseif t > budget then rejected = "total above current budget" end
+        if rejected then
+            local detail = string.format("%s; item %d x%d; quote unit/total %s/%s copper; caps unit/total/budget %.0f/%.0f/%.0f copper; age %.2fs",
+                rejected, sp.deal.id, sp.units, tostring(u), tostring(t), ceiling, sp.tolTotal, budget, age)
+            retirePurchase("quote refused: " .. rejected)
+            recordGate("purchase", "quote rejected: " .. rejected, sp.deal.id)
+            diagnostic("purchase quote", detail)
+            printf("quote refused: %s; nothing confirmed. /fsn diagnostics for quote details.", detail)
             if S.feedRefresh then S.feedRefresh() end
             return
         end
