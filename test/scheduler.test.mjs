@@ -14,6 +14,7 @@ local watchByID = {}
 local processed = {}
 local function num(value) return tonumber(value) end
 local function freshMedian(samples) return samples and samples[1] end
+function S.marketReference(id) return freshMedian(db.book[id] and db.book[id].s) end
 local function processBrowseRows(rows) processed[#processed+1]=rows end
 local function GetTime() return now end
 local function time() return now end
@@ -151,6 +152,12 @@ const batchSetup = `
   for id=1,205 do db.book[id]={s={100}} end
 `;
 function batchCheck(code) { check(batchSetup + code); }
+
+test('batch targets can use a trusted reference before local history has warmed up', () => batchCheck(`
+  db.book={[123]={s={}}}
+  function S.marketReference(id) assert(id==123); return 10000 end
+  assert(S.startBatch() and S.batchSearch.ids[123])
+`));
 
 test('owner-approved default enables batching without overriding explicit saved choices', () => {
   const init = section('local DEFAULTS =', '\n-- one-time retune:');

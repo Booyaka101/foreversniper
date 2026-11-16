@@ -1,6 +1,7 @@
 import test from 'node:test';
 import fs from 'node:fs';
 import { section, run } from './lua.mjs';
+import { fixture, provider, helpers as tsmHelpers } from './tsm-fixture.mjs';
 
 const history = section('local HISTORY_SPACING =', '\n-- Item info cache:');
 const merge = section('local function mergeIntoBook(', '\n-- FORWARD DECLARATIONS:');
@@ -55,6 +56,7 @@ local C_AuctionHouse={
 }
 `;
 const production = history + merge
+  + section('function S.marketReference(', '\nlocal COMMODITY_SNAPSHOT_AGE')
   + section('local function dealLine(', '\n-- TOOLTIP INTELLIGENCE:')
   + fs.readFileSync(new URL('../DepthOptimizer.lua', import.meta.url), 'utf8')
   + section('local COMMODITY_SNAPSHOT_AGE', 'local function prepareCommodityDeal')
@@ -76,6 +78,71 @@ local function complete(low,qty,high,competition)
 end
 `;
 function check(body) { run(setup + production + helpers + body); }
+
+function tsmCheck(body) { run(setup + fixture + provider + production + helpers + tsmHelpers + body); }
+
+test('TSM admits a first-sighting candidate with an empty book, but only live tiers admit a deal', () => tsmCheck(`
+  market(); assert(next(db.book)==nil)
+  observe(6500,20); assert(S.liveCandidates[123] and #admitted==0)
+  complete(6500,10,10000,10)
+  assert(#admitted==1 and admitted[1].sweep.verified and admitted[1].sweep.profit==29970)
+`));
+
+test('TSM bootstrap still enforces complete results, net profit, stock, budget and overhang', () => {
+  for (const change of [
+    'C_AuctionHouse.HasFullCommoditySearchResults=function() return false end',
+    'cfg.profit=30000','cfg.maxSpend=65000','cfg.maxStock=9','cfg.overhang=9',
+  ]) tsmCheck(`market(); observe(6500,20); assert(S.liveCandidates[123])
+    ${change}; complete(6500,10,10000,10); assert(#admitted==0)`);
+});
+
+test('mature local history caps TSM while missing, stale or disabled TSM preserves local fallback', () => {
+  tsmCheck(`market(); seed(); values.dbmarket=20000
+    local price,source=S.marketReference(123); assert(price==10000 and source:find('caps TSM'))
+    observe(7500,20); assert(not S.liveCandidates)`);
+  for (const action of ['TSM_API=nil','market(now-43201)','cfg.tsm=false; market()']) {
+    tsmCheck(`seed(); ${action}; assert(S.marketReference(123)==10000)
+      observe(6500,20); assert(S.liveCandidates[123])`);
+  }
+});
+
+test('without verified TSM and mature local history the first sighting still only learns', () => {
+  for (const action of ['', 'market(now-43201)', 'cfg.tsm=false; market()', 'historical()']) {
+    tsmCheck(`${action}; observe(6500,20); assert(not S.liveCandidates and #admitted==0)
+      assert(S.gateLog.counts['no fresh market reference']==1 and #db.book[123].s==2)`);
+  }
+});
+
+test('the first full snapshot also queues TSM candidates before learning its own floor', () => tsmCheck(`
+  market(); cfg.quiet=true; db.watch={}; S.scansDone=0; S.scanning=true
+  local function err(_,message) error(message) end
+  local function after() end
+  local function dbg() end
+  function S.resumeDeferredDeepScan() end
+  C_AuctionHouse.GetNumReplicateItems=function() return 2 end
+  C_AuctionHouse.GetReplicateItemInfo=function(i)
+    return nil,nil,10,nil,nil,nil,nil,nil,nil,i==1 and 65000 or 100000,
+      nil,nil,nil,nil,nil,nil,123,true
+  end
+  ${section('local function completeScan(', '\n-- Scan engine,')}
+  completeScan('test')
+  assert(S.scansDone==1 and S.liveCandidates[123] and #admitted==0)
+  assert(db.book[123].s[2]==6500)
+  complete(6500,10,10000,10); assert(#admitted==1 and admitted[1].sweep.verified)
+`));
+
+test('TSM commands inspect a reference and preserve an explicit local-only choice', () => tsmCheck(`
+  market()
+  local function command(rest)
+    local cmd='tsm'
+    ${section('    elseif cmd == "tsm" then', '\n    elseif cmd == "batch" then').replace('elseif cmd', 'if cmd')}
+    end
+  end
+  command('123'); assert(S.marketReference(123)==10000)
+  command('off'); assert(cfg.tsm==false and S.marketReference(123)==nil)
+  command('bad'); assert(cfg.tsm==false)
+  command('on'); assert(S.marketReference(123)==10000)
+`));
 
 test('moderate discount flows from summary through real live-depth validation to admission', () => check(`
   seed(); observe(6500,20)

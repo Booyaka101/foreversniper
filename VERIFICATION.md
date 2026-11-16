@@ -213,3 +213,47 @@ Local gates: all 101 tests pass; wow-secret-lint reports zero errors and warning
 strict load/lifecycle simulation passes; git diff --check passes. Extended AH
 simulation is not claimed as a gate because of the previously recorded baseline
 simulator failures. Live-game confirmation remains pending after deployment.
+## TSM first-scan reference integration, 2026-11-16
+
+Bounded pass: verify the installed price API and provenance, wire discovery,
+exercise first-sighting and risk regressions, run local gates and exact-head CI.
+No merge, deployment, release, live settings changes or SavedVariables writes.
+
+Inspected installed TSM 4.15.7: App/API.lua lines 244-283 exposes public source
+evaluation but no update timestamp. AuctionDBConfig.lua lines 22-54 maps DBMarket,
+DBRecent and DBHistorical to realm fields. AuctionDB.lua lines 57-67 and 161-210
+keeps update times internally and reads downloadTime metadata; it does not impose
+our source-specific expiry. AppHelper.lua lines 108-175 and 403-425 routes realm
+data by realm plus faction and ignores duplicates. Its loader is reassigned at
+login (lines 325-328). The installed AppData.lua contains separate Normal-Alliance
+and Normal-Horde market, recent and historical feeds and Forever-EU regional
+feeds. No private addon code or saved data was sent to documentation services.
+
+Design: optional TSM dependency, public prices only, session-only read-only secure
+observer for known AppHelper metadata. No payload execution, TSM loader replacement
+or TSM data writes. Use the lower usable realm market/recent price (12-hour max
+download age), capped by historical (48-hour max) and mature fresh local history.
+Historical-only, regional-only, wrong realm/faction, future, unknown or unobserved
+feeds cannot bootstrap. Missing TSM/API failures fall back safely. Cache results
+for at most 30s (missing values 5s), never beyond contributing feed freshness;
+cap cache at 12,000 items. Timing limits are explicit conservative policy choices.
+
+Discovery, automatic targets and batch targeting share the resolver. Full scans
+no longer suppress the first pass when a trusted reference exists. Learning still
+happens after candidate evaluation and never stores TSM prices as local samples.
+Selling, cancellation and portfolio reference policies are unchanged. No pacing,
+purchase, quote, outcome or budget safeguard was relaxed.
+
+All 118 tests pass locally. New regressions run production provider, resolver,
+browse, full-snapshot, live-tier admission and optimizer paths. They cover empty
+book first sightings, conservative caps, API errors/invalid values, freshness and
+cache expiry, wrong realm/faction, unknown metadata, no-observer fallback, commands,
+batch eligibility before local warm-up, and complete-results/profit/stock/budget/
+overhang rejection. Lua compilation includes all three runtime chunks. Lint and
+strict load/lifecycle simulation also pass; exact-head CI is checked on the PR.
+
+Remaining live check: `/fsn tsm` must confirm observed realm data after reload;
+`/fsn tsm <itemID>` exposes the selected source. Load ordering by another addon
+may cause AppHelper data to arrive before our observer; this deliberately leaves
+TSM unavailable rather than trusting a timestamp we cannot verify. There is no
+claim of first-second results, actual missed-trade recovery or guaranteed resale.
