@@ -895,7 +895,7 @@ do
         local count = num(ah.GetNumCommoditySearchResults(itemID))
         if not count or count < 0 or count % 1 ~= 0 then return nil, "unreadable" end
         if count == 0 then return nil, "empty" end
-        local tiers = {}
+        local tiers, evidence = {}, {}
         for i = 1, count do
             local row = ah.GetCommoditySearchResultInfo(itemID, i)
             if type(row) ~= "table" then return nil, "unreadable" end
@@ -914,8 +914,12 @@ do
                 return nil, "unreadable"
             end
             tiers[#tiers + 1] = { price = price, quantity = math.max(0, quantity - owned) }
+            if i <= 3 then
+                evidence[#evidence + 1] = string.format("%s:%d:%d:%d:%s", tostring(returnedID),
+                    price, quantity, owned, tostring(num(row.auctionID) or "unknown"))
+            end
         end
-        return { tiers = tiers, t = GetTime() }
+        return { tiers = tiers, t = GetTime(), readAt = GetTime(), evidence = table.concat(evidence, ",") }
     end
 
     readCommodityTiers = function(itemID)
@@ -933,10 +937,10 @@ local function commodityTiersForBuy(itemID)
     local saved = S.commoditySnapshots[itemID]
     if not saved or GetTime() < saved.t or GetTime() - saved.t > COMMODITY_SNAPSHOT_AGE then return nil, "loading" end
     local snapshot, reason = readCommodityTiers(itemID)
-    if snapshot then snapshot.t = saved.t return snapshot end
+    if snapshot then snapshot.t = saved.t return snapshot, nil, "live API" end
     -- A refresh may clear the API's result table. Keep the completed search
     -- that produced the offer, not a partial refresh or persisted deal row.
-    if reason == "loading" or reason == "empty" then return saved end
+    if reason == "loading" or reason == "empty" then return saved, nil, "completed fallback: " .. reason end
     return nil, reason
 end
 
@@ -1120,9 +1124,10 @@ end
 local function commodityOfferTerms(itemID, line, units, cost, market, kind)
     line = num(line)
     if not line or line <= 0 then return nil, "invalid" end
-    local snapshot, reason = commodityTiersForBuy(itemID)
+    local snapshot, reason, source = commodityTiersForBuy(itemID)
     if not snapshot then return nil, reason end
-    return commodityPositionTerms(itemID, line, units, cost, market, kind, snapshot)
+    local terms, rejected = commodityPositionTerms(itemID, line, units, cost, market, kind, snapshot)
+    return terms, rejected, snapshot, source
 end
 
 local function purchaseAPIAvailable()
@@ -2148,7 +2153,7 @@ quickBuy = function(r)
         printf("no deal line known for %s yet - click the row once to search it.", r.link or ("item " .. r.itemID))
         return
     end
-    local terms, reason = commodityOfferTerms(r.itemID, line, r.units, r.cost, r.market2, r.kind)
+    local terms, reason, snapshot, source = commodityOfferTerms(r.itemID, line, r.units, r.cost, r.market2, r.kind)
     if not terms then
         if reason == "loading" or reason == "unreadable" or reason == "grown" then prepareCommodityDeal(r.itemID, r.link, line, r.market2, r.kind) end
         if reason == "empty" then markDealGone(r.itemID, math.huge) end
@@ -2171,6 +2176,11 @@ quickBuy = function(r)
         return
     end
     local buyUnits, expected = terms.units, terms.cost
+    if snapshot then
+        diagnostic("purchase tiers", string.format("item %d; %s; completed age %.2fs; read age %.2fs; %d tiers; approved x%d/%d copper; first 3 rows item:unit:quantity:owned:auctionID=%s",
+            r.itemID, source, GetTime() - snapshot.t, GetTime() - (snapshot.readAt or snapshot.t),
+            #snapshot.tiers, buyUnits, expected, snapshot.evidence or "unavailable"))
+    end
     pcall(C_AuctionHouse.CancelCommoditiesPurchase)
     S.snipePending = {
         deal = { id = r.itemID, link = r.link }, units = buyUnits,

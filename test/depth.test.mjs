@@ -50,7 +50,8 @@ local function prepareCommodityDeal() end
 local function purchaseAPIAvailable() return true end
 local function markDealGone() end
 local function recordGate() end
-local function diagnostic() end
+local diagnostics = {}
+local function diagnostic(domain,message) diagnostics[#diagnostics+1]={domain=domain,message=message} end
 local function printPending() end
 local function renderPopup() end
 local function checkWatchCommodity() end
@@ -219,6 +220,40 @@ test('commodity tier prices preserve the observed Forever item identity and copp
   rows={{itemID=2772,unitPrice=296,quantity=173,numOwnerItems=0}}
   local result=readCommodityTiers(2772)
   assert(result and result.tiers[1].price==296 and result.tiers[1].quantity==173)
+`));
+
+test('Buy diagnostics capture raw live tiers and distinguish completed age from quote age', () => check(`
+  snapshot({{price=10,quantity=10},{price=100,quantity=1}})
+  rows[1].auctionID=123030736
+  now=110
+  quickBuy({itemID=123,line=10,units=10,cost=100,market2=100,kind='market',t=100})
+  assert(calls.start==1 and S.snipePending.t==110)
+  local entry=diagnostics[1]
+  assert(entry.domain=='purchase tiers')
+  assert(entry.message:find('live API; completed age 10.00s; read age 0.00s',1,true))
+  assert(entry.message:find('123:10:10:0:123030736',1,true))
+  assert(entry.message:find('approved x10/100 copper',1,true))
+`));
+
+test('Buy diagnostics identify empty and loading fallback without changing approval', () => {
+  for (const reason of ['empty', 'loading']) check(`
+    snapshot({{price=10,quantity=10},{price=100,quantity=1}})
+    S.commoditySnapshots[123]=readCommodityTiers(123)
+    now=105; rows={}
+    ${reason === 'loading' ? 'C_AuctionHouse.HasFullCommoditySearchResults=function() return false end' : ''}
+    quickBuy({itemID=123,line=10,units=10,cost=100,market2=100,kind='market',t=100})
+    assert(calls.start==1 and S.snipePending.expected==100 and S.snipePending.maxUnit==10)
+    assert(diagnostics[1].message:find('completed fallback: ${reason}; completed age 5.00s; read age 5.00s',1,true))
+    assert(diagnostics[1].message:find('123:10:10:0:unknown',1,true))
+  `);
+});
+
+test('raw tier evidence is bounded and copies values instead of retaining API row tables', () => check(`
+  snapshot({{price=10,quantity=10},{price=20,quantity=1},{price=30,quantity=1},{price=40,quantity=1}})
+  local saved=readCommodityTiers(123)
+  assert(#saved.tiers==4 and saved.evidence=='123:10:10:0:unknown,123:20:1:0:unknown,123:30:1:0:unknown')
+  rows[1].unitPrice=999
+  assert(saved.tiers[1].price==10 and saved.evidence:find('123:10:10:0:unknown',1,true))
 `));
 
 test('mismatched or missing Forever tier identity cannot authorize Buy or fall back to cached tiers', () => {
