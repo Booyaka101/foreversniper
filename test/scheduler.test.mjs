@@ -15,6 +15,7 @@ local processed = {}
 local function num(value) return tonumber(value) end
 local function freshMedian(samples) return samples and samples[1] end
 function S.marketReference(id) return freshMedian(db.book[id] and db.book[id].s) end
+function S.salesPolicy() end
 local function processBrowseRows(rows) processed[#processed+1]=rows end
 local function GetTime() return now end
 local function time() return now end
@@ -101,6 +102,18 @@ local function slots(n)
 end
 `;
 function check(code) { run(setup + production + helpers + code); }
+
+test('liquidity adds a bounded priority boost without starving older candidates', () => check(`
+  function S.salesPolicy(id) if id==1 then return {rate=1,daily=100000} end end
+  assert(S.candidatePriority({id=1,t=now})==2)
+  assert(S.candidatePriority({id=2,t=now-8})>S.candidatePriority({id=1,t=now,profit=1000000000}))
+`));
+
+test('sales caps refresh owned stock with the manual cap off', () => check(`
+  cfg.sales=true; local sent=0
+  function S.requestSellingOwned() sent=sent+1; return true end
+  sweepQuery(); assert(sent==1 and #queries==0)
+`));
 
 test('a focused validated offer gets one five-second ready window, then discovery resumes', () => check(`
   focus={id=123,line=10,market=100}; S.dealFocus={deal=focus}

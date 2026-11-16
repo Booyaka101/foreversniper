@@ -317,3 +317,50 @@ intentional; live confirmation after reload is required, not claimed by tests.
 Local validation: all 129 tests pass; secret lint reports zero errors/warnings;
 strict load/lifecycle simulation passes. Deployment requires successful exact
 PR-head and merged-main CI, a runtime backup and unchanged SavedVariables hashes.
+
+## TSM regional sales and liquidity, 2026-11-16
+
+Branch: `feat/tsm-sales-liquidity`, based on deployed PR #8 main (`fc35aa8`).
+Scope is implementation, validation and a review PR only. No runtime installation,
+SavedVariables, publication switches, release version or deployment changes.
+
+Research verified the installed TSM 4.15.7 Forever regional sale feed has
+`regionSale`, `regionSoldPerDay` and `regionSalePercent`, under `Forever-EU`.
+Its number-source registration divides stored values by 1000, and the public
+custom-price evaluator rounds the final expression. Scaled expressions with a
+positive offset preserve fractional rates/volume and distinguish known zero
+from missing values. Metadata inspection never executes AppHelper payloads.
+
+Definitions were checked against TSM's official price/value source documentation:
+
+- https://support.tradeskillmaster.com/en_US/custom-strings/which-price-sources-can-i-use-and-what-do-they-mean
+- https://support.tradeskillmaster.com/en_US/custom-strings/which-value-sources-can-i-use-and-what-do-they-mean
+
+Policy: matching Forever normal/hardcore regional data, observed and no more than
+48 hours old, may lower existing market references/resale estimates. It cannot
+bootstrap discovery. Known rates below 5% or volume-derived caps below one reject
+market/dump positions. Exposure is capped at 10% of daily regional volume per AH,
+rounded down, including held/banked items, owned auctions and pending receipts.
+Manual limits may tighten but not loosen this cap. Vendor/absolute watches keep
+their existing policies. Defaults are configurable policy choices, not measured
+optimal thresholds. Unknown sales data preserves existing fallback behavior.
+
+Review covered provider metadata/scoping/caching, discovery reference selection,
+complete-prefix optimization, fresh owned-stock scheduling, guarded Buy and quote
+revalidation, bounded candidate priority, commands and tooltip/status diagnostics.
+Sales queries use only the public TSM API and do not issue AH requests. Fresh
+stock maintenance shares existing paced scheduler slots.
+
+Final local checks: all 153 tests passed (129 prior, 24 added); secret lint zero
+errors/warnings; strict load/lifecycle simulation clean with existing unknown-event
+notices; diff whitespace check passed. Tests exercise production Lua sections,
+provider failure/zero/fractional values, stale/future/mismatched scopes, no regional
+bootstrap, live-tier admission/profit, total exposure and complete prefixes,
+vendor/watch exemptions, Buy and quote-time policy, commands and bounded priority.
+Full test and simulation logs are retained under the approved local temp directory
+as `forever-sales-tests.log` and `forever-sales-sim.log`.
+
+Remaining gates: PR review and CI; actual in-game per-item API coverage, observer
+delivery, protected execution and resale performance remain unverified. The known
+strict AH scenario failures described above were not re-investigated or claimed
+as passing. Stop at the review PR; do not merge or deploy this feature in this pass.

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import fs from 'node:fs';
 import { section, run } from './lua.mjs';
-import { fixture, provider, helpers as tsmHelpers } from './tsm-fixture.mjs';
+import { fixture, provider, helpers as tsmHelpers, salesEnvironment, salesAPI } from './tsm-fixture.mjs';
 
 const history = section('local HISTORY_SPACING =', '\n-- Item info cache:');
 const merge = section('local function mergeIntoBook(', '\n-- FORWARD DECLARATIONS:');
@@ -81,6 +81,37 @@ end
 function check(body) { run(setup + production + helpers + body); }
 
 function tsmCheck(body) { run(setup + fixture + provider + production + helpers + tsmHelpers + body); }
+
+function salesCheck(body) { run(setup + fixture + salesEnvironment + provider + production + helpers + tsmHelpers + salesAPI + body); }
+
+test('sale averages cap existing references but cannot bootstrap regional-only prices', () => {
+  salesCheck(`salesFeed(); assert(S.marketReference(123)==nil)
+    market(); assert(S.marketReference(123)==9000)
+    values.dbregionsaleavg=50000; now=now+31
+    assert(S.marketReference(123)==10000)`);
+  salesCheck(`salesFeed(); seed(); assert(S.marketReference(123)==9000)`);
+});
+
+test('sales data reaches live-tier admission and conservative profit estimates', () => salesCheck(`
+  salesFeed(); market(); values.dbregionsoldperday=nil
+  observe(6000,10); assert(S.liveCandidates[123] and #admitted==0)
+  complete(6000,10,10000,10)
+  assert(#admitted==1 and admitted[1].sweep.verified and admitted[1].sweep.profit==25480)
+`));
+
+test('sales commands inspect coverage and validate policy options', () => salesCheck(`
+  local function command(rest)
+    local cmd='sales'
+    ${section('    elseif cmd == "sales" then', '\n    elseif cmd == "tsm" then').replace('elseif cmd', 'if cmd')}
+    end
+  end
+  command('123'); command('rate 10'); command('share 5')
+  assert(cfg.saleRate==0.10 and cfg.saleShare==0.05)
+  command('share 0'); command('rate 101'); command('nonsense')
+  assert(cfg.saleRate==0.10 and cfg.saleShare==0.05)
+  command('off'); assert(cfg.sales==false)
+  command('on'); assert(cfg.sales==true)
+`));
 
 test('TSM admits a first-sighting candidate with an empty book, but only live tiers admit a deal', () => tsmCheck(`
   market(); assert(next(db.book)==nil)

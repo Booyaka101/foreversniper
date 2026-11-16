@@ -21,6 +21,9 @@ local DEFAULTS = {
     sweep     = 2,       -- fallback scheduler tick; ready events also wake paced searches
     batch     = true,    -- owner-approved rollout; failures retain individual fallback
     tsm       = true,    -- verified realm pricing bootstraps discovery; local history caps it
+    sales     = true,    -- fresh TSM sales data only tightens market/dump estimates
+    saleRate  = 0.05,    -- minimum regional posting success rate when known
+    saleShare = 0.10,    -- known exposure limited to this share of regional daily AH volume
     freshMins = 45,      -- market age: older price samples do not arm alerts
     overhang  = 500,     -- max competing units above the deal; more = slow flip (0 = off)
     armAfter  = 2,       -- require two learned observations before market alerts
@@ -873,8 +876,11 @@ function S.marketReference(itemID, now)
     local price, source
     if cfg.tsm ~= false and ForeverSniperTSM then price, source = ForeverSniperTSM.reference(itemID, now) end
     if median and (not price or median < price) then
-        return median, price and "local history (caps TSM)" or "local history"
+        source = price and "local history (caps TSM)" or "local history"
+        price = median
     end
+    local sales = S.salesPolicy(itemID, now)
+    if price and sales and sales.average and sales.average < price then price, source = sales.average, "TSM regional sale average (caps reference)" end
     return price, source
 end
 
@@ -974,12 +980,35 @@ function S.purchaseBudget()
     return math.max(0, math.min(math.floor(wallet * 0.95), wallet - reserve, cap))
 end
 
-function S.stockAllowance(itemID)
+function S.salesPolicy(itemID, now)
+    if cfg.sales == false or cfg.tsm == false then return nil, nil, nil, "sales checks disabled" end
+    if not ForeverSniperTSM or not ForeverSniperTSM.sales then return nil, nil, nil, "TSM sales unavailable" end
+    local data, unknown = ForeverSniperTSM.sales(itemID, now or time())
+    if not data then return nil, nil, nil, unknown end
+    local limit = data.daily and math.floor(data.daily * (cfg.saleShare or 0.10))
+    if data.rate and data.rate < (cfg.saleRate or 0.05) then return data, limit, "liquidity" end
+    if limit and limit < 1 then return data, limit, "liquidity" end
+    return data, limit
+end
+
+function S.salesSummary(itemID)
+    local data, limit, rejected, unknown = S.salesPolicy(itemID)
+    if not data then return "sales/liquidity unknown: " .. (unknown or "no verified data") end
+    return string.format("regional sales %s (%.1fh old): avg %s; rate %s; daily/AH %s; exposure cap %s%s (not a sale guarantee)",
+        data.region, (time() - data.stamp) / 3600,
+        data.average and fmtMoney(data.average) or "unknown",
+        data.rate and string.format("%.1f%%", data.rate * 100) or "unknown",
+        data.daily and string.format("%.3f", data.daily) or "unknown",
+        limit and tostring(limit) or "unknown", rejected and "; rejected: low liquidity" or "")
+end
+
+function S.stockAllowance(itemID, salesLimit)
     local cap = db.stockLimits[tostring(itemID)]
     if cap == nil then cap = cfg.maxStock end
     cap = num(cap)
     if not cap or cap < 0 or cap % 1 ~= 0 then return nil, "stockinfo" end
-    if cap == 0 then return math.huge end
+    if salesLimit then cap = math.min(cap == 0 and math.huge or cap, salesLimit) end
+    if cap == 0 and not salesLimit then return math.huge end
     local getter = C_Item and C_Item.GetItemCount or GetItemCount
     if not getter then return nil, "stockinfo" end
     local ok, held = pcall(getter, itemID, true)
@@ -1020,11 +1049,17 @@ local function commodityPositionTerms(itemID, line, units, cost, market, kind, s
     if not num(liveUnits) or not num(liveCost) then return nil, "invalid" end
     if (units and (not num(units) or units < liveUnits)) or (cost and (not num(cost) or cost < liveCost)) then return nil, "grown" end
     if liveUnits < 1 then return nil, "empty" end
+    kind = offerKind(itemID, line, kind) or (market ~= nil and "market" or "watch")
+    local sales, salesLimit, salesReason
+    if kind == "market" or kind == "dump" then
+        if policy then sales = policy.sales
+        else sales, salesLimit, salesReason = S.salesPolicy(itemID) end
+        if salesReason then return nil, salesReason end
+    end
     local allowance, stockReason
-    if policy then allowance = policy.allowance else allowance, stockReason = S.stockAllowance(itemID) end
+    if policy then allowance = policy.allowance else allowance, stockReason = S.stockAllowance(itemID, salesLimit) end
     if not allowance then return nil, stockReason end
     if liveUnits > allowance then return nil, "stocklimit" end
-    kind = offerKind(itemID, line, kind) or (market ~= nil and "market" or "watch")
     if kind == "market" or kind == "dump" then
         local info = infoOf(itemID)
         if info.quality == -1 or info.stackable == nil then
@@ -1047,6 +1082,7 @@ local function commodityPositionTerms(itemID, line, units, cost, market, kind, s
     if market ~= nil then
         market = num(market)
         if not market or market <= 0 then return nil, "invalid" end
+        if sales and sales.average then market = math.min(market, sales.average) end
         resale = kind ~= "vendor" and competing and math.min(market, competing - 1) or market
         profit = math.floor(liveUnits * resale * (kind == "vendor" and 1 or (1 - (cfg.cut or 0.05))) - liveCost - reserve)
         if not num(profit) then return nil, "invalid" end
@@ -1061,9 +1097,11 @@ function S.optimizedCommodityTerms(itemID, line, market, kind, snapshot)
     end
     line = num(line)
     if not line or line < 1 then return nil, "invalid" end
-    local allowance, stockReason = S.stockAllowance(itemID)
+    local sales, salesLimit, salesReason = S.salesPolicy(itemID)
+    if salesReason then return nil, salesReason end
+    local allowance, stockReason = S.stockAllowance(itemID, salesLimit)
     if not allowance then return nil, stockReason end
-    local policy = {allowance=allowance, budget=S.purchaseBudget()}
+    local policy = {allowance=allowance, budget=S.purchaseBudget(), sales=sales}
     -- Only fresh-history candidates reach this path. An empty order book never
     -- invents an exit price; the existing market reference remains the upper bound.
     return ForeverSniperDepthOptimizer.choose(snapshot.tiers, math.floor(line), function(ceiling, lot)
@@ -1170,7 +1208,7 @@ local popupRows = {}
 local popup
 local commodityActionState
 
-local function addPositionTooltip(units, cost, line, market, profit)
+local function addPositionTooltip(units, cost, line, market, profit, itemID)
     if market then GameTooltip:AddLine("exit reference: " .. fmtMoney(market), 0.7, 0.7, 0.7) end
     if units and cost then
         GameTooltip:AddLine(string.format("complete position: %d units, purchase %s (deposit reserve extra if relisting)",
@@ -1178,6 +1216,7 @@ local function addPositionTooltip(units, cost, line, market, profit)
     end
     if line then GameTooltip:AddLine("deal line: " .. fmtMoney(line), 0.3, 1, 0.45) end
     if profit then GameTooltip:AddLine("estimated position net: " .. fmtSignedMoney(profit), 0.3, 1, 0.45) end
+    if itemID then GameTooltip:AddLine(S.salesSummary(itemID), 0.7, 0.7, 0.7, true) end
 end
 
 local function renderPopup()
@@ -1478,7 +1517,7 @@ local function buildPopup()
             if not self.itemID then return end
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
             if self.link then GameTooltip:SetHyperlink(self.link) else GameTooltip:SetItemByID(self.itemID) end
-            addPositionTooltip(self.units, self.cost, self.line, self.market, self.positionProfit)
+            addPositionTooltip(self.units, self.cost, self.line, self.market, self.positionProfit, self.itemID)
             if self.buyHint then GameTooltip:AddLine(self.buyHint, 1, 0.82, 0.3, true) end
             GameTooltip:Show()
         end)
@@ -2112,6 +2151,7 @@ quickBuy = function(r)
             empty="no units remain under the approved line - nothing purchased.",
             budget="full deal plus deposit reserve exceeds the budget - no partial wall purchased.",
             stocklimit="full deal exceeds your per-item stock limit - nothing purchased.",
+            liquidity="fresh regional sales are below your liquidity policy - nothing purchased.",
             stockinfo="stock data is unavailable or stale - refresh /fsn sell before buying.",
             profit="full live deal does not clear the profit floor after fees - nothing purchased.",
             iteminfo="item eligibility is still loading - nothing purchased.",
@@ -2676,7 +2716,7 @@ local function buildFeed()
             if not self.itemID then return end
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
             if self.link then GameTooltip:SetHyperlink(self.link) else GameTooltip:SetItemByID(self.itemID) end
-            addPositionTooltip(self.units, self.cost, self.line, self.market2, self.positionProfit)
+            addPositionTooltip(self.units, self.cost, self.line, self.market2, self.positionProfit, self.itemID)
             local volatility = bookVolatility(self.itemID)
             if volatility then
                 GameTooltip:AddLine(string.format("observed price variation: %.0f%% (not expected profit)", volatility * 100), 0.7, 0.7, 0.7)
@@ -3815,8 +3855,11 @@ do
     function S.candidatePriority(candidate)
         local age = math.max(0, GetTime() - candidate.t)
         local profit = math.max(0, candidate.profit or 0)
+        local sales = S.salesPolicy(candidate.id)
+        local liquidity = sales and sales.rate and sales.daily
+            and math.min(2, sales.rate * math.log(1 + sales.daily)) or 0
         -- A bounded value boost cannot starve older candidates indefinitely.
-        return age + math.min(5, math.log(1 + profit / 10000))
+        return age + math.min(5, math.log(1 + profit / 10000)) + liquidity
     end
 end
 
@@ -3837,7 +3880,7 @@ local function sweepQuery()
     end
     if not canQuery() then return end
     if C_AuctionHouse == nil then return end
-    if (cfg.maxStock > 0 or next(db.stockLimits))
+    if (cfg.maxStock > 0 or next(db.stockLimits) or (cfg.sales == true and cfg.tsm ~= false))
         and (not S.sellingOwnedUpdated or GetTime() - S.sellingOwnedUpdated > 15)
         and (not S.stockRefreshAt or GetTime() - S.stockRefreshAt >= 5)
         and not (S.liveCandidate or S.autoSearch or S.watchSearch) then
@@ -5170,6 +5213,7 @@ local function onCommodityResults(itemID)
                 profit="net after competition and deposit below floor", invalid="invalid position data",
                 quality="quality below floor", stackable="not stackable", iteminfo="item info loading",
                 overhang="live competing stock over limit", stocklimit="per-item stock limit reached",
+                liquidity="fresh regional sales below liquidity policy",
                 stockinfo="stock data unavailable or stale"}
             recordGate("validation", reasons[rejected] or rejected, itemID)
             if c.refresh then markDealGone(itemID, math.huge) end
@@ -5428,6 +5472,7 @@ local HELP = {
     "|cffffd100tuning|r",
     "/fsn thresh 50        alert at %% of learned market (1-99)",
     "/fsn tsm [on|off|ID]  verified TSM reference status or per-item value",
+    "/fsn sales [ID]      inspect regional sales; on/off, rate/share PCT set policy",
     "/fsn sweep 3          fallback tick seconds (2-30); ready events wake paced searches",
     "/fsn batch on|off     experimental 100-key summaries; failures fall back to item checks",
     "/fsn max 250g         spend cap per Buy click",
@@ -5604,6 +5649,8 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             S.scansDone, db.stats.book or 0, db.stats.deals or 0)
         printf("market reference: %s. /fsn tsm <itemID> inspects an item's reference.",
             cfg.tsm == false and "TSM disabled; local history only" or ForeverSniperTSM.status(time()))
+        printf("sales checks: %s; known rate floor %.1f%%, exposure cap %.1f%% of regional daily/AH volume. Unknown data retains fallback; /fsn sales ITEMID inspects coverage.",
+            cfg.sales == false and "off" or "on", (cfg.saleRate or 0.05) * 100, (cfg.saleShare or 0.10) * 100)
         local ss = S.sweepStats or { sent = 0, rows = 0, yields = 0 }
         printf("monitor timing: completed-check revisit last/mean/max %.1f/%.1f/%.1fs (%d repeats); detected-to-validated last/max %.1f/%.1fs. Not listing age or a Buy guarantee.",
             ss.revisitLast or 0, (ss.revisitTotal or 0) / math.max(1, ss.revisitCount or 0), ss.revisitMax or 0,
@@ -5786,6 +5833,23 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             cfg.every = math.floor(v)
             printf("scanning every %ds while the AH is open.", cfg.every)
         else printf("usage: /fsn every 45  (seconds, 15-900)") end
+
+    elseif cmd == "sales" then
+        local option, value = rest:match("^(%S+)%s*(.-)$")
+        if option == "on" and value == "" then cfg.sales = true
+        elseif option == "off" and value == "" then cfg.sales = false
+        elseif option == "rate" or option == "share" then
+            local percent = tonumber(value)
+            if not percent or percent ~= percent or percent <= 0 or percent > 100 then printf("usage: /fsn sales rate|share <percent 0-100, exclusive of 0>") return end
+            if option == "rate" then cfg.saleRate = percent / 100 else cfg.saleShare = percent / 100 end
+        elseif option then
+            local id = tonumber(rest)
+            if not id or id <= 0 or id % 1 ~= 0 then printf("usage: /fsn sales [on|off|rate PCT|share PCT|itemID]") return end
+            printf("item %d: %s", id, S.salesSummary(id))
+            return
+        end
+        printf("sales checks %s: rate floor %.1f%%; exposure share %.1f%%. Unknown data is not proof of liquidity.",
+            cfg.sales == false and "off" or "on", (cfg.saleRate or 0.05) * 100, (cfg.saleShare or 0.10) * 100)
 
     elseif cmd == "tsm" then
         if rest == "on" then cfg.tsm = true

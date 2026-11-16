@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import test from 'node:test';
 import fengari from 'fengari';
 import { source, section, run } from './lua.mjs';
+import { fixture, provider, salesEnvironment, salesAPI } from './tsm-fixture.mjs';
 
 const optimizer = fs.readFileSync(new URL('../DepthOptimizer.lua', import.meta.url), 'utf8');
 
@@ -87,6 +88,98 @@ local function offer()
 end
 `;
 function check(body) { run(setup + production + prepared + body); }
+
+function salesCheck(body) {
+  run(setup + fixture.replace(/\bcalls\b/g, 'apiCalls') + salesEnvironment + provider
+    + production + prepared + salesAPI.replace(/\bcalls\b/g, 'apiCalls') + body);
+}
+
+test('fresh sale averages cap resale profit without raising lower live exits', () => {
+  salesCheck(`salesFeed(); values.dbregionsaleavg=50
+    local terms=S.optimizedCommodityTerms(123,10,100,'market',snapshot({{price=10,quantity=10},{price=100,quantity=1}}))
+    assert(terms and terms.resale==50 and terms.profit==355)`);
+  salesCheck(`salesFeed(); values.dbregionsaleavg=1000
+    local terms=S.optimizedCommodityTerms(123,10,100,'market',snapshot({{price=10,quantity=10},{price=80,quantity=1}}))
+    assert(terms and terms.resale==79)`);
+});
+
+test('known low sale rate or daily volume rejects market and dump positions', () => {
+  for (const kind of ['market', 'dump']) for (const change of [
+    'values.dbregionsalerate=0.01', 'values.dbregionsalerate=0',
+    'values.dbregionsoldperday=0', 'values.dbregionsoldperday=9.999',
+  ]) salesCheck(`salesFeed(); ${change}
+    local terms,reason=S.optimizedCommodityTerms(123,10,100,'${kind}',snapshot({{price=10,quantity=1}}))
+    assert(not terms and reason=='liquidity')`);
+});
+
+test('daily volume bounds inventory, owned auctions and pending exposure', () => salesCheck(`
+  salesFeed(); values.dbregionsoldperday=100
+  held=4; owned={{itemKey={itemID=123},quantity=2}}; db.stockPending['123']=1
+  local terms=S.optimizedCommodityTerms(123,10,100,'market',snapshot({{price=10,quantity=3}}))
+  assert(terms and terms.units==3)
+  held=5
+  local rejected,reason=S.optimizedCommodityTerms(123,10,100,'market',snapshot({{price=10,quantity=3}}))
+  assert(not rejected and reason=='stocklimit')
+`));
+
+test('sales caps select complete prefixes and cannot loosen manual stock caps', () => salesCheck(`
+  salesFeed(); values.dbregionsoldperday=50
+  local wall=snapshot({{price=10,quantity=4},{price=20,quantity=4},{price=100,quantity=1}})
+  local terms=S.optimizedCommodityTerms(123,20,100,'market',wall)
+  assert(terms and terms.units==4 and terms.line==10)
+  db.stockLimits['123']=3
+  local rejected,reason=S.optimizedCommodityTerms(123,20,100,'market',wall)
+  assert(not rejected and reason=='stocklimit')
+`));
+
+test('volume caps require fresh readable stock with the manual cap off', () => {
+  for (const action of ['held=nil', 'S.sellingOwnedUpdated=nil', 'now=now+21']) salesCheck(`
+    salesFeed(); ${action}
+    local terms,reason=S.optimizedCommodityTerms(123,10,100,'market',snapshot({{price=10,quantity=1}}))
+    assert(not terms and reason=='stockinfo')
+  `);
+});
+
+test('unknown, stale or disabled sales preserve existing fallback', () => {
+  for (const action of ['', 'salesFeed(now-172801)', 'cfg.sales=false; salesFeed()', 'cfg.tsm=false; salesFeed()']) {
+    salesCheck(`${action}; values.dbregionsalerate=0
+      local terms=S.optimizedCommodityTerms(123,10,100,'market',snapshot({{price=10,quantity=10}}))
+      assert(terms and S.salesSummary(123):find('unknown'))`);
+  }
+});
+
+test('vendor and absolute watch purchases are exempt from market sales policy', () => salesCheck(`
+  salesFeed(); values.dbregionsalerate=0; values.dbregionsoldperday=0
+  local wall=snapshot({{price=10,quantity=10}})
+  assert(S.optimizedCommodityTerms(123,10,100,'vendor',wall))
+  assert(S.optimizedCommodityTerms(123,10,nil,'watch',wall))
+`));
+
+test('guarded Buy rechecks liquidity instead of trusting displayed offers', () => salesCheck(`
+  salesFeed(); values.dbregionsalerate=0
+  offer(); assert(calls.start==0 and not S.snipePending)
+`));
+
+test('guarded Buy rechecks sale-average profit and total exposure', () => {
+  for (const change of ['values.dbregionsaleavg=5', 'values.dbregionsoldperday=50']) {
+    salesCheck(`salesFeed(); ${change}
+      offer(); assert(calls.start==0 and not S.snipePending)`);
+  }
+});
+
+test('quote confirmation rechecks sales settings and newly held stock', () => {
+  for (const change of ['cfg.saleRate=0.30', 'cfg.saleShare=0.005', 'held=95']) {
+    salesCheck(`salesFeed(); offer(); assert(calls.start==1)
+      ${change}; handlers.COMMODITY_PRICE_UPDATED(10,100)
+      assert(calls.confirm==0 and not S.snipePending)`);
+  }
+});
+
+test('the exact sale-rate floor and sales exposure limit permit guarded confirmation', () => salesCheck(`
+  salesFeed(); values.dbregionsalerate=0.05; values.dbregionsoldperday=100
+  offer(); assert(calls.start==1)
+  handlers.COMMODITY_PRICE_UPDATED(10,100); assert(calls.confirm==1)
+`));
 
 test('an in-flight batch summary blocks buying even with a valid complete snapshot', () => check(`
   S.batchSearch={t=now}
