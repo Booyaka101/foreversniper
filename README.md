@@ -159,6 +159,12 @@ itself. Mature, fresh local history also caps the reference. These are conservat
 policy limits, not a guarantee of demand, sale price, or profit. Regional and
 alternate-realm prices do not bootstrap candidates.
 
+Forever market identity follows TSM's ruleset mapping (`Normal`, `PvP`,
+`Roleplay`, `Roleplay PvP` or `Hardcore`) plus faction, not the physical realm
+name. Missing or unreadable ruleset APIs fail closed rather than guessing Normal.
+Provider status identifies the selected scope and separately reports stale,
+future-dated, unmatched or unobserved timestamps.
+
 Prices come from `TSM_API.GetCustomPriceValue`. Because that API exposes no data
 timestamp, a read-only secure hook observes AppHelper's realm/faction metadata
 while it loads. It does not execute the data payload, replace TSM functions, or
