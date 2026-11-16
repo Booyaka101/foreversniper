@@ -118,6 +118,36 @@ automatically clear these reservations.
 
 ## Purchase safeguards
 
+### Candidate selection and history
+
+The default discovery ceiling is now **70% of the fresh local reference**, not
+50%. An upgrade retunes exactly the former 50% setting once, records it in
+`previousThreshold`, and prints how to restore it: `/fsn thresh 50`. Other saved
+thresholds are preserved, and subsequent choices survive reloads. This is a
+candidate-selection policy, not a promise that a 30% discount is profitable.
+Complete live tiers still determine the position, estimated exit and net profit.
+
+History retains at most 30 observations, spaced at least 90 seconds apart.
+Repeated sightings within that interval can lower its price but cannot raise it
+or renew its timestamp. Legacy dense samples are also grouped conservatively when
+read. This prevents scan frequency from dominating the reference; it does not
+create missing history, confirm demand, or preserve old prices indefinitely.
+The default two-observation warm-up now needs at least 90 seconds of evidence.
+The 45-minute freshness limit still applies.
+
+### Buying a displayed offer
+
+Readiness events update existing Buy buttons immediately instead of waiting for
+the full feed repaint. A live-validated focused offer receives one five-second
+routine-search pause starting when the scanner can query again. Discovery then
+resumes, and in-flight result paging is never abandoned. Other addons and the
+server can still make the shared AH busy during that window.
+
+Buy labels distinguish `BUSY` (live AH readiness), `N/A` (readiness unavailable),
+`QUOTE`, `RESULT`, and `LOCK` (unknown purchase outcome). `/fsn status` reports
+the focused offer's current action and reason. A disappearing offer can genuinely
+have sold or become ineligible; the pause is not a reservation of its auctions.
+
 A hardware Buy press approves one complete commodity position. Stock and budget
 are checked before starting and again when the live quote arrives. The existing
 price, age, ownership, enable/disable, and unknown-outcome locks remain in place.

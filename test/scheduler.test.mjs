@@ -101,6 +101,43 @@ end
 `;
 function check(code) { run(setup + production + helpers + code); }
 
+test('a focused validated offer gets one five-second ready window, then discovery resumes', () => check(`
+  focus={id=123,line=10,market=100}; S.dealFocus={deal=focus}
+  sweepQuery(); assert(#queries==0 and S.dealFocus.buyWindowUntil==105)
+  now=104.9; sweepQuery(); assert(#queries==0)
+  now=105; sweepQuery(); assert(#queries==1)
+  complete(); now=106; sweepQuery(); assert(#queries==2)
+  assert(S.dealFocus.buyWindowUntil==105)
+`));
+
+test('the focused click window begins at live readiness, not while the AH is busy', () => check(`
+  focus={id=123,line=10,market=100}; S.dealFocus={deal=focus}
+  ready=false; sweepQuery(); assert(not S.dealFocus.buyWindowUntil)
+  now=110; ready=true; sweepQuery()
+  assert(S.dealFocus.buyWindowUntil==115 and #queries==0)
+`));
+
+test('focused click windows never interrupt owned result pagination', () => check(`
+  focus={id=123,line=10,market=100}; S.dealFocus={deal=focus}
+  S.liveCandidate={id=456,t=now,needsPage=true}
+  sweepQuery(); assert(count("page",456)==1)
+  assert(not S.dealFocus.buyWindowUntil)
+`));
+
+test('ready events refresh purchase controls before scheduling another search', () => check(`
+  local refreshed=0
+  function S.refreshPurchasePresentation()
+    refreshed=refreshed+1
+    assert(not S.sweepWake)
+  end
+  S.sweepTicker={}
+  handlers.AUCTION_HOUSE_THROTTLED_SYSTEM_READY()
+  assert(refreshed==1 and S.sweepWake)
+  S.sweepWake=nil
+  handlers.AUCTION_HOUSE_THROTTLED_MESSAGE_RESPONSE_RECEIVED()
+  assert(refreshed==2 and S.sweepWake)
+`));
+
 const batchSetup = `
   cfg.batch=true; cfg.minUnit=1; cfg.freshMins=45; cfg.armAfter=2
   local resultRows, full, submit = {}, true, nil
@@ -222,6 +259,9 @@ test('manual watches and displayed deal refreshes keep priority over batches', (
   watch=456; slots(1)
   assert(count("target",456)==1 and count("batch")==0)
   focus={id=999,line=10,market=100}; S.dealFocus={deal=focus}
+  complete(); now=now+1; sweepQuery()
+  assert(count("target",999)==0 and S.dealFocus.buyWindowUntil==now+5)
+  now=now+5
   slots(2)
   assert(count("target",999)==1 and count("batch")==0)
 `));
@@ -308,6 +348,8 @@ test('discovery receives every second slot with automatic targets available', ()
 test('a displayed deal cannot stop discovery and only takes bounded refresh slots', () => check(`
   focus={id=999,line=10,market=100,kind="market"}
   S.dealFocus={deal=focus}
+  sweepQuery(); assert(#queries==0 and S.dealFocus.buyWindowUntil==105)
+  now=105
   slots(40)
   assert(count("browse")==20)
   assert(count("target",999)>0 and count("target",999)<=3)

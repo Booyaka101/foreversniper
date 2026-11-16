@@ -158,3 +158,58 @@ stock/reserve and server-only accounting coverage. All 83 tests pass locally;
 static checker reports zero errors/warnings; strict load/lifecycle simulation is
 clean with known unknown-event notices. Extended AH simulation is not a passing
 gate and is not claimed here. No live deployment, release or saved-data write.
+## Deal selection and Buy readiness repair, 2026-11-16
+
+Scope: owner reports no deals overnight, then two offers stuck on Wait before
+disappearing. Thirty-minute bounded pass: research listing-value methods, trace
+candidate admission and history, inspect readiness/UI ordering, add executable
+regressions, run local gates and exact-head CI. No deployment or release.
+
+Research completed before edits:
+
+- TSM's official market-value description separates per-snapshot outlier handling
+  from time-aggregated history. We do not have its realm/region dataset and do not
+  claim our floor median is DBMarket:
+  https://support.tradeskillmaster.com/en_US/custom-strings/how-is-auctiondb-market-value-calculated
+- TSM explicitly says DBMarket describes listings, not what an item will sell for:
+  https://support.tradeskillmaster.com/en_US/custom-strings/which-price-sources-can-i-use-and-what-do-they-mean
+- Read the installed Bilis `Sniper.lua`, lines 848-977: it evaluates commodity
+  tiers with capital, stock, gap and net-profit policies. Rejected its invented
+  next-price fallback when there is no higher tier. Our existing optimiser keeps
+  the lower of a real next tier minus one copper and the supplied reference, or
+  the reference alone when no higher listing exists. Neither establishes demand.
+- Reused prior verified live-readiness API findings. No request-rate increase.
+
+Production-function probes on the deployed baseline showed a 35%-discount lot
+could pass existing full-tier risk checks at 2g99s70c estimated net, yet the 50%
+discovery prefilter never queued it. Repeated sightings could replace all 30
+history observations in five minutes at ten-second intervals. These are synthetic
+counterexamples, not measured missed trades on the live AH. The saved account
+file was from the prior evening while WoW was running; it cannot prove the live
+cause. No real SavedVariables writes were made.
+
+Implementation: once-only 50-to-70 default retune with prior value retained and
+an in-game restoration message; preserve other thresholds. Seventy percent is a
+conservative policy choice, not an empirically optimal trading rule. Time-spaced
+history retains conservative interval minima and de-clusters legacy samples;
+future/stale samples and own-relist exclusions remain. Removed the unused legacy
+median function and inlined the single sample-count call to remain within Lua's
+200-local chunk limit after adding the shared history helper.
+
+Wait finding: feed controls were refreshed on a multi-second schedule while ready
+events could schedule a new search after 0.01s. Immediate button updates plus one
+bounded five-second focused-offer routine-search window address that race without
+bypassing live readiness. Quote/outcome/unknown-lock labels are distinct. In-flight
+pages finish first, and routine discovery resumes after the single window.
+Live server contention or another buyer can still invalidate an offer.
+
+Regression coverage includes summary-to-live-tier-to-admission with production
+functions, strict-threshold restoration, live depth/fees/deposit/budget/stock/
+overhang rejection, scan-frequency independence, legacy de-clustering, sustained
+declines/expiry, migration, ready-event UI ordering, one-shot click windows and
+uninterrupted paging. Existing purchase and outcome tests remain intact.
+
+Local gates: all 101 tests pass; wow-secret-lint reports zero errors and warnings;
+strict load/lifecycle simulation passes; git diff --check passes. Extended AH
+simulation is not claimed as a gate because of the previously recorded baseline
+simulator failures. Live-game confirmation remains pending after deployment.
