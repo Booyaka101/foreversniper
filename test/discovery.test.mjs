@@ -89,6 +89,16 @@ test('TSM admits a first-sighting candidate with an empty book, but only live ti
   assert(#admitted==1 and admitted[1].sweep.verified and admitted[1].sweep.profit==29970)
 `));
 
+test('physical Forever realms find fresh Normal faction feeds on their first sighting', () => tsmCheck(`
+  WOW_PROJECT_ID=99; WOW_PROJECT_CAMELOT=99; realm='A physical Forever realm'
+  Enum={GameRule={HardcoreRuleset=1,RPRuleset=2,PvPRuleset=3}}
+  C_GameRules={IsGameRuleActive=function() return false end}
+  market(); observe(6500,20)
+  assert(S.liveCandidates[123] and #admitted==0)
+  complete(6500,10,10000,10)
+  assert(#admitted==1 and admitted[1].sweep.verified)
+`));
+
 test('TSM bootstrap still enforces complete results, net profit, stock, budget and overhang', () => {
   for (const change of [
     'C_AuctionHouse.HasFullCommoditySearchResults=function() return false end',

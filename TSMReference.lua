@@ -16,6 +16,24 @@ end
 local function realmKey()
     if type(GetRealmName) ~= "function" or type(UnitFactionGroup) ~= "function" then return end
     local realm, faction = GetRealmName(), UnitFactionGroup("player")
+    if WOW_PROJECT_CAMELOT and WOW_PROJECT_ID == WOW_PROJECT_CAMELOT then
+        -- TSM's Forever feeds are ruleset markets, not physical realm names.
+        -- Match its SessionInfo mapping exactly; missing rules cannot mean Normal.
+        local rules = Enum and Enum.GameRule
+        if not rules or not C_GameRules or type(C_GameRules.IsGameRuleActive) ~= "function" then return end
+        local function active(rule)
+            if rule == nil then return end
+            local ok, value = pcall(C_GameRules.IsGameRuleActive, rule)
+            if ok and type(value) == "boolean" then return value end
+        end
+        local hardcore, rp, pvp = active(rules.HardcoreRuleset), active(rules.RPRuleset), active(rules.PvPRuleset)
+        if hardcore == nil or rp == nil or pvp == nil then return end
+        if hardcore then realm = "Hardcore"
+        elseif rp and pvp then realm = "Roleplay PvP"
+        elseif rp then realm = "Roleplay"
+        elseif pvp then realm = "PvP"
+        else realm = "Normal" end
+    end
     if type(realm) == "string" and type(faction) == "string" then
         return string.lower(realm .. "-" .. faction)
     end
@@ -52,15 +70,30 @@ function provider.status(now)
         return "TSM price API unavailable"
     end
     if not observing then return "TSM data timestamp observer unavailable" end
-    local stamps = timestamps[realmKey()]
+    local key = realmKey()
+    if not key then return "TSM market identity unavailable; waiting for realm, faction and ruleset APIs" end
+    local stamps = timestamps[key]
+    local newest, future
     for i = 1, 2 do
         local source = sources[i]
         local stamp = stamps and number(stamps[source.key])
         if stamp and stamp <= now and now - stamp <= source.age then
-            return "TSM realm data verified; newest usable market/recent feed within 12 hours"
+            return string.format("TSM realm data verified for %s (%s feed %.1f hours old)", key, source.key, (now - stamp) / 3600)
         end
+        if stamp and stamp > now then future = true
+        elseif stamp then newest = math.max(newest or 0, stamp) end
     end
-    return "TSM realm data missing, stale, future-dated or loaded before observer; using local history"
+    if newest then
+        return string.format("TSM market/recent data stale for %s (newest %.1f hours old; limit 12); using local history", key, (now - newest) / 3600)
+    end
+    if future then return "TSM market/recent timestamp is future-dated for " .. key .. "; using local history" end
+    local observed = {}
+    for scope in pairs(timestamps) do observed[#observed + 1] = scope end
+    table.sort(observed)
+    if #observed > 0 then
+        return "TSM market/recent data missing for " .. key .. "; observed " .. table.concat(observed, ", ") .. "; using local history"
+    end
+    return "TSM market/recent timestamps missing for " .. key .. "; AppHelper may have loaded before observer; using local history"
 end
 
 function provider.reference(itemID, now)

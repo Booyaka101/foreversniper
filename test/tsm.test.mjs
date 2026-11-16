@@ -75,3 +75,57 @@ test('missing observer support leaves the provider optional and unavailable', ()
   assert(ForeverSniperTSM.reference(123,1000000)==nil)
   assert(ForeverSniperTSM.status(1000000):find('observer unavailable'))
 `));
+
+const forever = `
+WOW_PROJECT_ID=99; WOW_PROJECT_CAMELOT=99
+Enum={GameRule={HardcoreRuleset=1,RPRuleset=2,PvPRuleset=3}}
+local activeRules={false,false,false}
+C_GameRules={IsGameRuleActive=function(rule) return activeRules[rule] end}
+realm='A physical Forever realm'
+`;
+
+test('Forever resolves physical realms to the same ruleset markets as TSM', () => {
+  for (const [hardcore, rp, pvp, market] of [
+    [false,false,false,'Normal'], [false,false,true,'PvP'],
+    [false,true,false,'Roleplay'], [false,true,true,'Roleplay PvP'],
+    [true,false,false,'Hardcore'], [true,true,true,'Hardcore'],
+  ]) check(`${forever}
+    activeRules={${hardcore},${rp},${pvp}}
+    market(now,'${market}-Alliance')
+    assert(ForeverSniperTSM.reference(123,now)==10000)
+    assert(ForeverSniperTSM.status(now):find('${market.toLowerCase()}-alliance',1,true))
+    faction='Horde'; assert(ForeverSniperTSM.reference(123,now)==nil)
+  `);
+});
+
+test('Forever never guesses Normal from missing, throwing or unreadable rules', () => {
+  for (const failure of [
+    'C_GameRules=nil', 'Enum=nil', 'Enum.GameRule.PvPRuleset=nil',
+    'C_GameRules.IsGameRuleActive=function() error("not ready") end',
+    'C_GameRules.IsGameRuleActive=function() return 0 end',
+  ]) check(`${forever} market(); ${failure}
+    assert(ForeverSniperTSM.reference(123,now)==nil and calls==0)
+    assert(ForeverSniperTSM.status(now):find('identity unavailable'))
+  `);
+});
+
+test('ruleset changes invalidate scope-specific cached prices and cannot borrow Normal data', () => check(`
+  ${forever} market(); assert(ForeverSniperTSM.reference(123,now)==10000)
+  activeRules[3]=true
+  assert(ForeverSniperTSM.reference(123,now)==nil)
+  assert(ForeverSniperTSM.status(now):find('missing for pvp-alliance',1,true))
+`));
+
+test('non-Forever clients retain physical realm matching even if ruleset APIs exist', () => check(`
+  ${forever} WOW_PROJECT_ID=1
+  market(); assert(ForeverSniperTSM.reference(123,now)==nil)
+  market(now,realm..'-Alliance'); assert(ForeverSniperTSM.reference(123,now)==10000)
+`));
+
+test('status distinguishes stale, future, mismatched and unobserved data', () => {
+  check(`market(now-43201); assert(ForeverSniperTSM.status(now):find('stale for normal-alliance',1,true))`);
+  check(`market(now+1); assert(ForeverSniperTSM.status(now):find('future-dated',1,true))`);
+  check(`market(now,'Other-Horde'); local status=ForeverSniperTSM.status(now)
+    assert(status:find('missing for normal-alliance',1,true) and status:find('observed other-horde',1,true))`);
+  check(`assert(ForeverSniperTSM.status(now):find('AppHelper may have loaded before observer',1,true))`);
+});

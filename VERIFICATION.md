@@ -289,3 +289,31 @@ Local gates: all 123 tests pass, including all three Lua chunks compiling; secre
 lint reports zero errors/warnings; strict load/lifecycle simulation passes. Exact
 PR-head and merged-main CI must both pass before deployment. Live timing and the
 installed AppHelper observer still require confirmation after `/reload`.
+## Forever TSM market identity repair, 2026-11-16
+
+Reported live symptom after PR #7: TSM API present but the generic timestamp
+fallback warning appeared. Installed market/recent feeds were only about 48
+minutes old at inspection, not outside the 12-hour policy. Read-only inspection
+identified a concrete compatibility defect: TSM LibTSMWoW/Source/Util/SessionInfo.lua
+lines 13-35 replaces physical realm names with Forever ruleset markets, whereas
+our resolver joined raw GetRealmName() with faction. Exact live raw realm and
+observer delivery were not available from the screenshot, so a missed loader
+callback is not ruled out solely by this diagnosis.
+
+Repair matches TSM's ruleset mapping on WOW_PROJECT_CAMELOT: Hardcore first,
+then Roleplay PvP, Roleplay, PvP or Normal, with the existing faction suffix.
+Missing enums/APIs, throwing calls and non-boolean rules never default to Normal.
+Other clients keep physical realm matching. Status now identifies the expected
+market and distinguishes missing identity, unmatched/never-observed data, stale
+feeds and future timestamps; fresh status includes scope, source and age.
+No freshness limit, price reference policy or purchase safeguard changes.
+
+Regressions reproduce the old physical-realm/Normal-feed mismatch and exercise
+all ruleset combinations, faction and scope cache isolation, unreadable APIs,
+non-Forever behavior, differentiated diagnostics and first-sighting discovery
+through complete live-tier admission. The missing-observer fallback remains
+intentional; live confirmation after reload is required, not claimed by tests.
+
+Local validation: all 129 tests pass; secret lint reports zero errors/warnings;
+strict load/lifecycle simulation passes. Deployment requires successful exact
+PR-head and merged-main CI, a runtime backup and unchanged SavedVariables hashes.
