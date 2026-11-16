@@ -69,7 +69,7 @@ local function on(event,fn) handlers[event]=fn end
 local onOptional=on
 local function snapshot(tiers)
     rows={}
-    for _,tier in ipairs(tiers) do rows[#rows+1]={unitPrice=tier.price,quantity=tier.quantity,numOwnerItems=0} end
+    for _,tier in ipairs(tiers) do rows[#rows+1]={itemID=123,unitPrice=tier.price,quantity=tier.quantity,numOwnerItems=0} end
     S.commoditySnapshots[123]={tiers=tiers,t=now}
     return S.commoditySnapshots[123]
 end
@@ -189,6 +189,58 @@ test('an in-flight batch summary blocks buying even with a valid complete snapsh
   S.batchSearch=nil
   offer()
   assert(calls.start==1)
+`));
+
+test('a contradicted cheap offer cannot be retried from cached tiers before a fresh result', () => check(`
+  local function refreshDealPresentation() end
+  ${section('markDealGone = function(', '\nquickBuy = function')}
+  ${section('function S.offerAvailable(', '\nfunction S.dismissDeal(')}
+  ${section('local function prepareCommodityDeal(', '\nlocal function offerKind(')
+    .replace('local function prepareCommodityDeal(', 'prepareCommodityDeal = function(')}
+  local deal={id=123,line=25,units=13,cost=325,market=300,kind='market'}
+  S.deals={deal}
+  snapshot({{price=25,quantity=13},{price=300,quantity=1}})
+  local row={itemID=123,line=25,units=13,cost=325,market2=300,kind='market',offer=deal,t=100}
+  quickBuy(row); assert(calls.start==1)
+  handlers.COMMODITY_PRICE_UPDATED(159,2070)
+  assert(calls.confirm==0 and deal.gone and not S.commoditySnapshots[123])
+  assert(S.liveCandidates[123] and S.liveCandidates[123].line==25)
+  quickBuy(row); assert(calls.start==1)
+  local terms,reason=commodityOfferTerms(123,25,13,325,300,'market')
+  assert(not terms and reason=='loading','API cache alone must not restore Buy readiness')
+  S.liveCandidate=S.liveCandidates[123]; S.liveCandidates[123]=nil
+  rows={{unitPrice=155,quantity=100,numOwnerItems=0}}
+  handlers.COMMODITY_SEARCH_RESULTS_UPDATED(123)
+  assert(S.commoditySnapshots[123] and deal.gone and not captured)
+`));
+
+test('commodity tier prices preserve the observed Forever item identity and copper units', () => check(`
+  WOW_PROJECT_ID=99; WOW_PROJECT_CAMELOT=99
+  rows={{itemID=2772,unitPrice=296,quantity=173,numOwnerItems=0}}
+  local result=readCommodityTiers(2772)
+  assert(result and result.tiers[1].price==296 and result.tiers[1].quantity==173)
+`));
+
+test('mismatched or missing Forever tier identity cannot authorize Buy or fall back to cached tiers', () => {
+  for (const id of ['456', '123.5', '"123"', 'nil']) check(`
+    WOW_PROJECT_ID=99; WOW_PROJECT_CAMELOT=99
+    snapshot({{price=10,quantity=10}}); rows[1].itemID=${id}
+    local result,reason,identity=readCommodityTiers(123)
+    assert(not result and reason=='unreadable' and identity:find('requested item 123',1,true))
+    result,reason=commodityTiersForBuy(123)
+    assert(not result and reason=='unreadable','wrong-item results must not reuse the old snapshot')
+    quickBuy({itemID=123,line=10,units=10,cost=100,market2=100,kind='market',t=100})
+    assert(calls.start==0 and not S.snipePending)
+    handlers.COMMODITY_SEARCH_RESULTS_UPDATED(123)
+    assert(not S.commoditySnapshots[123])
+  `);
+});
+
+test('one wrong-item tier discards the whole wall instead of selecting a cheap partial prefix', () => check(`
+  snapshot({{price=2,quantity=21},{price=274,quantity=100}})
+  rows[2].itemID=456
+  local result,reason=readCommodityTiers(123)
+  assert(not result and reason=='unreadable')
 `));
 
 const commands = section('    elseif cmd == "keep" then', '\n    elseif cmd == "thresh" then')

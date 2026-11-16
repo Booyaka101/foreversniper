@@ -33,6 +33,7 @@ local function requestItemLoad() end
 local function offerKind(_,_,kind) return kind end
 local function depositPerUnit() return 2 end
 local function printf() end
+local function diagnostic() end
 local function fmtMoney(v) return tostring(v) end
 local function isNewListing() return true end
 local function push(list,cap,v) list[#list+1]=v end
@@ -73,8 +74,8 @@ local function observe(price,qty)
   processBrowseRows({{itemKey={itemID=123},minPrice=price,totalQuantity=qty}},false,'batch')
 end
 local function complete(low,qty,high,competition)
-  rows={{unitPrice=low,quantity=qty,numOwnerItems=0}}
-  if high then rows[#rows+1]={unitPrice=high,quantity=competition,numOwnerItems=0} end
+  rows={{itemID=123,unitPrice=low,quantity=qty,numOwnerItems=0}}
+  if high then rows[#rows+1]={itemID=123,unitPrice=high,quantity=competition,numOwnerItems=0} end
   handlers.COMMODITY_SEARCH_RESULTS_UPDATED(123)
 end
 `;
@@ -97,6 +98,14 @@ test('sales data reaches live-tier admission and conservative profit estimates',
   observe(6000,10); assert(S.liveCandidates[123] and #admitted==0)
   complete(6000,10,10000,10)
   assert(#admitted==1 and admitted[1].sweep.verified and admitted[1].sweep.profit==25480)
+`));
+
+test('wrong-item cheap API tiers cannot admit deals or teach automatic price history', () => salesCheck(`
+  market(); S.autoSearch={id=123,t=now}
+  S.liveCandidate={id=123,line=7000,market=10000,kind='market',t=now}
+  rows={{itemID=456,unitPrice=2,quantity=21,numOwnerItems=0}}
+  handlers.COMMODITY_SEARCH_RESULTS_UPDATED(123)
+  assert(#admitted==0 and not S.commoditySnapshots[123] and not db.book[123])
 `));
 
 test('sales commands inspect coverage and validate policy options', () => salesCheck(`

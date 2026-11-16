@@ -387,3 +387,57 @@ errors/warnings and strict load/lifecycle simulation is clean. The actual live
 cause remains unresolved pending the next quote's evidence; this is a diagnostic
 repair, not a claim that purchases are fixed. The owner was told this diagnostic
 update would be deployed only after its exact-commit CI passes.
+
+### Contradicted quote invalidation
+
+The deployed diagnostic build (`0d97cd9`, passing CI run `43891207857`) showed
+item 2592 x13 approved at 25 copper each / 325 total, but quoted at 159 copper
+each / 2070-2079 total within 0.22-0.35 seconds. A subsequent native browse
+screenshot showed Wool Cloth at 155 copper each. This establishes an obsolete
+cheap offer relative to the purchase quote and native browse, not a timeout or
+sales-policy rejection. It does not establish why the initial search had the
+cheap tiers (removed auctions, delayed cache updates or another source).
+
+Confirmed retry defect: above-cap quotes were cancelled but left their offers
+and cached complete tiers available for another click. Price-contradicted quotes
+now discard that item's snapshot, mark its offers gone and queue normal paced
+revalidation at the original ceiling/exit caps. No price, budget or policy ceiling
+is raised. Non-price refusals keep existing behavior. Unknown outcomes stay locked.
+
+Local validation: 157 tests passed, lint zero errors/warnings, strict load/lifecycle
+simulation clean. Production-path regression reproduces the reported 13 x25 /2070
+case, blocks a second click and cache-only readiness, then feeds a fresh 155-copper
+result and verifies the original offer remains rejected. Additional tests cover
+independent unit/total overruns, item-local invalidation, unchanged refresh caps,
+late quotes and non-price refusals. Deployment remains gated on exact-commit CI;
+the original search/quote divergence still requires live observation.
+
+### Live tier identity validation
+
+The owner reported the same mismatch on item 2772: 21 units approved at 2 copper
+each /42 total, quoted at 274 copper each /5754 total in 0.25 seconds. Native and
+TSM screens showed roughly 296-298 copper, not 2 copper. With our scanner disabled
+and the native commodity panel refreshed, a raw API dump returned `itemID=2772`,
+`unitPrice=296`, `quantity=173`, `numOwnerItems=0`, `auctionID=123030736`, matching
+the native price tier. Earlier active-scanner dumps were empty; these do not
+establish an API signature error. The standard two-argument getter works.
+
+Found a concrete missing check: the production tier reader used requested item ID
+to label rows but did not verify each returned row's item ID. On Forever the
+verified layout now requires every tier's `itemID` to match the request. Other
+clients reject mismatches when a row identity is supplied. A wrong, malformed or
+missing Forever identity rejects the entire wall, cannot fall back to a cached
+snapshot, and cannot admit a deal or teach automatic price history. Result-event
+diagnostics retain requested/returned IDs. No price scaling is introduced.
+
+This closes an attribution gap but a wrong-item row has not yet been captured
+during the failing live scan. It is not proof of the incident's root cause.
+The quote-contradiction invalidation above is retained so a rejected stale bargain
+cannot remain repeatedly buyable from the same snapshot.
+
+Final local checks for the combined repair: 161 tests pass; secret lint zero
+errors/warnings; strict load/lifecycle simulation clean. Regressions preserve the
+actual 296-copper/173-unit raw values, reject wrong/missing/malformed identities
+and mixed-item walls, block Buy and cached fallback, and prevent automatic history
+or live admission from a wrong-item cheap result. The initial source of cheap
+tiers remains an unresolved live question. No purchase guard has been weakened.

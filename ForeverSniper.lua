@@ -899,6 +899,14 @@ do
         for i = 1, count do
             local row = ah.GetCommoditySearchResultInfo(itemID, i)
             if type(row) ~= "table" then return nil, "unreadable" end
+            -- Forever returns an item ID on every tier. Never attribute a
+            -- shared/stale API result to the item requested by this search.
+            local returnedID = num(row.itemID)
+            local forever = WOW_PROJECT_CAMELOT and WOW_PROJECT_ID == WOW_PROJECT_CAMELOT
+            if (forever or row.itemID ~= nil) and returnedID ~= itemID then
+                return nil, "unreadable", string.format("requested item %d; tier %d returned item %s",
+                    itemID, i, tostring(returnedID))
+            end
             local price, quantity = num(row.unitPrice), num(row.quantity)
             local owned = row.numOwnerItems == nil and 0 or num(row.numOwnerItems)
             if not price or price <= 0 or price % 1 ~= 0 or not quantity or quantity < 0 or quantity % 1 ~= 0
@@ -915,9 +923,9 @@ do
         if not (ah and ah.HasFullCommoditySearchResults and ah.GetNumCommoditySearchResults) then return nil, "loading" end
         local okFull, full = pcall(ah.HasFullCommoditySearchResults, itemID)
         if not okFull or full ~= true then return nil, "loading" end
-        local ok, snapshot, reason = pcall(readCompletedTiers, ah, itemID)
+        local ok, snapshot, reason, identity = pcall(readCompletedTiers, ah, itemID)
         if not ok then return nil, "unreadable" end
-        return snapshot, reason
+        return snapshot, reason, identity
     end
 end
 
@@ -5136,7 +5144,8 @@ local function onCommodityResults(itemID)
     itemID = num(itemID)
     if not itemID or itemID < 1 or itemID % 1 ~= 0 then return end
     S.wakeSweep()
-    local snapshot, reason = readCommodityTiers(itemID)
+    local snapshot, reason, identity = readCommodityTiers(itemID)
+    if identity then diagnostic("commodity result identity", identity) end
     if snapshot then
         S.commoditySnapshots[itemID] = snapshot
         S.noteRevisit(itemID)
@@ -5259,6 +5268,14 @@ on("COMMODITY_PRICE_UPDATED", function(unitPrice, totalPrice)
             local detail = string.format("%s; item %d x%d; quote unit/total %s/%s copper; caps unit/total/budget %.0f/%.0f/%.0f copper; age %.2fs",
                 rejected, sp.deal.id, sp.units, tostring(u), tostring(t), ceiling, sp.tolTotal, budget, age)
             retirePurchase("quote refused: " .. rejected)
+            if rejected == "unit price above approved ceiling" or rejected == "total above approved purchase cost" then
+                -- The quote contradicts these tiers. Never offer the same cached
+                -- bargain again without a new completed search.
+                S.commoditySnapshots[sp.deal.id] = nil
+                markDealGone(sp.deal.id, math.huge)
+                prepareCommodityDeal(sp.deal.id, sp.deal.link, sp.maxUnit, sp.market, sp.kind)
+                S.wakeSweep()
+            end
             recordGate("purchase", "quote rejected: " .. rejected, sp.deal.id)
             diagnostic("purchase quote", detail)
             printf("quote refused: %s; nothing confirmed. /fsn diagnostics for quote details.", detail)
