@@ -14,6 +14,7 @@ local watchByID = {}
 local processed = {}
 local function num(value) return tonumber(value) end
 local function freshMedian(samples) return samples and samples[1] end
+function S.marketReference(id) return freshMedian(db.book[id] and db.book[id].s) end
 local function processBrowseRows(rows) processed[#processed+1]=rows end
 local function GetTime() return now end
 local function time() return now end
@@ -152,6 +153,12 @@ const batchSetup = `
 `;
 function batchCheck(code) { check(batchSetup + code); }
 
+test('batch targets can use a trusted reference before local history has warmed up', () => batchCheck(`
+  db.book={[123]={s={}}}
+  function S.marketReference(id) assert(id==123); return 10000 end
+  assert(S.startBatch() and S.batchSearch.ids[123])
+`));
+
 test('owner-approved default enables batching without overriding explicit saved choices', () => {
   const init = section('local DEFAULTS =', '\n-- one-time retune:');
   for (const setting of ['nil', 'false', 'true']) run(`
@@ -197,7 +204,7 @@ test('batch requests are bounded, deterministic and rotate across known keys', (
 test('batch mode preserves broad discovery opportunities', () => batchCheck(`
   submit=function() S.readBatch() end
   slots(8)
-  assert(count("batch")==3 and count("browse")==4 and count("target")==1)
+  assert(count("batch")==3 and count("browse")==2 and count("target")==3)
 `));
 
 test('batch replies use the shared candidate pipeline, never a tier snapshot', () => batchCheck(`
@@ -262,8 +269,9 @@ test('manual watches and displayed deal refreshes keep priority over batches', (
   complete(); now=now+1; sweepQuery()
   assert(count("target",999)==0 and S.dealFocus.buyWindowUntil==now+5)
   now=now+5
-  slots(2)
-  assert(count("target",999)==1 and count("batch")==0)
+  slots(1); assert(count("batch")==1)
+  S.readBatch(); slots(1)
+  assert(count("target",999)==1 and count("batch")==1)
 `));
 
 test('bad, foreign, duplicate and incomplete summaries trigger fallback without processing', () => {
@@ -278,7 +286,7 @@ test('bad, foreign, duplicate and incomplete summaries trigger fallback without 
     handlers.AUCTION_HOUSE_BROWSE_RESULTS_UPDATED()
     assert(S.batchDisabled and not S.batchSearch and #processed==0)
     assert(next(S.batchChecked)==nil)
-    slots(2); assert(count("target")==1 and count("batch")==1)
+    slots(2); assert(count("target")==2 and count("batch")==1)
   `);
 });
 
@@ -340,9 +348,9 @@ test('weighted category rotation spreads classes without changing their shares',
   assert(counts[7]==6 and counts[0]==6 and counts[3]==4 and counts[8]==4)
 `));
 
-test('discovery receives every second slot with automatic targets available', () => check(`
+test('discovery receives every fourth slot with automatic targets available', () => check(`
   slots(16)
-  assert(count("browse")==8 and count("target",123)==8)
+  assert(count("browse")==4 and count("target",123)==12)
 `));
 
 test('a displayed deal cannot stop discovery and only takes bounded refresh slots', () => check(`
@@ -351,22 +359,60 @@ test('a displayed deal cannot stop discovery and only takes bounded refresh slot
   sweepQuery(); assert(#queries==0 and S.dealFocus.buyWindowUntil==105)
   now=105
   slots(40)
-  assert(count("browse")==20)
+  assert(count("browse")==10)
   assert(count("target",999)>0 and count("target",999)<=3)
-  assert(count("target",123)>=17)
+  assert(count("target",123)>=27)
 `));
 
 test('manual watches retain their slot while discovery and automatic checks continue', () => check(`
   watch=456
   slots(16)
-  assert(count("target",456)==4 and count("target",123)==4 and count("browse")==8)
+  assert(count("target",456)==4 and count("target",123)==8 and count("browse")==4)
 `));
 
 test('queued candidates cannot consume reserved discovery slots', () => check(`
   S.liveCandidates={}
   for id=1,20 do S.liveCandidates[id]={id=id,t=now,line=10,market=100} end
   slots(8)
-  assert(count("browse")==4 and count("target")==4)
+  assert(count("browse")==2 and count("target")==6)
+`));
+
+test('queued bargains use the next monitoring slot ahead of watches and speculative searches', () => check(`
+  watch=456
+  slots(1); assert(count("target",456)==1)
+  S.liveCandidates={[789]={id=789,t=now,line=10,market=100,detectedAt=now}}
+  slots(1); assert(count("target",789)==1 and count("browse")==0)
+  assert(S.liveCandidate.detectedAt==101)
+`));
+
+test('batch hot-item boost is bounded so older coverage still wins', () => batchCheck(`
+  db.book={[1]={s={now,80}},[2]={s={now,100}}}
+  function S.marketReference() return 100 end
+  S.batchChecked={[1]=now-10,[2]=now-12}
+  submit=function(keys) assert(keys[1].itemID==1) end
+  assert(S.startBatch()); S.readBatch()
+  now=now+10; S.batchChecked[2]=now-16
+  submit=function(keys) assert(keys[1].itemID==2) end
+  assert(S.startBatch())
+`));
+
+test('completed checks record actual revisit intervals, not submission counts', () => check(`
+  S.noteRevisit(123); assert(not S.sweepStats.revisitCount)
+  now=now+7; S.noteRevisit(123)
+  now=now+11; S.noteRevisit(123)
+  assert(S.revisitByID[123]==11 and S.checkedAt[123]==now)
+  assert(S.sweepStats.revisitCount==2 and S.sweepStats.revisitTotal==18)
+  assert(S.sweepStats.revisitMax==11)
+`));
+
+test('deep pages yield to fresh candidates and have bounded background spacing', () => check(`
+  startDeepScan(true); local scan=S.deepScan; scan.wantsPage=true
+  now=103; scan.ticker.fn(); assert(count("deep page")==0)
+  now=104; S.liveCandidates={[789]={id=789,t=now}}
+  scan.ticker.fn(); assert(count("deep page")==0)
+  S.liveCandidates=nil; scan.ticker.fn(); assert(count("deep page")==1)
+  scan.wantsPage=true; now=107; scan.ticker.fn(); assert(count("deep page")==1)
+  now=108; scan.ticker.fn(); assert(count("deep page")==2)
 `));
 
 test('an unrelated in-flight search can finish paging while a deal is displayed', () => check(`
@@ -511,6 +557,8 @@ test('deep discovery continues past a displayed deal without replacing live targ
   S.autoSearch={id=123,t=now}
   scan.ticker.fn(); assert(count("deep page")==0)
   S.autoSearch=nil
+  scan.ticker.fn(); assert(count("deep page")==0)
+  now=106
   scan.ticker.fn(); assert(count("deep page")==1)
 `));
 
@@ -533,7 +581,7 @@ test('failed search submissions consume spacing rather than triggering a retry b
   assert(count("failed target")==1 and S.autoSearch==nil)
   for i=1,10 do handlers.AUCTION_HOUSE_THROTTLED_SYSTEM_READY() end
   advance(100.9); assert(#queries==1)
-  advance(101.02); assert(#queries==2 and queries[2].kind=="browse")
+  advance(101.02); assert(#queries==2 and queries[2].kind=="failed target")
 `));
 
 test('dropped requests wake a paced recovery rather than bypassing spacing', () => check(`

@@ -73,6 +73,7 @@ local function snapshot(tiers)
 end
 `;
 const production = optimizer
+  + section('function S.noteRevisit(', '\nS.autoChecked =')
   + section('local COMMODITY_SNAPSHOT_AGE', 'local function prepareCommodityDeal')
   + section('function S.purchaseBudget()', 'local function purchaseAPIAvailable()')
   + section('local function finishPurchase(p, source)', '\nmarkDealGone =')
@@ -134,8 +135,8 @@ test('stock commands manage defaults, overrides, and guarded receipt acknowledge
   command("received","123"); assert(db.stockPending["123"]==nil)
 `));
 
-test('both production Lua chunks compile', () => {
-  for (const code of [optimizer, source]) {
+test('all production Lua chunks compile', () => {
+  for (const code of [optimizer, source, fs.readFileSync(new URL('../TSMReference.lua', import.meta.url), 'utf8')]) {
     const L = fengari.lauxlib.luaL_newstate();
     try {
       const status = fengari.lauxlib.luaL_loadstring(L, fengari.to_luastring(code));

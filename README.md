@@ -120,7 +120,65 @@ automatically clear these reservations.
 
 ### Candidate selection and history
 
-The default discovery ceiling is now **70% of the fresh local reference**, not
+#### Continuous monitoring and pricing mistakes
+
+The routine scheduler now reserves three of every four available query slots for
+monitoring, with the fourth reserved for broad discovery. Queued bargains receive
+the next monitoring slot ahead of speculative searches. Existing owned result
+pages and the bounded five-second focused Buy window still take precedence.
+These are scheduling priorities, not faster server requests or instant alerts.
+
+Batch summaries revisit up to 100 known eligible items per request. Oldest checks
+lead, with a bounded five-second priority boost for a fresh near-reference-floor
+sighting. The existing ten-second per-item batch cooldown remains. Unknown items
+still enter through broad discovery and full/deep scans, not a guessed item list.
+Every deep-scan page now evaluates candidates before learning its own prices;
+complete live tiers are still mandatory before admission. Deep browse requests
+are spaced at least four seconds apart and yield to queued validation and the
+focused click window. They retain browse ownership, so batches resume after the
+deep scan rather than destroying its page set. Deep scans remain time-bounded.
+
+`/fsn status` reports completed-check revisit last/mean/max and observed
+candidate-to-validation delays. `/fsn tsm <itemID>` also shows that item's last
+completed check and last revisit interval. These measurements do not establish
+listing age, sale demand, or guaranteed detection-to-Buy time. Server readiness
+and purchase locks can still delay a valid opportunity. No listing-created event
+or promise of beating other buyers is implied.
+
+#### TSM-backed first-scan discovery
+
+When TSM and its AppHelper are enabled, Forever Sniper can use verified realm
+prices immediately, without waiting for its local history to warm up. The first
+browse sighting and the first full snapshot can both queue candidates. Deals
+still require complete live commodity results and all existing risk checks.
+
+The starting reference is the lower valid `DBMarket` / `DBRecent` value, provided
+its realm/faction feed was downloaded within 12 hours. A valid `DBHistorical`
+value downloaded within 48 hours can lower it, but cannot bootstrap an item by
+itself. Mature, fresh local history also caps the reference. These are conservative
+policy limits, not a guarantee of demand, sale price, or profit. Regional and
+alternate-realm prices do not bootstrap candidates.
+
+Prices come from `TSM_API.GetCustomPriceValue`. Because that API exposes no data
+timestamp, a read-only secure hook observes AppHelper's realm/faction metadata
+while it loads. It does not execute the data payload, replace TSM functions, or
+change TSM settings. Unknown layouts, data loaded before the observer, missing
+prices, errors, stale or future timestamps all fall back to local history. The
+verified layout is TSM 4.15.7's Forever realm feeds, which include stackables;
+other feed layouts are not guessed. TSM is optional and is loaded before our
+observer; AppHelper is deliberately not declared as an optional dependency so
+its data can be observed when it subsequently loads.
+
+- `/fsn tsm`: provider status.
+- `/fsn tsm <itemID>`: selected reference and its source, including a local cap.
+- `/fsn tsm off` / `/fsn tsm on`: persistently disable or enable TSM references.
+
+This changes discovery only. Local history is not filled with TSM samples, and
+selling/portfolio references keep their existing local-history rules. It does
+not increase request rates or import TSM's saved operations. A candidate can
+appear when its first live results arrive, not necessarily in the first second.
+
+The default discovery ceiling is now **70% of the trusted reference**, not
 50%. An upgrade retunes exactly the former 50% setting once, records it in
 `previousThreshold`, and prints how to restore it: `/fsn thresh 50`. Other saved
 thresholds are preserved, and subsequent choices survive reloads. This is a
@@ -132,7 +190,8 @@ Repeated sightings within that interval can lower its price but cannot raise it
 or renew its timestamp. Legacy dense samples are also grouped conservatively when
 read. This prevents scan frequency from dominating the reference; it does not
 create missing history, confirm demand, or preserve old prices indefinitely.
-The default two-observation warm-up now needs at least 90 seconds of evidence.
+Without usable TSM data, the default two-observation warm-up needs at least
+90 seconds of local evidence.
 The 45-minute freshness limit still applies.
 
 ### Buying a displayed offer

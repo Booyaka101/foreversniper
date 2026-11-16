@@ -20,6 +20,7 @@ local DEFAULTS = {
     every     = 45,      -- seconds between full scans while the AH is open
     sweep     = 2,       -- fallback scheduler tick; ready events also wake paced searches
     batch     = true,    -- owner-approved rollout; failures retain individual fallback
+    tsm       = true,    -- verified realm pricing bootstraps discovery; local history caps it
     freshMins = 45,      -- market age: older price samples do not arm alerts
     overhang  = 500,     -- max competing units above the deal; more = slow flip (0 = off)
     armAfter  = 2,       -- require two learned observations before market alerts
@@ -865,6 +866,18 @@ local S = {
 }
 db.lastAlert = S.lastAlert
 
+function S.marketReference(itemID, now)
+    now = now or time()
+    local b = db.book[itemID]
+    local median = b and freshMedian(b.s or {}, now, (cfg.freshMins or 45) * 60, cfg.armAfter)
+    local price, source
+    if cfg.tsm ~= false and ForeverSniperTSM then price, source = ForeverSniperTSM.reference(itemID, now) end
+    if median and (not price or median < price) then
+        return median, price and "local history (caps TSM)" or "local history"
+    end
+    return price, source
+end
+
 local COMMODITY_SNAPSHOT_AGE = 20
 S.commoditySnapshots = {}
 
@@ -941,7 +954,8 @@ local function prepareCommodityDeal(itemID, link, line, market, kind)
                 break
             end
         end
-        S.liveCandidates[itemID] = {kind=inferred, id=itemID, link=link, line=line, market=market, t=GetTime(), refresh=true}
+        S.liveCandidates[itemID] = {kind=inferred, id=itemID, link=link, line=line, market=market,
+            t=GetTime(), detectedAt=GetTime(), refresh=true}
     end
 end
 
@@ -2291,7 +2305,7 @@ local function feedOverview(visibleCount)
         queryRequestCount(), p.interval, p.busyEpisodes)
     local progress = string.format("Live item checks %d/%d completed | %d distinct targets | discovery %d\nFS search attempts %d/60s | minimum spacing %.1fs",
         ss.autoCompleted or 0, ss.autoSent or 0, ss.autoUnique or 0, ss.sent or 0, queryRequestCount(), p.interval)
-    local learning = string.format("Local history: %d ready | %d learning | %d stale\nMarket alerts require %d time-spaced fresh observations per item.",
+    local learning = string.format("Local history: %d ready | %d learning | %d stale\nLocal fallback needs %d time-spaced observations. Verified TSM references bypass warm-up.",
         history.ready, history.warming, history.stale, cfg.armAfter)
     local empty = "|cffffd100" .. stage .. "|r\n\nNo qualifying complete positions to show.\n" .. guidance
         .. "\n\n" .. progress .. "\n\n" .. learning
@@ -2754,6 +2768,7 @@ local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
         local queued = S.liveCandidates[itemID]
         S.liveCandidates[itemID] = { kind = kind, id = itemID, link = link,
             line = sweep.line or unit, market = market, profit = sweep.profit,
+            detectedAt = queued and (queued.detectedAt or queued.t) or GetTime(),
             t = queued and queued.t or GetTime(), refresh = queued and queued.refresh }
         if not queued then recordGate("offer", "queued for live tiers", itemID) end
         return
@@ -2930,16 +2945,15 @@ local function completeScan(reason)
     local function finishScan()
     if S.harvestOwner ~= owner then return end
 
-    -- Market deals: a new listing under threshold% of a learned median. The
+    -- Market deals: a new listing below the trusted reference's deal ceiling. The
     -- whole depth under that line is swept (every unit of every cheap listing,
     -- so stackables come as one lot), and the deal only fires if the estimated
     -- resale profit - market after the AH cut, minus cost - clears the floor.
     local deals = 0
-    if not firstScan then
+    do -- Trusted references can qualify candidates on the first full snapshot.
         for _, c in ipairs(cands) do
             if not db.blacklist[c.id] and c.unit >= cfg.minUnit then
-                local b = db.book[c.id]
-                local med = b and freshMedian(b.s, t, (cfg.freshMins or 45) * 60, cfg.armAfter) or nil
+                local med = S.marketReference(c.id, t)
                 local lineR = med and dealLine(med, c.id) or nil
                 if med and med >= cfg.minUnit and lineR and c.unit <= lineR then
                     local line = lineR
@@ -3033,7 +3047,7 @@ local function completeScan(reason)
 
     if not cfg.quiet and (firstScan or deals > 0) then
         if firstScan then
-            printf("scan 1 done: %d listings, %d items learned. Alerts arm after %d scans; watch rules are live now.",
+            printf("scan 1 done: %d listings, %d items learned. Verified TSM references are live; local fallback needs %d time-spaced observations.",
                 n, db.stats.book, cfg.armAfter)
         else
             printf("scan %d: %d listings, %d new, %d deal%s.", S.scansDone, n, #cands, deals, deals == 1 and "" or "s")
@@ -3379,6 +3393,21 @@ lastQueryAt = 0
 local sweepCount, watchCursor = 0, 0
 S.sweepStats = { sent = 0, rows = 0, yields = 0, lastRows = 0 }
 
+function S.noteRevisit(id)
+    S.checkedAt = S.checkedAt or {}
+    S.revisitByID = S.revisitByID or {}
+    local now, previous = GetTime(), S.checkedAt[id]
+    local stats = S.sweepStats
+    if previous then
+        stats.revisitLast = math.max(0, now - previous)
+        S.revisitByID[id] = stats.revisitLast
+        stats.revisitMax = math.max(stats.revisitMax or 0, stats.revisitLast)
+        stats.revisitCount = (stats.revisitCount or 0) + 1
+        stats.revisitTotal = (stats.revisitTotal or 0) + stats.revisitLast
+    end
+    S.checkedAt[id] = now
+end
+
 S.autoChecked = {}
 local function nextAutoTarget()
     local now, best, bestScore = time(), nil, nil
@@ -3386,7 +3415,7 @@ local function nextAutoTarget()
     for rawID, b in pairs(db.book) do
         local id = tonumber(rawID)
         if id and not watchByID[id] and not db.blacklist[id] and commodityFor(id) == true then
-            local market = freshMedian(b.s, now, (cfg.freshMins or 45) * 60, cfg.armAfter)
+            local market = S.marketReference(id, now)
             local line = market and dealLine(market, id)
             local elapsed = GetTime() - (S.autoChecked[id] or -60)
             local eligible = market and market >= cfg.minUnit and line <= budget and elapsed >= 10
@@ -3619,12 +3648,11 @@ local function processBrowseRows(rows, added, source)
         if S.sweepStats.lastSort == "cheapest" then
             markDealGone(key, price)
         end
-            local b = db.book[key]
-            if b then
-                local med = freshMedian(b.s, t, (cfg.freshMins or 45) * 60, cfg.armAfter)
+            do
+                local med = S.marketReference(key, t)
                 local dealLinePx = nil
                 if not med then
-                    why("no fresh median yet", key)
+                    why("no fresh market reference", key)
                 elseif med < cfg.minUnit then
                     why("market under floor", key)
                 else
@@ -3678,8 +3706,6 @@ local function processBrowseRows(rows, added, source)
                             { units = qty, cost = cost, profit = est, line = line }, true)
                     end
                 end
-            else
-                why("no price history yet", key)
             end
         end
     end
@@ -3708,14 +3734,20 @@ do
             local checked = id and (S.batchChecked[id] or -60)
             if id and id > 0 and id % 1 == 0 and not watchByID[id] and not db.blacklist[id] and commodityFor(id) == true
                 and now - checked >= 10 then
-                local market = freshMedian(b.s, time(), (cfg.freshMins or 45) * 60, cfg.armAfter)
+                local market = S.marketReference(id)
                 if market and market >= cfg.minUnit then
-                    candidates[#candidates + 1] = {id=id, checked=checked}
+                    local samples = b.s or {}
+                    local stamp, price = num(samples[#samples - 1]), num(samples[#samples])
+                    -- A small, bounded near-line boost improves hot-item revisits
+                    -- without letting them continually displace older coverage.
+                    local hot = stamp and stamp <= time() and time() - stamp <= 120
+                        and price and price > 0 and price <= market * 0.85
+                    candidates[#candidates + 1] = {id=id, checked=checked, priority=checked - (hot and 5 or 0)}
                 end
             end
         end
         table.sort(candidates, function(a, b)
-            if a.checked ~= b.checked then return a.checked < b.checked end
+            if a.priority ~= b.priority then return a.priority < b.priority end
             return a.id < b.id
         end)
         local keys, ids = {}, {}
@@ -3761,7 +3793,10 @@ do
             seen[id] = true
         end
         S.batchSearch = nil
-        for id in pairs(owner.ids) do S.batchChecked[id] = GetTime() end
+        for id in pairs(owner.ids) do
+            S.batchChecked[id] = GetTime()
+            S.noteRevisit(id)
+        end
         local stats = S.sweepStats
         stats.batchCompleted = (stats.batchCompleted or 0) + 1
         stats.batchKeys = (stats.batchKeys or 0) + owner.count
@@ -3849,8 +3884,8 @@ local function sweepQuery()
     end
     rebuildWatch()
     local watchKey, watchID, watchRule
-    if sweepCount % 4 == 1 then watchKey, watchID, watchRule = nextWatchKey() end
-    if sweepCount % 2 == 1 and not watchKey then
+    local targetSlot = sweepCount % 4 ~= 0
+    if targetSlot then
         local oldest
         for id, candidate in pairs(S.liveCandidates or {}) do
             if GetTime() - candidate.t >= 30 then
@@ -3867,9 +3902,10 @@ local function sweepQuery()
             return -- failed attempts also consume a pacing slot
         end
     end
-    -- Alternate target validation and discovery. A displayed deal may use a
-    -- target slot, never the discovery slot or an in-flight search's pages.
-    if sweepCount % 2 == 1 and C_AuctionHouse.SendSearchQuery then
+    -- Three monitoring slots per discovery slot. Queued bargains go first;
+    -- watch rules precede speculative checks and discovery cannot be starved.
+    if sweepCount % 4 == 1 then watchKey, watchID, watchRule = nextWatchKey() end
+    if targetSlot and C_AuctionHouse.SendSearchQuery then
         local key, id, w = watchKey, watchID, watchRule
         if not key and S.startBatch() then return end
         local target = not key and nextAutoTarget() or nil
@@ -3948,28 +3984,10 @@ end
 
 -- DEEP SCAN (/fsn deepscan, auto every 15 min with the AH open): page every
 -- listing of each scan category into the book. Modeled on ForeverForge's
--- 15-minute scan: auto-paging up to 40 pages per category, alerts stay OFF
--- (the live sweep re-finds anything actionable in minutes), the sweep is
--- paused while it runs, and server drops are survived by the watchdog.
+-- Auto-paging up to 40 pages per category. Every page evaluates candidates;
+-- live item validation continues between pages without replacing browse state.
 local DEEP_MAX_PAGES, DEEP_INTERVAL = 40, 900
 local deepSend, deepNext, deepMore
-
-local function bookRows(rows, added)
-    local first = added and (S.browseRecorded or 0) + 1 or 1
-    local mins, t = {}, time()
-    for i = first, #rows do
-        local r = rows[i]
-        local key = num(r.itemKey and r.itemKey.itemID)
-        local price = num(r.minPrice)
-        if key and price and price > 0 then
-            mins[key] = price
-            local qty = num(r.totalQuantity) or 0
-            if qty > 0 then noteStack(key, qty) end
-        end
-    end
-    if next(mins) then mergeIntoBook(mins, t) end
-    S.browseRecorded = #rows
-end
 
 local function deepAbort(say)
     local d = S.deepScan
@@ -4108,6 +4126,17 @@ startDeepScan = function(force)
         -- Item searches can interrupt between browse pages, but never replace
         -- the deep scan's browse result set or race its next page request.
         if S.autoSearch or S.watchSearch or S.liveCandidate or S.pending or S.buying or not canQuery(true) then return end
+        -- Reserve time for live validations and the same bounded click window
+        -- as the routine scheduler. Browse pages retain their existing owner.
+        if focusedDeal() and S.dealFocus then
+            local focus = S.dealFocus
+            if not focus.buyWindowUntil then focus.buyWindowUntil = GetTime() + 5 end
+            if GetTime() < focus.buyWindowUntil then return end
+        end
+        if GetTime() - (d.lastReq or 0) < 4 then return end
+        for _, candidate in pairs(S.liveCandidates or {}) do
+            if GetTime() - candidate.t < 30 then return end
+        end
         if d.needsSend then deepSend() return end
         if d.wantsPage then deepPage() return end
         -- a page request the server dropped sends no event: re-request, or
@@ -4879,7 +4908,7 @@ local function readDeepBrowse(added)
     if ok and type(rows) == "table" then
         local extra = added and math.max(0, #rows - (S.browseRecorded or 0)) or #rows
         if not added then S.browseRecorded = 0 end
-        bookRows(rows, added)
+        processBrowseRows(rows, added, "deep discovery")
         owner.rows = (owner.rows or 0) + extra
         if not added then owner.received = true end
         deepMore()
@@ -5067,6 +5096,7 @@ local function onCommodityResults(itemID)
     local snapshot, reason = readCommodityTiers(itemID)
     if snapshot then
         S.commoditySnapshots[itemID] = snapshot
+        S.noteRevisit(itemID)
     elseif reason == "unreadable" then
         S.commoditySnapshots[itemID] = nil
     elseif reason == "empty" then
@@ -5128,6 +5158,11 @@ local function onCommodityResults(itemID)
         end
         local terms, rejected = S.optimizedCommodityTerms(itemID, c.line, c.market, c.kind, snapshot)
         if terms then
+            if c.detectedAt then
+                local stats = S.sweepStats
+                stats.validationLast = math.max(0, GetTime() - c.detectedAt)
+                stats.validationMax = math.max(stats.validationMax or 0, stats.validationLast)
+            end
             fireAlert(c.kind, itemID, c.link, terms.first, terms.resale,
                 {units=terms.units,cost=terms.cost,profit=terms.profit,line=terms.line or c.line,verified=true}, true)
         else
@@ -5392,6 +5427,7 @@ local HELP = {
     "/fsn unwatch <link>|all",
     "|cffffd100tuning|r",
     "/fsn thresh 50        alert at %% of learned market (1-99)",
+    "/fsn tsm [on|off|ID]  verified TSM reference status or per-item value",
     "/fsn sweep 3          fallback tick seconds (2-30); ready events wake paced searches",
     "/fsn batch on|off     experimental 100-key summaries; failures fall back to item checks",
     "/fsn max 250g         spend cap per Buy click",
@@ -5566,7 +5602,12 @@ SlashCmdList.FOREVERSNIPER = function(msg)
         printf("%s | %d full snapshots done | book %d items | %d alerts fired",
             cfg.enabled and "|cff7cff4fon|r" or "|cffff4d4doff|r",
             S.scansDone, db.stats.book or 0, db.stats.deals or 0)
+        printf("market reference: %s. /fsn tsm <itemID> inspects an item's reference.",
+            cfg.tsm == false and "TSM disabled; local history only" or ForeverSniperTSM.status(time()))
         local ss = S.sweepStats or { sent = 0, rows = 0, yields = 0 }
+        printf("monitor timing: completed-check revisit last/mean/max %.1f/%.1f/%.1fs (%d repeats); detected-to-validated last/max %.1f/%.1fs. Not listing age or a Buy guarantee.",
+            ss.revisitLast or 0, (ss.revisitTotal or 0) / math.max(1, ss.revisitCount or 0), ss.revisitMax or 0,
+            ss.revisitCount or 0, ss.validationLast or 0, ss.validationMax or 0)
         printf("batch discovery: %s; %d sent, %d completed, %d keys covered, %d rows, %d failures; last response %.2fs.",
             S.batchDisabled or (cfg.batch and "enabled (experimental)" or "off"),
             ss.batchSent or 0, ss.batchCompleted or 0, ss.batchKeys or 0,
@@ -5606,7 +5647,7 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             queryRequestCount(), p.interval, p.busyEpisodes,
             p.busySeconds + (p.busySince and math.max(0, GetTime() - p.busySince) or 0))
         local history = historyReadiness()
-        printf("Local history: %d ready, %d learning, %d stale; market alerts require %d distinct fresh observations per item. Ready history alone does not mean a qualifying deal.",
+        printf("Local history: %d ready, %d learning, %d stale; local fallback requires %d time-spaced observations. Verified TSM references need no local warm-up. Neither proves a deal.",
             history.ready, history.warming, history.stale, cfg.armAfter)
         if S.sweepTicker then
             printf("live sweep: |cffffd100%d sent|r, %d rows read, %d yields (browse-tab pauses). AH open: %s.",
@@ -5745,6 +5786,22 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             cfg.every = math.floor(v)
             printf("scanning every %ds while the AH is open.", cfg.every)
         else printf("usage: /fsn every 45  (seconds, 15-900)") end
+
+    elseif cmd == "tsm" then
+        if rest == "on" then cfg.tsm = true
+        elseif rest == "off" then cfg.tsm = false
+        elseif rest ~= "" then
+            local id = tonumber(rest)
+            if not id or id <= 0 or id % 1 ~= 0 then printf("usage: /fsn tsm [on|off|itemID]") return end
+            local value, source = S.marketReference(id)
+            printf("item %d reference: %s (%s).", id, value and fmtMoney(value) or "unavailable", source or "no trusted reference")
+            local checked = S.checkedAt and S.checkedAt[id]
+            local revisit = S.revisitByID and S.revisitByID[id]
+            printf("item %d monitoring: last completed check %s; last revisit interval %s.", id,
+                checked and string.format("%.1fs ago", math.max(0, GetTime() - checked)) or "not observed",
+                revisit and string.format("%.1fs", revisit) or "not yet measured")
+        end
+        printf("TSM reference: %s", cfg.tsm == false and "disabled; local history only" or ForeverSniperTSM.status(time()))
 
     elseif cmd == "batch" then
         if rest == "on" or rest == "off" then
