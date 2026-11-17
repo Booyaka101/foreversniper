@@ -1,5 +1,32 @@
 # Depth optimiser verification
 
+## Purchase timing comparison, November 17, 2026
+
+Branch: `feat/purchase-timing`, based on deployed PR #12 commit
+`cc7acab5abca0aea9a0522e2ec83d8a13c8c7b73`. This change is not deployed.
+
+- Session-only per-attempt timing separates detection, query dispatch, complete
+  results, validation, hardware press and quote response. Missing stages remain
+  unknown; API rereads retain completion age rather than claiming fresh results.
+- Opt-in `/fsn prebuy on|off` compares complete tiers before and after a forced
+  `SendSearchQuery`. A second hardware press within two seconds is required;
+  no asynchronous result callback starts a purchase. One check permits one quote.
+- Search pacing, pagination, ownership and all existing price, budget, liquidity,
+  exposure and unknown-outcome guards remain authoritative. No price thresholds,
+  scanner strategy, saved data or installation files are changed.
+- Regression coverage includes timing attribution, missing stages, cached refresh
+  bypass, synchronous request ownership, unrelated replies, partial/foreign/expired
+  results, disappearing tiers, contradictory quotes and second-press guards.
+- Local gates: 196 tests passed; static lint zero errors/warnings; strict
+  load/lifecycle simulation clean with existing unknown-event notices;
+  `git diff --check` passed. Full logs are retained in the approved temp directory
+  as `forever-purchase-timing-{tests,lint,sim}.log`.
+
+Live comparison remains untested. A completed new query is not proof of fresh
+server data, and these changes do not establish the cause of missed bargains.
+The known extended AH-scenario failures below remain outside the passing gate.
+Exact-head CI and owner approval are required before deployment.
+
 ## Targeted material-list trial, November 17, 2026
 
 Branch: `feat/targeted-materials`, based on PR #11 commit

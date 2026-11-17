@@ -28,6 +28,32 @@ Server delays, pagination, stock refreshes, history availability, and other addo
 still affect coverage. These scheduling changes do not establish a measured
 live-client detection speed or guarantee winning a contested listing.
 
+## Purchase timing and new-search comparison
+
+`/fsn diagnostics` records matched purchase attempts with detection-to-search,
+search-to-completion, validation-to-click, click-to-quote and detection-to-quote
+times, query method and completed-result age at click. Missing stages are
+`unknown`. A live API reread preserves the completed-search timestamp; neither
+that timestamp nor a fast quote response tells us the age of server listings.
+
+`/fsn prebuy on` enables an opt-in diagnostic comparison, not a faster purchase:
+
+1. Press Buy (or the existing Buy binding) to queue a new `SendSearchQuery`,
+   bypassing cached-result refresh. No purchase starts from its result callback.
+2. After completion, press Buy again within two seconds to start the usual
+   guarded quote. The button shows Check until this window is ready.
+
+Diagnostics compare quantities and costs below the unchanged ceiling before and
+after that search, plus queue and search-response time. Partial, invalid or
+expired results do not authorize buying. The second press still rechecks the
+live tiers, displayed position, budgets, reserve, eligibility and purchase locks.
+Each completed check permits only one quote attempt. A fresh completed search
+can still disagree with a purchase quote; the server exposes no snapshot age.
+
+`/fsn prebuy off` restores normal one-press buying. Timing evidence remains on.
+The setting is off by default and does not change the scanning strategy, saved
+prices or purchase ceilings. `/fsn targeted off` selects broad scanning separately.
+
 ## Experimental batch discovery
 
 ### Targeted Normal Horde materials

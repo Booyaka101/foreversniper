@@ -335,8 +335,42 @@ test('targeted mode is opt-in and preserves explicit saved choices', () => {
   `);
 });
 
+test('prebuy test is opt-in and preserves explicit saved choices', () => {
+  const init = section('local DEFAULTS =', '\n-- one-time retune:');
+  for (const setting of ['nil', 'false', 'true']) run(`
+    ForeverSniperDB={config={prebuy=${setting}}}
+    ${init}
+    assert(db.config.prebuy==${setting === 'nil' ? 'false' : setting})
+  `);
+});
+
+test('prebuy holds a bounded second-press window without starting a purchase', () => check(`
+  cfg.prebuy=true; S.prebuyCheck={completedAt=100}
+  now=101; sweepQuery(); assert(#queries==0)
+  now=102; sweepQuery(); assert(#queries==0)
+  now=102.1; sweepQuery(); assert(count("target")==1)
+`));
+
+test('forced prebuy dispatch bypasses cached-result refresh and owns synchronous replies', () => check(`
+  ${section('local function requestItemSearch(', '\nlocal function searchListing').replace('local function requestItemSearch(', 'requestItemSearch = function(')}
+  local refreshed,sent=0,0
+  C_AuctionHouse.MakeItemKey=function(id) return {itemID=id} end
+  C_AuctionHouse.HasSearchResults=function() return true end
+  C_AuctionHouse.RefreshCommoditySearchResults=function() refreshed=refreshed+1 end
+  C_AuctionHouse.SendSearchQuery=function(key)
+    assert(S.liveCandidate and S.liveCandidate.id==key.itemID and S.liveCandidate.prebuy)
+    assert(S.searchMethods[key.itemID]=='new item search')
+    sent=sent+1
+  end
+  sendTargetSearch('autoSearch',{id=123})
+  assert(refreshed==1 and sent==0 and S.searchMethods[123]=='refresh commodity')
+  complete(); now=101
+  sendTargetSearch('liveCandidate',{id=123,prebuy={}})
+  assert(refreshed==1 and sent==1 and S.liveCandidate.searchStartedAt==101)
+`));
+
 test('batch command toggles future requests without abandoning an in-flight owner', () => {
-  const command = section('    elseif cmd == "batch" then', '\n    elseif cmd == "targeted" then')
+  const command = section('    elseif cmd == "batch" then', '\n    elseif cmd == "prebuy" then')
     .replace('elseif cmd', 'if cmd');
   batchCheck(`
     local function command(rest)
