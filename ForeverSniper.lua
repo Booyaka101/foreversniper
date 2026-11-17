@@ -945,7 +945,7 @@ local function commodityTiersForBuy(itemID)
     if not saved or GetTime() < saved.t or GetTime() - saved.t > COMMODITY_SNAPSHOT_AGE then return nil, "loading" end
     local snapshot, reason = readCommodityTiers(itemID)
     if snapshot then
-        snapshot.t, snapshot.timing = saved.t, saved.timing
+        snapshot.t, snapshot.timing, snapshot.remainder = saved.t, saved.timing, saved.remainder
         return snapshot, nil, "live API"
     end
     -- A refresh may clear the API's result table. Keep the completed search
@@ -994,6 +994,24 @@ do
             elapsed(timing.validatedAt, timing.feedRenderedAt), elapsed(timing.feedRenderedAt, timing.clickAt),
             elapsed(timing.clickAt, GetTime()), elapsed(timing.detectedAt, GetTime()),
             elapsed(timing.completedAt, timing.clickAt), timing.source or "unknown"))
+    end
+
+    function S.queueRemainderRetry(p)
+        local previous = p.remainder
+        if p.units <= 1 or (previous and (previous ~= S.remainderRetry or GetTime() >= previous.expires)) then
+            S.remainderRetry = nil
+            return
+        end
+        local retry = {id=p.deal.id, link=p.deal.link, line=p.maxUnit, market=p.market, kind=p.kind,
+            failedUnits=p.units, cost=p.expected or p.tolTotal,
+            expires=previous and previous.expires or GetTime() + 10}
+        S.remainderRetry = retry
+        S.liveCandidates = S.liveCandidates or {}
+        S.liveCandidates[retry.id] = {id=retry.id, link=retry.link, line=retry.line,
+            market=retry.market, kind=retry.kind, t=GetTime(), detectedAt=GetTime(),
+            refresh=true, forceSearch=true, remainder=retry}
+        diagnostic("remainder retry", string.format("item %d; rejected x%d; fresh search at ceiling %.0f copper; smaller quote requires another BUY press",
+            retry.id, retry.failedUnits, retry.line))
     end
 
     function S.prebuyReady(itemID, line)
@@ -1209,12 +1227,51 @@ function S.optimizedCommodityTerms(itemID, line, market, kind, snapshot)
     end)
 end
 
+function S.remainderTerms(itemID, line, units, cost, market, kind, snapshot)
+    local retry = snapshot.remainder
+    if not retry or retry ~= S.remainderRetry or retry.id ~= itemID or GetTime() >= retry.expires then return nil, "loading" end
+    if units and (not num(units) or units < 1 or units % 1 ~= 0)
+        or cost and (not num(cost) or cost < 1 or cost % 1 ~= 0) then return nil, "invalid" end
+    line = math.min(line, retry.line)
+    local available, _, first, competing, competingUnits = commodityLot(snapshot, line)
+    if available < 1 then return nil, "empty" end
+    -- A new search may still contain the rejected quantity. Reduce it on each
+    -- hardware retry; the new server quote, not this sizing rule, authorizes cost.
+    local limit = available < retry.failedUnits and available or math.max(1, math.floor(retry.failedUnits / 2))
+    limit = math.min(limit, units or limit)
+    local tiers = {}
+    for _, tier in ipairs(snapshot.tiers) do tiers[#tiers + 1] = tier end
+    table.sort(tiers, function(a, b) return a.price < b.price end)
+    local selected, total = 0, 0
+    for _, tier in ipairs(tiers) do
+        if tier.price > line or selected >= limit then break end
+        local quantity = math.min(tier.quantity, limit - selected)
+        selected, total = selected + quantity, total + quantity * tier.price
+    end
+    if total > math.min(cost or retry.cost, retry.cost) then return nil, "grown" end
+    -- Partial recovery keeps the approved exit estimate, not a claim that the
+    -- cheap floor was cleared. Remaining cheap units still count as competition.
+    local lot = {units=selected, cost=total, first=first, competing=competing,
+        competingUnits=competingUnits + available - selected}
+    local terms, reason = commodityPositionTerms(itemID, line, selected, total,
+        market and math.min(market, retry.market or market), kind, snapshot, lot)
+    if terms then terms.line = line end
+    return terms, reason
+end
+
 local function commodityOfferTerms(itemID, line, units, cost, market, kind)
     line = num(line)
     if not line or line <= 0 then return nil, "invalid" end
     local snapshot, reason, source = commodityTiersForBuy(itemID)
     if not snapshot then return nil, reason end
-    local terms, rejected = commodityPositionTerms(itemID, line, units, cost, market, kind, snapshot)
+    local terms, rejected
+    local retry = S.remainderRetry
+    if retry and retry.id == itemID and not snapshot.remainder then return nil, "loading" end
+    if snapshot.remainder then
+        terms, rejected = S.remainderTerms(itemID, line, units, cost, market, kind, snapshot)
+    else
+        terms, rejected = commodityPositionTerms(itemID, line, units, cost, market, kind, snapshot)
+    end
     return terms, rejected, snapshot, source
 end
 
@@ -2057,6 +2114,10 @@ commodityActionState = function(itemID, link, line, units, cost, market, kind)
         return S.prebuyReady(itemID, line) and "Buy" or "Check", true,
             "New-search test: first press searches; press again within 2s of completion to start a guarded quote."
     end
+    local snapshot = S.commoditySnapshots[itemID]
+    if ready and snapshot and snapshot.remainder then
+        return "Retry", true, "Buy the smaller recovery offer at the original ceiling. Each retry needs a new press and quote."
+    end
     return ready and "Buy" or "Load", ready,
         ready and "One click buys this complete position after the live quote passes validation."
             or "Waiting for validated live tiers. The scanner prepares these automatically."
@@ -2132,6 +2193,7 @@ function S.offerAvailable(offer)
 end
 
 function S.dismissDeal(itemID)
+    if S.remainderRetry and S.remainderRetry.id == itemID then S.remainderRetry = nil end
     for _, d in ipairs(S.deals) do if d.id == itemID then d.gone = true end end
     for _, field in ipairs({"liveCandidate", "autoSearch", "watchSearch"}) do
         if S[field] and S[field].id == itemID then S[field] = nil end
@@ -2145,6 +2207,7 @@ end
 
 -- Share Clear/wipe cleanup without adding to this chunk's Lua local limit.
 function S.clearFeedDeals()
+    S.remainderRetry = nil
     if S.snipePending and not S.snipePending.confirmed then retirePurchase("feed cleared") end
     for i = #S.deals, 1, -1 do
         S.dismissDeal(S.deals[i].id)
@@ -2163,6 +2226,7 @@ local function finishPurchase(p, source)
         return
     end
     db.unsettledPurchase, S.outcomeOwner, S.snipePending = nil, nil, nil
+    S.remainderRetry = nil
     S.session.spent = (S.session.spent or 0) + total
     S.session.buys = (S.session.buys or 0) + 1
     S.boughtAt[tostring(id)] = {t=time(), price=total / units, source=source, kind=p.kind, ceiling=p.maxUnit}
@@ -2272,6 +2336,7 @@ quickBuy = function(r)
         return
     end
     local buyUnits, expected = terms.units, terms.cost
+    line = terms.line or line
     if not S.prebuyGate(r, line, snapshot, source) then return end
     -- Match the native buy display's sanitized average, including mixed tiers.
     -- This request argument does not replace the exact total and unit quote caps.
@@ -2293,6 +2358,7 @@ quickBuy = function(r)
         market = r.market2, kind = terms.kind,
         offer = r.offer,
         attempt = S.purchaseSequence, timing = S.purchaseTiming(snapshot, source),
+        remainder = snapshot and snapshot.remainder,
     }
     local pending = S.snipePending
     C_Timer.After(6, function()
@@ -2356,10 +2422,13 @@ local function feedBestBuy()
     -- the best affordable GROUP: highest total profit wins; items cooling
     -- down from a failed buy are skipped
     local order = collectDealGroups()
+    local retry = S.remainderRetry
+    if retry and GetTime() >= retry.expires then retry = nil end
     local best
     for _, g in ipairs(order) do
         local cooling = buyFailUntil[g.id] and GetTime() < buyFailUntil[g.id]
-        if not cooling and commodityOfferReady(g.id, g.link, g.line, g.units, g.cost, g.market, g.kind) then best = g break end
+        if not cooling and (not retry or retry.id == g.id)
+            and commodityOfferReady(g.id, g.link, g.line, g.units, g.cost, g.market, g.kind) then best = g break end
     end
     if not best then
         printf("no fresh deal to buy right now - the sweep is on it, press again in a moment.")
@@ -2949,6 +3018,7 @@ local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
         -- before exposing an actionable lot or claiming its profit.
         S.liveCandidates = S.liveCandidates or {}
         local queued = S.liveCandidates[itemID]
+        if queued and queued.remainder then return end
         local detectedAt = GetTime()
         if queued then detectedAt = queued.detectedAt end
         S.liveCandidates[itemID] = { kind = kind, id = itemID, link = link,
@@ -3727,7 +3797,7 @@ local function sendTargetSearch(field, target)
     noteQueryAttempt()
     -- Own the request before invoking the client: custom clients can deliver
     -- a cached response synchronously from RefreshCommoditySearchResults.
-    local ok, e = pcall(requestItemSearch, target.id, target.commodity, true, target.prebuy ~= nil)
+    local ok, e = pcall(requestItemSearch, target.id, target.commodity, true, target.prebuy ~= nil or target.forceSearch == true)
     if not ok then
         if S[field] == target then S[field] = nil end
         err("target search", e)
@@ -4133,6 +4203,20 @@ local function sweepQuery()
             return
         end
     end
+    local retry = S.remainderRetry
+    if retry then
+        local candidate = S.liveCandidates and S.liveCandidates[retry.id]
+        rebuildWatch()
+        if GetTime() >= retry.expires or db.blacklist[retry.id]
+            or (cfg.targeted and not targetedPool[retry.id] and not watchByID[retry.id]) then
+            S.remainderRetry = nil
+            if candidate and candidate.remainder == retry then S.liveCandidates[retry.id] = nil end
+        elseif candidate and candidate.remainder == retry then
+            S.liveCandidates[retry.id] = nil
+            sendTargetSearch("liveCandidate", candidate)
+            return
+        end
+    end
     local focus = focusedDeal()
     if focus and S.dealFocus then
         local priority = S.dealFocus
@@ -4486,6 +4570,7 @@ end
 local stopRelisting -- forward: defined with the batch-relist block below
 
 local function stopSweeping()
+    S.remainderRetry = nil
     observeQueryPressure(false)
     S.sweepWake = nil
     if not S.ahOpen or not cfg.enabled then S.batchSearch = nil end
@@ -5390,6 +5475,8 @@ local function onCommodityResults(itemID)
     local snapshot, reason, identity = readCommodityTiers(itemID)
     if identity then diagnostic("commodity result identity", identity) end
     if snapshot then
+        local previous = S.commoditySnapshots[itemID]
+        if previous and previous.remainder == S.remainderRetry then snapshot.remainder = previous.remainder end
         S.commoditySnapshots[itemID] = snapshot
         S.noteRevisit(itemID)
     elseif reason == "unreadable" then
@@ -5436,7 +5523,7 @@ local function onCommodityResults(itemID)
     -- A completed automatic check may just have queued this candidate. Its
     -- event-owned full tiers already satisfy preparation; do not search twice.
     local queued = snapshot and S.liveCandidates and S.liveCandidates[itemID]
-    if queued and not queued.prebuy then
+    if queued and not queued.prebuy and not queued.remainder then
         if not c or c.id ~= itemID then c = queued end
         S.liveCandidates[itemID] = nil
     end
@@ -5458,8 +5545,18 @@ local function onCommodityResults(itemID)
             recordGate("validation", reason or "no snapshot", itemID)
             return
         end
-        local terms, rejected = S.optimizedCommodityTerms(itemID, c.line, c.market, c.kind, snapshot)
+        local terms, rejected
+        if c.remainder or snapshot.remainder then
+            snapshot.remainder = c.remainder or snapshot.remainder
+            terms, rejected = S.remainderTerms(itemID, c.line, nil, nil, c.market, c.kind, snapshot)
+        else
+            terms, rejected = S.optimizedCommodityTerms(itemID, c.line, c.market, c.kind, snapshot)
+        end
         if terms then
+            if c.remainder then
+                diagnostic("remainder ready", string.format("item %d; x%d at or under %.0f copper; total %.0f copper; press BUY for a new guarded quote",
+                    itemID, terms.units, terms.line, terms.cost))
+            end
             snapshot.timing = snapshot.timing or {}
             snapshot.timing.detectedAt = c.detectedAt
             snapshot.timing.validatedAt = GetTime()
@@ -5532,6 +5629,9 @@ on("COMMODITY_PRICE_UPDATED", function(unitPrice, totalPrice)
                 S.commoditySnapshots[sp.deal.id] = nil
                 markDealGone(sp.deal.id, math.huge)
                 prepareCommodityDeal(sp.deal.id, sp.deal.link, sp.maxUnit, sp.market, sp.kind)
+                local candidate = S.liveCandidates and S.liveCandidates[sp.deal.id]
+                if candidate then candidate.forceSearch = true end
+                S.queueRemainderRetry(sp)
                 S.wakeSweep()
             end
             recordGate("purchase", "quote rejected: " .. rejected, sp.deal.id)

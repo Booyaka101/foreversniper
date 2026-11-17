@@ -94,8 +94,9 @@ test('quote refusals identify the exact unchanged guard and retain numeric evide
     ['function S.purchaseBudget() return 99 end', '10,100', 'total above current budget'],
   ]) check(`offer(); ${change}; handlers.COMMODITY_PRICE_UPDATED(${quote})
     assert(calls.confirm==0 and calls.cancel==1 and not S.snipePending)
-    assert(#diagnostics==1 and diagnostics[1].domain=='purchase quote')
-    local message=diagnostics[1].message
+    local message
+    for _,entry in ipairs(diagnostics) do if entry.domain=='purchase quote' then message=entry.message end end
+    assert(message)
     assert(message:find('${reason}',1,true) and message:find('item 123 x10',1,true)
       and message:find('quote unit/total',1,true) and message:find('age ',1,true))`);
 });
