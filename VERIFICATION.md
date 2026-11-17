@@ -1,5 +1,36 @@
 # Depth optimiser verification
 
+## Prebuy dispatch repair, November 17, 2026
+
+Branch: `fix/prebuy-dispatch`, based on PR #13 commit
+`52fdeb2d557f61afac42f065e0748c2d722ec91e`.
+
+Two deterministic failures were reproduced against PR #13:
+
+- An explicit first Buy/Check press could sit behind the ordinary five-second
+  focused-offer click window, even though the owner had already pressed it.
+- Deep-scan pages could occupy the two-second second-press window when no focused
+  offer was present.
+
+The pending current check now takes the next eligible item-query slot before
+routine focus/discovery work. Existing readiness, pacing, scope, owned pages,
+stock refresh and purchase locks run first. The discovery debt and other queued
+candidates are retained. Deep pages respect the completed-check window.
+
+Local gates: 201 tests pass; static lint reports zero errors/warnings; strict
+load/lifecycle simulation is clean with existing unknown-event notices;
+`git diff --check` passes. Logs, including the two failing pre-repair cases,
+are retained as `forever-prebuy-dispatch-{before,tests,lint,sim}.log` in the
+approved local temp directory.
+
+These are repairs to the new diagnostic workflow. They do not establish the
+cause of the earlier normal one-press quote mismatches. Live server freshness
+and purchase availability remain unresolved.
+
+PR #13 was owner-approved and installed from its exact CI-passed commit before
+this repair. Runtime hashes were verified and SavedVariables were unchanged.
+Rollback: `D:/WoW/AddonBackups/ForeverSniper/pre-purchase-timing-20261117-204503`.
+
 ## Purchase timing comparison, November 17, 2026
 
 Branch: `feat/purchase-timing`, based on deployed PR #12 commit

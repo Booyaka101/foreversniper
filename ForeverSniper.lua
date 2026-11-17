@@ -4080,6 +4080,19 @@ local function sweepQuery()
     end
     local prebuy = cfg.prebuy and S.prebuyCheck
     if prebuy and prebuy.completedAt and GetTime() - prebuy.completedAt <= 2 then return end
+    if prebuy and not prebuy.finished and not prebuy.completedAt
+        and GetTime() - prebuy.t < 15 and not db.blacklist[prebuy.id] then
+        local candidate = S.liveCandidates and S.liveCandidates[prebuy.id]
+        rebuildWatch()
+        if candidate and candidate.prebuy == prebuy
+            and (not cfg.targeted or targetedPool[prebuy.id] or watchByID[prebuy.id]) then
+            -- The hardware press already used the click opportunity. Dispatch
+            -- its check before waiting for another click or routine discovery.
+            S.liveCandidates[prebuy.id] = nil
+            sendTargetSearch("liveCandidate", candidate)
+            return
+        end
+    end
     local focus = focusedDeal()
     if focus and S.dealFocus then
         local priority = S.dealFocus
@@ -4359,6 +4372,8 @@ startDeepScan = function(force)
         -- Item searches can interrupt between browse pages, but never replace
         -- the deep scan's browse result set or race its next page request.
         if S.autoSearch or S.watchSearch or S.liveCandidate or S.pending or S.buying or not canQuery(true) then return end
+        local prebuy = cfg.prebuy and S.prebuyCheck
+        if prebuy and prebuy.completedAt and GetTime() - prebuy.completedAt <= 2 then return end
         -- Reserve time for live validations and the same bounded click window
         -- as the routine scheduler. Browse pages retain their existing owner.
         if focusedDeal() and S.dealFocus then
