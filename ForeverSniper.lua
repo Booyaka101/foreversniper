@@ -1467,7 +1467,21 @@ local function noteQueryAttempt()
     local p, now = queryPacing(), GetTime()
     queryRequestCount()
     push(p.requests, 120, now)
+    p.nextAt = math.max(now, p.nextAt or 0) + p.interval
     lastQueryAt = now
+end
+
+function S.queryReadyAt(urgent)
+    local p = queryPacing()
+    local due = math.max(lastQueryAt + p.interval, p.nextAt or 0)
+    if urgent then
+        -- Borrow one pacing slot for a just-detected bargain, then repay it.
+        -- The rolling cap prevents the loan crossing a minute boundary twice.
+        due = math.max(lastQueryAt + 0.01, due - p.interval)
+    end
+    -- Addition/subtraction can round differently at the exact minute boundary.
+    if queryRequestCount() >= 60 then due = math.max(due, p.requests[1] + 60 + 0.001) end
+    return due
 end
 
 local function requestItemSearch(itemID, commodity, separateOwner, forceSearch)
@@ -2535,9 +2549,9 @@ local function feedOverview(visibleCount)
         decision, fmtMoney(cfg.maxSpend or 0), fmtMoney(cfg.profit or 0), S.session.buys or 0, fmtMoney(S.session.spent or 0))
     local p = queryPacing()
     local history = historyReadiness()
-    status = status .. string.format("\nFS search attempts %d/60s | min spacing %.1fs | shared readiness waits %d",
+    status = status .. string.format("\nFS search attempts %d/60s | routine spacing %.1fs | shared readiness waits %d",
         queryRequestCount(), p.interval, p.busyEpisodes)
-    local progress = string.format("Live item checks %d/%d completed | %d distinct targets | discovery %d\nFS search attempts %d/60s | minimum spacing %.1fs",
+    local progress = string.format("Live item checks %d/%d completed | %d individual targets | discovery %d\nFS search attempts %d/60s | routine spacing %.1fs",
         ss.autoCompleted or 0, ss.autoSent or 0, ss.autoUnique or 0, ss.sent or 0, queryRequestCount(), p.interval)
     local learning = string.format("Local history: %d ready | %d learning | %d stale\nLocal fallback needs %d time-spaced observations. Verified TSM references bypass warm-up.",
         history.ready, history.warming, history.stale, cfg.armAfter)
@@ -3025,7 +3039,7 @@ local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
             line = sweep.line or unit, market = market, profit = sweep.profit,
             detectedAt = detectedAt,
             t = queued and queued.t or GetTime(), refresh = queued and queued.refresh,
-            prebuy = queued and queued.prebuy }
+            prebuy = queued and queued.prebuy, forceSearch = queued and queued.forceSearch }
         if not queued then recordGate("offer", "queued for live tiers", itemID) end
         return
     end
@@ -3761,7 +3775,7 @@ local function avoidBrowseTab()
     end
 end
 
-canQuery = function(paging)
+canQuery = function(paging, urgent)
     if not cfg.enabled or not S.ahOpen then return false end
     if S.batchSearch then return false end
     if S.nativeSellActive() then return false end
@@ -3777,7 +3791,8 @@ canQuery = function(paging)
     -- The live API is authoritative. Shared SENT/QUEUED events can leave the
     -- cached flag false when a ready event is missing or arrives out of order.
     throttleReady = true
-    if GetTime() - lastQueryAt < queryPacing().interval then
+    if (not urgent and GetTime() - lastQueryAt < queryPacing().interval)
+        or GetTime() < S.queryReadyAt(urgent) then
         S.wakeSweep()
         return false
     end
@@ -4032,6 +4047,7 @@ do
             or type(C_AuctionHouse.HasFullBrowseResults) ~= "function" then return false end
         S.batchChecked = S.batchChecked or {}
         local candidates, now = {}, GetTime()
+        local priorityPool = not cfg.targeted and S.targetedPool() or nil
         local pool = db.book
         if cfg.targeted then
             pool = S.targetedPool()
@@ -4049,25 +4065,39 @@ do
                 end
             end
         end
-        -- Spend each available monitoring slot on up to 100 oldest keys. A
-        -- per-item cooldown wastes batch capacity on single-item fallback checks.
+        -- Keep broad coverage, but revisit the market-matched material seed
+        -- more often. At least 25 slots remain for oldest-first coverage.
         table.sort(candidates, function(a, b)
             if a.checked ~= b.checked then return a.checked < b.checked end
             return a.id < b.id
         end)
         local keys, ids = {}, {}
-        for _, candidate in ipairs(candidates) do
-            if #keys >= 100 then break end
+        local priorityIDs = {}
+        local function add(candidate)
             local id = candidate.id
             local ok, key = pcall(C_AuctionHouse.MakeItemKey, id)
             if ok and type(key) == "table" and key.itemID == id and not ids[id] then
                 keys[#keys + 1], ids[id] = key, true
+                if priorityPool and priorityPool[id] then priorityIDs[id] = true end
             end
         end
+        local priorityCount = 0
+        for _, candidate in ipairs(candidates) do
+            if priorityPool and priorityPool[candidate.id] then
+                priorityCount = priorityCount + 1
+                if #keys < 75 then add(candidate) end
+            end
+        end
+        for _, candidate in ipairs(candidates) do
+            if #keys >= 100 then break end
+            if not ids[candidate.id] then add(candidate) end
+        end
+        S.sweepStats.batchEligible = #candidates
+        S.sweepStats.batchPriorityEligible = priorityCount
         if #keys == 0 then return false end
         -- Own the browse channel before calling into clients with cached replies.
         S.sweeping = false
-        S.batchSearch = {t=now, ids=ids, count=#keys, targeted=cfg.targeted}
+        S.batchSearch = {t=now, ids=ids, count=#keys, targeted=cfg.targeted, priorityIDs=priorityIDs}
         noteQueryAttempt()
         S.sweepStats.batchSent = (S.sweepStats.batchSent or 0) + 1
         local ok = pcall(C_AuctionHouse.SearchForItemKeys, keys, {})
@@ -4107,6 +4137,11 @@ do
                 stats.batchRevisitMax = math.max(stats.batchRevisitMax or 0, gap)
                 stats.batchRevisitCount = (stats.batchRevisitCount or 0) + 1
                 stats.batchRevisitTotal = (stats.batchRevisitTotal or 0) + gap
+                local lane = owner.priorityIDs and owner.priorityIDs[id] and "priority" or "coverage"
+                stats.batchLanes = stats.batchLanes or {}
+                local metric = stats.batchLanes[lane] or {count=0,total=0,max=0}
+                metric.count, metric.total, metric.max = metric.count + 1, metric.total + gap, math.max(metric.max, gap)
+                stats.batchLanes[lane] = metric
             end
             S.batchChecked[id] = completedAt
             S.noteRevisit(id)
@@ -4124,6 +4159,16 @@ do
         local sort = stats.lastSort
         stats.lastSort = "batch"
         processBrowseRows(rows, false, "batch")
+        S.fastValidationCandidate = nil
+        for id in pairs(owner.ids) do
+            local candidate = S.liveCandidates and S.liveCandidates[id]
+            if candidate and not candidate.refresh and not candidate.prebuy and not candidate.remainder then
+                candidate.forceSearch = true
+                if not S.fastValidationCandidate or S.candidatePriority(candidate) > S.candidatePriority(S.fastValidationCandidate) then
+                    S.fastValidationCandidate = candidate
+                end
+            end
+        end
         stats.lastSort = sort
         S.wakeSweep()
         return true
@@ -4137,6 +4182,20 @@ do
             and math.min(2, sales.rate * math.log(1 + sales.daily)) or 0
         -- A bounded value boost cannot starve older candidates indefinitely.
         return age + math.min(5, math.log(1 + profit / 10000)) + liquidity
+    end
+
+    function S.fastValidation()
+        local candidate = S.fastValidationCandidate
+        if not candidate or not S.liveCandidates or S.liveCandidates[candidate.id] ~= candidate
+            or not candidate.detectedAt or GetTime() - candidate.detectedAt >= 1
+            or db.blacklist[candidate.id] or (not cfg.targeted and S.discoveryDue)
+            or cfg.prebuy or S.remainderRetry or S.deepScan
+            or S.liveCandidate or S.autoSearch or S.watchSearch or focusedDeal() then return end
+        if cfg.targeted then
+            local pool = S.targetedPool()
+            if not pool or not pool[candidate.id] then return end
+        end
+        return candidate
     end
 end
 
@@ -4154,6 +4213,21 @@ local function sweepQuery()
             S.sweepStats.timeouts = (S.sweepStats.timeouts or 0) + 1
             recordGate("search", "timed out", owner.id)
         end
+    end
+    local fast = S.fastValidation()
+    if fast then
+        if not canQuery(nil, true) then return end
+        local saved = math.max(0, S.queryReadyAt() - GetTime())
+        S.sweepStats.validationAdvanced = (S.sweepStats.validationAdvanced or 0) + 1
+        S.sweepStats.validationSaved = (S.sweepStats.validationSaved or 0) + saved
+        S.liveCandidates[fast.id], S.fastValidationCandidate = nil, nil
+        sweepCount = sweepCount + 1
+        if not cfg.targeted and sweepCount % 4 == 0 then
+            S.discoveryDue = true
+            S.sweepStats.discoveryBorrowed = (S.sweepStats.discoveryBorrowed or 0) + 1
+        end
+        sendTargetSearch("liveCandidate", fast)
+        return
     end
     if not canQuery() then return end
     if C_AuctionHouse == nil then return end
@@ -4535,7 +4609,7 @@ end
 function S.wakeSweep(notBefore)
     if not S.sweepTicker or not S.ahOpen or not cfg.enabled then return end
     local now = GetTime()
-    local due = math.max(now + 0.01, lastQueryAt + queryPacing().interval, notBefore or 0)
+    local due = math.max(now + 0.01, S.queryReadyAt(S.fastValidation() ~= nil), notBefore or 0)
     if S.sweepWake and S.sweepWake.at <= due then return end
     local owner = S.sweepTicker
     local wake = {at=due}
@@ -4692,7 +4766,8 @@ do
         if not ready then return false, reason == "unavailable" and "auction readiness unavailable" or "auction throttle busy" end
         if not (C_AuctionHouse and C_AuctionHouse.QueryOwnedAuctions) then return false, "owned query API unavailable" end
         if (S.sellingOwnedRequest and GetTime() - S.sellingOwnedRequest < 1)
-            or GetTime() - lastQueryAt < queryPacing().interval then return false, "query spacing; wait before retrying" end
+            or GetTime() - lastQueryAt < queryPacing().interval
+            or GetTime() < S.queryReadyAt() then return false, "query spacing; wait before retrying" end
         S.sellingOwnedRequest = GetTime()
         noteQueryAttempt()
         local ok, submitted = pcall(queryOwned, beforeQuery)
@@ -6049,13 +6124,22 @@ SlashCmdList.FOREVERSNIPER = function(msg)
         printf("validation timing: queue wait last/max %.2f/%.2fs; response last/max %.2f/%.2fs; %d discovery slots borrowed (next slot reserved for discovery).",
             ss.queueLast or 0, ss.queueMax or 0, ss.responseLast or 0, ss.responseMax or 0,
             ss.discoveryBorrowed or 0)
+        printf("urgent validation: %d dispatches; %.2fs total pacing wait avoided, repaid before routine searches. Rolling limit 60 attempts/60s.",
+            ss.validationAdvanced or 0, ss.validationSaved or 0)
         printf("batch discovery: %s; %d sent, %d completed, %d keys covered, %d rows, %d failures; last response %.2fs.",
             S.batchDisabled or (cfg.batch and "enabled (experimental)" or "off"),
             ss.batchSent or 0, ss.batchCompleted or 0, ss.batchKeys or 0,
             ss.batchRows or 0, ss.batchFailures or 0, ss.batchLatency or 0)
-        printf("batch revisit last/mean/max %.2f/%.2f/%.2fs (%d repeated item checks); oldest-first rotation. Includes scheduling and server waits, not listing age.",
+        printf("batch revisit last/mean/max %.2f/%.2f/%.2fs (%d repeated item checks). Includes scheduling and server waits, not listing age.",
             ss.batchRevisitLast or 0, (ss.batchRevisitTotal or 0) / math.max(1, ss.batchRevisitCount or 0),
             ss.batchRevisitMax or 0, ss.batchRevisitCount or 0)
+        printf("batch allocation: %d eligible; %d market-matched priority materials; up to 75 priority keys plus at least 25 oldest-first keys per broad batch. Unused priority slots return to coverage.",
+            ss.batchEligible or 0, ss.batchPriorityEligible or 0)
+        for _, lane in ipairs({"priority", "coverage"}) do
+            local metric = ss.batchLanes and ss.batchLanes[lane]
+            if metric then printf("%s batch revisit mean/max %.2f/%.2fs (%d repeats).", lane,
+                metric.total / math.max(1, metric.count), metric.max, metric.count) end
+        end
         printf("targeted list: %s. /fsn targeted on|off", S.targetedStatus())
         printf("prebuy new-search test: %s; timing evidence in /fsn diagnostics. No server snapshot age is available.", cfg.prebuy and "on (two presses)" or "off (normal one-press)")
         printf("automatic item checks: %d sent, %d completed, %d distinct targets; last target: %s (stock movement is not confirmed sales).",
@@ -6093,7 +6177,7 @@ SlashCmdList.FOREVERSNIPER = function(msg)
                 math.max(0, (S.dealFocus.buyWindowUntil or GetTime()) - GetTime()))
         end
         local p = queryPacing()
-        printf("FS live-search attempts: %d in the last 60s; minimum spacing %.1fs (fixed). Shared readiness waits: %d; observed wait span %.1fs. Shared waits do not identify their source.",
+        printf("FS live-search attempts: %d in the last 60s; routine spacing %.1fs; urgent validation can borrow one slot. Shared readiness waits: %d; observed wait span %.1fs. Shared waits do not identify their source.",
             queryRequestCount(), p.interval, p.busyEpisodes,
             p.busySeconds + (p.busySince and math.max(0, GetTime() - p.busySince) or 0))
         local history = historyReadiness()
