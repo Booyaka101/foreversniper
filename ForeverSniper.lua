@@ -20,6 +20,7 @@ local DEFAULTS = {
     every     = 45,      -- seconds between full scans while the AH is open
     sweep     = 2,       -- fallback scheduler tick; ready events also wake paced searches
     batch     = true,    -- owner-approved rollout; failures retain individual fallback
+    targeted  = false,   -- opt-in Normal Horde material list; no routine broad discovery
     tsm       = true,    -- verified realm pricing bootstraps discovery; local history caps it
     sales     = true,    -- fresh TSM sales data only tightens market/dump estimates
     saleRate  = 0.05,    -- minimum regional posting success rate when known
@@ -3467,16 +3468,19 @@ function S.noteRevisit(id)
 end
 
 S.autoChecked = {}
-local function nextAutoTarget()
+local function nextAutoTarget(pool, cooldown)
     local now, best, bestScore = time(), nil, nil
     local budget = S.purchaseBudget()
-    for rawID, b in pairs(db.book) do
+    for rawID in pairs(pool or db.book) do
+        local b = db.book[rawID] or {}
         local id = tonumber(rawID)
-        if id and not watchByID[id] and not db.blacklist[id] and commodityFor(id) == true then
+        local commodity = id and commodityFor(id)
+        if pool and id and commodity == nil then requestItemLoad(id) end
+        if id and not watchByID[id] and not db.blacklist[id] and commodity == true then
             local market = S.marketReference(id, now)
             local line = market and dealLine(market, id)
             local elapsed = GetTime() - (S.autoChecked[id] or -60)
-            local eligible = market and market >= cfg.minUnit and line <= budget and elapsed >= 10
+            local eligible = market and market >= cfg.minUnit and line <= budget and elapsed >= (cooldown or 10)
             local info = eligible and infoOf(id)
             if info and info.stackable ~= false and (info.quality == -1 or info.quality >= (cfg.quality or 1)) then
                 -- Depletion is demand evidence, not confirmed sales. Aging keeps
@@ -3778,6 +3782,41 @@ local function processBrowseRows(rows, added, source)
 end
 
 do
+    -- Seed only, not buy prices or proof of live commodity eligibility. Selected
+    -- from the 2026-11-17 Forever-EU sales / Normal Horde price feed (115 mats).
+    S.targetedItems = {
+        [12360]=true, [12363]=true, [14047]=true, [4306]=true, [8170]=true, [15416]=true, [14344]=true, [4338]=true, [3858]=true, [4304]=true,
+        [10620]=true, [2592]=true, [13468]=true, [3860]=true, [2841]=true, [12359]=true, [4234]=true, [7078]=true, [13463]=true, [14256]=true,
+        [2772]=true, [2776]=true, [2838]=true, [2840]=true, [2775]=true, [4235]=true, [3575]=true, [2770]=true, [7076]=true, [13466]=true,
+        [7910]=true, [15417]=true, [7912]=true, [3859]=true, [13465]=true, [12365]=true, [11176]=true, [8845]=true, [7911]=true, [3577]=true,
+        [11137]=true, [2771]=true, [7067]=true, [7082]=true, [2842]=true, [2452]=true, [10939]=true, [7080]=true, [16203]=true, [3821]=true,
+        [16204]=true, [11083]=true, [4625]=true, [3819]=true, [8838]=true, [11175]=true, [11178]=true, [11135]=true, [3576]=true, [8836]=true,
+        [3818]=true, [8169]=true, [4232]=true, [8846]=true, [6037]=true, [11177]=true, [8831]=true, [3820]=true, [16202]=true, [8839]=true,
+        [1206]=true, [10938]=true, [7068]=true, [1705]=true, [7077]=true, [1529]=true, [3369]=true, [3357]=true, [13464]=true, [3864]=true,
+        [11134]=true, [7070]=true, [12800]=true, [12803]=true, [7069]=true, [1210]=true, [12808]=true, [11174]=true, [12799]=true, [8150]=true,
+        [12364]=true, [783]=true, [7909]=true, [14343]=true, [13467]=true, [7079]=true, [9262]=true, [7075]=true, [7972]=true, [7081]=true,
+        [8171]=true,
+    }
+
+    function S.targetedPool()
+        if not ForeverSniperTSM or type(ForeverSniperTSM.marketIdentity) ~= "function" then return nil end
+        local market, region = ForeverSniperTSM.marketIdentity()
+        if market == "normal-horde" and region == "forever-eu" then return S.targetedItems end
+    end
+
+    function S.targetedStatus()
+        local total, checked = 0, 0
+        for id in pairs(S.targetedItems) do
+            total = total + 1
+            if S.targetedSeen and S.targetedSeen[id] then checked = checked + 1 end
+        end
+        return string.format("%s; Normal Horde / Forever-EU seed %d materials; %d distinct batch checks this session; %s",
+            cfg.targeted and "on" or "off", total, checked,
+            S.targetedPool() and "market verified" or "market unverified or mismatched (targeted searches paused)")
+    end
+end
+
+do
     function S.failBatch(reason)
         S.batchSearch = nil
         S.batchDisabled = reason
@@ -3793,11 +3832,19 @@ do
             or type(C_AuctionHouse.HasFullBrowseResults) ~= "function" then return false end
         S.batchChecked = S.batchChecked or {}
         local candidates, now = {}, GetTime()
-        for rawID, b in pairs(db.book) do
+        local pool = db.book
+        if cfg.targeted then
+            pool = S.targetedPool()
+            if not pool then return false end
+        end
+        for rawID in pairs(pool) do
+            local b = db.book[rawID] or {}
             local id = num(rawID)
+            local commodity = id and commodityFor(id)
+            if cfg.targeted and id and commodity == nil then requestItemLoad(id) end
             local checked = id and (S.batchChecked[id] or -60)
-            if id and id > 0 and id % 1 == 0 and not watchByID[id] and not db.blacklist[id] and commodityFor(id) == true
-                and now - checked >= 10 then
+            if id and id > 0 and id % 1 == 0 and not watchByID[id] and not db.blacklist[id] and commodity == true
+                and now - checked >= (cfg.targeted and 0 or 10) then
                 local market = S.marketReference(id)
                 if market and market >= cfg.minUnit then
                     local samples = b.s or {}
@@ -3806,7 +3853,7 @@ do
                     -- without letting them continually displace older coverage.
                     local hot = stamp and stamp <= time() and time() - stamp <= 120
                         and price and price > 0 and price <= market * 0.85
-                    candidates[#candidates + 1] = {id=id, checked=checked, priority=checked - (hot and 5 or 0)}
+                    candidates[#candidates + 1] = {id=id, checked=checked, priority=checked - (not cfg.targeted and hot and 5 or 0)}
                 end
             end
         end
@@ -3826,7 +3873,7 @@ do
         if #keys == 0 then return false end
         -- Own the browse channel before calling into clients with cached replies.
         S.sweeping = false
-        S.batchSearch = {t=now, ids=ids, count=#keys}
+        S.batchSearch = {t=now, ids=ids, count=#keys, targeted=cfg.targeted}
         noteQueryAttempt()
         S.sweepStats.batchSent = (S.sweepStats.batchSent or 0) + 1
         local ok = pcall(C_AuctionHouse.SearchForItemKeys, keys, {})
@@ -3860,6 +3907,10 @@ do
         for id in pairs(owner.ids) do
             S.batchChecked[id] = GetTime()
             S.noteRevisit(id)
+            if owner.targeted then
+                S.targetedSeen = S.targetedSeen or {}
+                S.targetedSeen[id] = true
+            end
         end
         local stats = S.sweepStats
         stats.batchCompleted = (stats.batchCompleted or 0) + 1
@@ -3927,6 +3978,11 @@ local function sweepQuery()
             return
         end
     end
+    local targetedPool
+    if cfg.targeted then
+        targetedPool = S.targetedPool()
+        if not targetedPool then return end
+    end
     local focus = focusedDeal()
     if focus and S.dealFocus then
         local priority = S.dealFocus
@@ -3936,7 +3992,7 @@ local function sweepQuery()
         if GetTime() < priority.buyWindowUntil then return end
     end
     sweepCount = sweepCount + 1
-    local discoveryDue = S.discoveryDue
+    local discoveryDue = not cfg.targeted and S.discoveryDue
     S.discoveryDue = nil
     if focus and sweepCount % 4 == 3 and not discoveryDue and not next(S.liveCandidates or {}) then
         local snapshot = S.commoditySnapshots[focus.id]
@@ -3953,12 +4009,15 @@ local function sweepQuery()
     end
     rebuildWatch()
     local watchKey, watchID, watchRule
-    local targetSlot = not discoveryDue and sweepCount % 4 ~= 0
+    local targetSlot = cfg.targeted or (not discoveryDue and sweepCount % 4 ~= 0)
     if not discoveryDue and (targetSlot or (not S.deepScan and not blizzardBrowseActive()
         and C_AuctionHouse.SendBrowseQuery)) then
         local oldest
         for id, candidate in pairs(S.liveCandidates or {}) do
-            if GetTime() - candidate.t >= 30 then
+            if cfg.targeted and not targetedPool[id] and not watchByID[id] then
+                -- A mode change must not dispatch old broad-discovery candidates.
+                S.liveCandidates[id] = nil
+            elseif GetTime() - candidate.t >= 30 then
                 S.liveCandidates[id] = nil
                 recordGate("preparation", "expired before search", id)
             elseif not oldest or S.candidatePriority(candidate) > S.candidatePriority(oldest)
@@ -3984,7 +4043,7 @@ local function sweepQuery()
     if targetSlot and C_AuctionHouse.SendSearchQuery then
         local key, id, w = watchKey, watchID, watchRule
         if not key and S.startBatch() then return end
-        local target = not key and nextAutoTarget() or nil
+        local target = not key and nextAutoTarget(targetedPool, cfg.targeted and 0 or nil) or nil
         if target then id = target.id end
         if key or target then
             local request = target or {id=id, maxPrice=w.maxPrice, rule=w}
@@ -4000,6 +4059,7 @@ local function sweepQuery()
             return
         end
     end
+    if cfg.targeted then return end -- never silently fall back to broad discovery
     if S.deepScan then return end -- deep scan retains browse ownership, not item searches
     if blizzardBrowseActive() then
         -- querying under Blizzard's own browse results can crash its ScrollBox;
@@ -5535,6 +5595,7 @@ local HELP = {
     "/fsn sales [ID]      inspect regional sales; on/off, rate/share PCT set policy",
     "/fsn sweep 3          fallback tick seconds (2-30); ready events wake paced searches",
     "/fsn batch on|off     experimental 100-key summaries; failures fall back to item checks",
+    "/fsn targeted on|off  101 Normal Horde / Forever-EU materials; no routine broad queries",
     "/fsn max 250g         spend cap per Buy click",
     "/fsn keep 10g         keep this gold untouched (5% wallet buffer also applies)",
     "/fsn stock 200        default per-item exposure cap (0 = off)",
@@ -5722,10 +5783,15 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             S.batchDisabled or (cfg.batch and "enabled (experimental)" or "off"),
             ss.batchSent or 0, ss.batchCompleted or 0, ss.batchKeys or 0,
             ss.batchRows or 0, ss.batchFailures or 0, ss.batchLatency or 0)
+        printf("targeted list: %s. /fsn targeted on|off", S.targetedStatus())
         printf("automatic item checks: %d sent, %d completed, %d distinct targets; last target: %s (stock movement is not confirmed sales).",
             ss.autoSent or 0, ss.autoCompleted or 0, ss.autoUnique or 0, tostring(ss.lastTarget or "none"))
-        printf("last discovery scope: %s; sort: %s. Routine discovery alternates broad categories and available subcategories, one page per query.",
-            ss.lastCat or "none", ss.lastSort or "none")
+        if cfg.targeted then
+            printf("routine broad discovery is off; targeted list searches share the existing request budget.")
+        else
+            printf("last discovery scope: %s; sort: %s. Routine discovery alternates broad categories and available subcategories, one page per query.",
+                ss.lastCat or "none", ss.lastSort or "none")
+        end
         local owner = S.liveCandidate or S.autoSearch or S.watchSearch
         local ready, readinessReason = throttleGate()
         local readiness = ready and "ready" or (readinessReason == "busy" and "waiting" or "unavailable")
@@ -5939,6 +6005,18 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             printf("batch discovery %s (experimental; full live tiers still required).", cfg.batch and "on" or "off")
             S.wakeSweep()
         else printf("usage: /fsn batch on|off; current: %s", cfg.batch and "on" or "off") end
+
+    elseif cmd == "targeted" then
+        if rest == "on" or rest == "off" then
+            cfg.targeted = rest == "on"
+            -- Keep in-flight owners and saved watches. The next scheduling slot
+            -- uses the new mode without inheriting a broad-discovery debt.
+            S.discoveryDue = nil
+            S.wakeSweep()
+        elseif rest ~= "" then
+            printf("usage: /fsn targeted [on|off]")
+        end
+        printf("targeted list: %s. Existing watches and purchase safeguards remain active.", S.targetedStatus())
 
     elseif cmd == "sweep" then
         local v = tonumber(rest)

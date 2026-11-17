@@ -1,5 +1,29 @@
 # Depth optimiser verification
 
+## Targeted material-list trial, November 17, 2026
+
+Branch: `feat/targeted-materials`, based on PR #11 commit
+`06806cff829fb0c8c393fd48526673aaac6b3ba2`. No installation, saved-variable
+edits, threshold changes, release or purchase-policy changes are included.
+
+- Added opt-in `/fsn targeted on|off`: fixed 101-material Normal Horde / Forever-EU
+  seed, up to 100 keys per summary, oldest-completed-first with no ten-second
+  batch cooldown and no routine broad-category discovery.
+- Seed IDs exactly match the read-only shortlist generated from 115 known mats,
+  regional sales feed `2026-11-17T01:02:06Z` and Normal Horde market/recent feed
+  `2026-11-17T05:18:53Z`. Selection and limitations are documented in README.
+- `npm test`: 183 tests passed, including 101-key coverage, candidate preparation,
+  same-pool fallback, unknown commodity warming, scope rejection, pacing,
+  opt-in persistence, mode changes, ownership and purchase locks.
+- Static checker: zero errors and warnings. Strict load/lifecycle simulation:
+  clean, with existing unknown-event notices. `git diff --check`: passed.
+- Logs: `C:/Users/cbosc/AppData/Local/Temp/opencode/forever-targeted-{tests,lint,sim}.log`.
+
+Actual live eligibility, full-list revisit times, available-at-click bargains and
+realized profit remain unmeasured. This list is not automatically reranked. The
+known extended AH-scenario failures below are not claimed as a passing gate.
+CI on the exact PR commit and owner approval remain required before deployment.
+
 ## Scope
 
 Branch: `feat/forever-depth-optimizer`. Baseline commit `31902e9` preserves

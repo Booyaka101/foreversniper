@@ -46,6 +46,7 @@ local function requestItemSearch(id)
     if synchronous then synchronous(id) end
 end
 local function recordGate() end
+local function requestItemLoad() end
 local function err() end
 local function printf() end
 local function dbg() end
@@ -78,6 +79,7 @@ const production = section('local SCAN_CATEGORIES =', '\nif db.boughtAt == nil')
   + section('local throttleReady, pagePending', '\nS.autoChecked =')
   + section('local function queryPacing()', '\nlocal function requestItemSearch')
   + section('canQuery = function(paging)', '\nlocal function discoveryScope')
+  + section('do\n    -- Seed only,', '\ndo\n    function S.failBatch')
   + section('do\n    function S.failBatch', '\nlocal function sweepQuery()')
   + section('local function sweepQuery()', '\n-- DEEP')
   + section('-- DEEP SCAN (/fsn deepscan', '\nfunction S.wakeSweep()')
@@ -166,6 +168,149 @@ const batchSetup = `
 `;
 function batchCheck(code) { check(batchSetup + code); }
 
+const targetedSetup = `
+  cfg.targeted=true
+  ForeverSniperTSM={marketIdentity=function() return "normal-horde","forever-eu" end}
+  function S.marketReference() return 10000 end
+  auto=nil
+`;
+function targetedCheck(code) { batchCheck(targetedSetup + code); }
+
+test('targeted seed contains 101 materials and bootstraps without changing the book', () => targetedCheck(`
+  db.book={}
+  local n=0; for id in pairs(S.targetedPool()) do assert(id>0 and id%1==0); n=n+1 end
+  assert(n==101 and S.targetedItems[2592] and S.targetedItems[12360])
+  assert(S.startBatch() and S.batchSearch.count==100)
+  assert(next(db.book)==nil)
+`));
+
+test('targeted batches cover all 101 keys without the broad cooldown or discovery slots', () => targetedCheck(`
+  local seen={}
+  submit=function(keys)
+    assert(#keys<=100)
+    for _,key in ipairs(keys) do assert(S.targetedItems[key.itemID]); seen[key.itemID]=true end
+    S.readBatch()
+  end
+  slots(2)
+  local n=0; for _ in pairs(seen) do n=n+1 end
+  assert(n==101 and count("batch")==2 and count("browse")==0)
+  slots(6)
+  assert(count("batch")==8 and count("browse")==0 and count("target")==0)
+  assert(S.targetedStatus():find("101 distinct batch checks",1,true))
+`));
+
+test('real individual selector honours the target pool, budget and zero revisit cooldown', () => targetedCheck(`
+  function S.purchaseBudget() return 10000 end
+  local function dealLine(market) return market*.7 end
+  local function infoOf() return {quality=2,stackable=true} end
+  local function absorbVelocity() end
+  local function movementScore() return 0 end
+  ${section('local function nextAutoTarget(', '\n-- one watched item')}
+  local pool={[2592]=true,[2775]=true}
+  db.book={}; S.autoChecked[2592]=now; db.blacklist[2775]=true
+  local target=nextAutoTarget(pool,0)
+  assert(target and target.id==2592 and target.line==7000)
+  assert(nextAutoTarget(pool,10)==nil)
+  function S.purchaseBudget() return 6999 end
+  assert(nextAutoTarget(pool,0)==nil)
+  function S.purchaseBudget() return 10000 end
+  commodityFor=function() return false end
+  assert(nextAutoTarget(pool,0)==nil)
+`));
+
+test('targeted mode checks market identity and never falls through to broad searches', () => {
+  for (const identity of [
+    'return "normal-alliance","forever-eu"', 'return "hardcore-horde","forever-hc-eu"',
+    'return "normal-horde","forever-us"', 'return nil,nil',
+  ]) targetedCheck(`
+    ForeverSniperTSM.marketIdentity=function() ${identity} end
+    slots(8); assert(#queries==0 and not S.targetedPool())
+  `);
+  targetedCheck('ForeverSniperTSM=nil; slots(4); assert(#queries==0)');
+});
+
+test('targeted eligibility retains live commodity, blacklist, watch and reference checks', () => targetedCheck(`
+  S.targetedItems={[1]=true,[2]=true,[3]=true,[4]=true,[5]=true,[6]=true}
+  watchByID[1]={}; db.blacklist[2]=true
+  local warmed=0
+  requestItemLoad=function(id) assert(id==4); warmed=warmed+1 end
+  commodityFor=function(id) if id==4 then return nil end return id~=3 end
+  function S.marketReference(id) if id==5 then return 0 end return 10000 end
+  submit=function(keys) assert(#keys==1 and keys[1].itemID==6) end
+  assert(S.startBatch() and warmed==1)
+`));
+
+test('targeted candidates get detail checks before another summary, without discovery debt', () => targetedCheck(`
+  local id=2592
+  S.discoveryDue=true
+  S.liveCandidates={[id]={id=id,t=now,line=10,market=10000},[999]={id=999,t=now}}
+  slots(1)
+  assert(count("target",id)==1 and count("batch")==0 and not S.discoveryDue)
+  assert(not S.liveCandidates[999])
+`));
+
+test('targeted batch failure and missing APIs restrict individual fallback to the seed pool', () => {
+  for (const change of ['S.batchDisabled="failed"', 'cfg.batch=false', 'C_AuctionHouse.SearchForItemKeys=nil']) targetedCheck(`
+    ${change}
+    nextAutoTarget=function(pool,cooldown)
+      assert(pool==S.targetedItems and cooldown==0)
+      return {id=2592,line=10,market=10000}
+    end
+    slots(8)
+    assert(count("target",2592)==8 and count("browse")==0 and count("batch")==0)
+  `);
+});
+
+test('targeted mode with no eligible keys idles instead of running a broad query', () => targetedCheck(`
+  function S.marketReference() end
+  slots(8); assert(#queries==0)
+`));
+
+test('targeted summaries retain candidate-only processing and buy locks', () => {
+  targetedCheck(`
+    submit=function(keys)
+      resultRows={{itemKey=keys[1],minPrice=10,totalQuantity=50}}
+      S.readBatch()
+    end
+    slots(1)
+    assert(#processed==1 and next(S.commoditySnapshots)==nil and #S.deals==0)
+  `);
+  for (const change of ['db.unsettledPurchase={}', 'S.quote={}', 'S.batchBuy={pending=true}', 'ready=false', 'nativeSell=true']) {
+    targetedCheck(`${change}; slots(4); assert(#queries==0)`);
+  }
+});
+
+test('targeted batches retain shared one-second and rolling-minute pacing', () => targetedCheck(`
+  submit=function() S.readBatch() end
+  for i=0,700 do now=100+i/10; sweepQuery() end
+  for i,query in ipairs(queries) do
+    if i>1 then assert(query.t-queries[i-1].t>=1) end
+    local n=0
+    for j=i,1,-1 do if query.t-queries[j].t>=60 then break end n=n+1 end
+    assert(n<=60)
+  end
+  assert(count("batch")>=60 and count("browse")==0)
+`));
+
+test('targeted command preserves saved watches and in-flight ownership', () => {
+  const command = section('    elseif cmd == "targeted" then', '\n    elseif cmd == "sweep" then')
+    .replace('elseif cmd', 'if cmd');
+  targetedCheck(`
+    local function command(rest)
+      local cmd="targeted"
+      ${command}
+      end
+    end
+    db.watch[2592]={maxPrice=100}; local watches=db.watch
+    assert(S.startBatch()); local owner=S.batchSearch
+    command("off"); assert(not cfg.targeted and S.batchSearch==owner)
+    S.discoveryDue=true; command("on")
+    assert(cfg.targeted and not S.discoveryDue and db.watch==watches)
+    command("invalid"); assert(cfg.targeted and S.batchSearch==owner)
+    S.readBatch(); assert(S.targetedSeen and not S.batchSearch)
+  `);
+});
+
 test('batch targets can use a trusted reference before local history has warmed up', () => batchCheck(`
   db.book={[123]={s={}}}
   function S.marketReference(id) assert(id==123); return 10000 end
@@ -181,8 +326,17 @@ test('owner-approved default enables batching without overriding explicit saved 
   `);
 });
 
+test('targeted mode is opt-in and preserves explicit saved choices', () => {
+  const init = section('local DEFAULTS =', '\n-- one-time retune:');
+  for (const setting of ['nil', 'false', 'true']) run(`
+    ForeverSniperDB={config={targeted=${setting}}}
+    ${init}
+    assert(db.config.targeted==${setting === 'nil' ? 'false' : setting})
+  `);
+});
+
 test('batch command toggles future requests without abandoning an in-flight owner', () => {
-  const command = section('    elseif cmd == "batch" then', '\n    elseif cmd == "sweep" then')
+  const command = section('    elseif cmd == "batch" then', '\n    elseif cmd == "targeted" then')
     .replace('elseif cmd', 'if cmd');
   batchCheck(`
     local function command(rest)

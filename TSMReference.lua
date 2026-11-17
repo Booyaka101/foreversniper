@@ -54,6 +54,10 @@ local function regionKey()
     return (string.find(realm, "hardcore-", 1, true) == 1 and "forever-hc-" or "forever-") .. string.lower(portal)
 end
 
+function provider.marketIdentity()
+    return realmKey(), regionKey()
+end
+
 local function observe(tag, realm, data)
     if type(realm) ~= "string" or type(data) ~= "string" then return end
     -- The installed Forever AppHelper uses realm/faction data even for mats.
