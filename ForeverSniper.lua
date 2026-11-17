@@ -128,7 +128,12 @@ local function printRecordedLog(informational)
     end
     for i = math.max(1, #records - 9), #records do
         local record = records[i]
-        printf("  [%s] %s -- %s", date("%m-%d %H:%M", record.t), record.domain, tostring(record.err):sub(1, 180))
+        local message = tostring(record.err)
+        local length = informational and #message or math.min(180, #message)
+        for offset = 1, math.max(1, length), 180 do
+            printf("  [%s] %s%s -- %s", date("%m-%d %H:%M", record.t), record.domain,
+                offset > 1 and " (continued)" or "", message:sub(offset, offset + 179))
+        end
     end
 end
 
@@ -971,6 +976,7 @@ do
         local timing = snapshot and snapshot.timing or {}
         return {detectedAt=timing.detectedAt, searchAt=timing.searchAt,
             completedAt=snapshot and snapshot.t, validatedAt=timing.validatedAt,
+            feedRenderedAt=timing.feedRenderedAt,
             method=timing.method, source=source, clickAt=GetTime(), prebuy=cfg.prebuy == true}
     end
 
@@ -981,10 +987,11 @@ do
             if not start or not finish or finish < start then return "unknown" end
             return string.format("%.2fs", finish - start)
         end
-        diagnostic("purchase timing", string.format("attempt %d; item %d; %s; mode %s; query %s; detect-to-search %s; search-to-complete %s; validate-to-click %s; click-to-quote %s; detect-to-quote %s; completed-age-at-click %s; %s (not server snapshot age)",
+        diagnostic("purchase timing", string.format("attempt %d; item %d; %s; mode %s; query %s; detect-to-search %s; search-to-complete %s; validate-to-click %s; validate-to-feed %s; feed-to-click %s; click-to-quote %s; detect-to-quote %s; completed-age-at-click %s; %s (not server snapshot age)",
             p.attempt, p.deal.id, outcome, timing.prebuy and "new-search test" or "normal",
             timing.method or "unknown", elapsed(timing.detectedAt, timing.searchAt),
             elapsed(timing.searchAt, timing.completedAt), elapsed(timing.validatedAt, timing.clickAt),
+            elapsed(timing.validatedAt, timing.feedRenderedAt), elapsed(timing.feedRenderedAt, timing.clickAt),
             elapsed(timing.clickAt, GetTime()), elapsed(timing.detectedAt, GetTime()),
             elapsed(timing.completedAt, timing.clickAt), timing.source or "unknown"))
     end
@@ -1972,7 +1979,7 @@ db.deals = S.deals
 local MAX_FEED = 200
 local feedFrame, feedRows, feedStatus, feedEmpty
 local FEED_ROWS, FEED_ROW_H, FEED_W = 14, 26, 700
-local feedDirty, feedLastRefresh = false, 0
+local feedDirty, feedLastRefresh, feedRefreshWake = false, 0, nil
 local buyFailUntil = {} -- itemID -> failed purchases rest for a while
 
 -- Only a live-validated position can reserve scanner time. Persisted feed
@@ -2469,7 +2476,20 @@ local function refreshFeed()
     if not feedFrame or not feedFrame:IsShown() then feedDirty = true return end
     -- throttled: a burst of deals refreshes once per quarter second, not per alert
     local now = GetTime()
-    if now - feedLastRefresh < 0.25 then feedDirty = true return end
+    if now - feedLastRefresh < 0.25 then
+        feedDirty = true
+        if not feedRefreshWake then
+            local wake = {}
+            feedRefreshWake = wake
+            after(math.max(0.01, feedLastRefresh + 0.25 - now), function()
+                if feedRefreshWake ~= wake then return end
+                feedRefreshWake = nil
+                if feedDirty then refreshFeed() end
+            end)
+        end
+        return
+    end
+    feedRefreshWake = nil
     feedLastRefresh = now
     feedDirty = false
     -- COMBINE LOTS: same-item deals merge into one affordable group (the
@@ -2532,6 +2552,12 @@ local function refreshFeed()
             end
             row.t = d.t
             row:Show()
+            local snapshot = S.commoditySnapshots[d.id]
+            local timing = snapshot and snapshot.timing
+            if ready and not d.gone and not d.bought and timing and timing.validatedAt and not timing.feedRenderedAt then
+                -- UI submission time, not a screen-paint or player-observation timestamp.
+                timing.feedRenderedAt = GetTime()
+            end
         else
             row:Hide()
         end
@@ -2546,8 +2572,7 @@ local function refreshFeed()
     end
 end
 
--- called from the OnUpdate ticker: applies a deferred refresh when one was
--- requested during the throttle window
+-- Deferred redraws own their deadline independently of the scanner tick.
 S.feedRefresh = refreshFeed -- runtime hook for code defined above the feed
 function S.refreshBuyButtons()
     -- Readiness windows can be shorter than the full feed's repaint interval.
@@ -2696,7 +2721,7 @@ local function buildFeed()
     tinsert(UISpecialFrames, "ForeverSniperFeed") -- ESC closes the feed
     -- Closing this window is temporary; it opens again on the next AH visit.
     feedFrame:SetClampedToScreen(true)
-    feedFrame:SetScript("OnShow", function() feedDirty = true end)
+    feedFrame:SetScript("OnShow", function() refreshFeed() end)
     feedFrame:SetScript("OnDragStart", feedFrame.StartMoving)
     feedFrame:SetScript("OnDragStop", feedFrame.StopMovingOrSizing)
     local bg = feedFrame:CreateTexture(nil, "BACKGROUND")

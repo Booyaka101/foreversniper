@@ -99,7 +99,7 @@ function salesCheck(body) {
 test('purchase timing separates validation age from the fast quote response', () => check(`
   local saved=snapshot({{price=10,quantity=10},{price=100,quantity=1}})
   saved.t=97.11
-  saved.timing={detectedAt=90,searchAt=94,validatedAt=97.11,method='refresh commodity'}
+  saved.timing={detectedAt=90,searchAt=94,validatedAt=97.11,feedRenderedAt=98.11,method='refresh commodity'}
   quickBuy({itemID=123,line=10,units=10,cost=100,market2=100,kind='market'})
   assert(calls.start==1 and S.snipePending.timing.completedAt==97.11)
   now=100.32
@@ -110,6 +110,8 @@ test('purchase timing separates validation age from the fast quote response', ()
   assert(message:find('detect-to-search 4.00s',1,true))
   assert(message:find('search-to-complete 3.11s',1,true))
   assert(message:find('validate-to-click 2.89s',1,true))
+  assert(message:find('validate-to-feed 1.00s',1,true))
+  assert(message:find('feed-to-click 1.89s',1,true))
   assert(message:find('click-to-quote 0.32s',1,true))
   assert(message:find('detect-to-quote 10.32s',1,true))
   assert(message:find('refresh commodity',1,true) and calls.confirm==0)
@@ -125,6 +127,8 @@ test('missing timing stays unknown and fallback reads do not reset completion ag
   for _,entry in ipairs(diagnostics) do if entry.domain=='purchase timing' then message=entry.message end end
   assert(message:find('detect-to-search unknown',1,true))
   assert(message:find('search-to-complete unknown',1,true))
+  assert(message:find('validate-to-feed unknown',1,true))
+  assert(message:find('feed-to-click unknown',1,true))
   assert(message:find('completed-age-at-click 3.00s',1,true))
   assert(message:find('completed fallback',1,true) and calls.confirm==0)
 `));
