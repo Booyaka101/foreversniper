@@ -14,16 +14,20 @@ sets the fallback tick (2-30 seconds), not the event-driven request interval.
 The live readiness API is authoritative: stale SENT/QUEUED event flags do not add
 a five-second delay after the server reports ready. The feed distinguishes owned
 batch/browse replies from idle shared-throttle waits.
+Pacing and reserved click-window deadlines schedule their own wake, so an expired
+wait does not need another server event or fallback tick to resume. Earlier ready
+events can advance a pending wake; each dispatch rechecks the normal gates.
 
-Routine scheduling alternates target checks and discovery opportunities instead
-of allocating only one discovery slot in four. Watches retain one slot in four.
+Routine scheduling reserves three monitoring slots per broad-discovery slot.
+Queued bargains can borrow one discovery slot, repaid before another candidate.
+Watches retain priority over speculative checks in one slot in four.
 Weighted categories are spread across the rotation rather than clustered.
 A displayed deal can use a target slot for a refresh no more often than once
-every 15 seconds; it no longer pauses unrelated discovery. An in-flight search
-can finish its pages before the next search starts. Deep discovery also continues
-with a displayed deal, but pending or unresolved purchases still stop queries.
+every 15 seconds, after one five-second ready window for the player to buy.
+An in-flight search can finish its pages before the next search starts. Deep
+discovery also continues after that window, but pending or unresolved purchases
+still stop queries.
 
-This trades some automatic target-check slots per cycle for broader discovery.
 Server delays, pagination, stock refreshes, history availability, and other addons
 still affect coverage. These scheduling changes do not establish a measured
 live-client detection speed or guarantee winning a contested listing.
@@ -84,9 +88,9 @@ prices and regional sale average. This is a fixed initial pool, not an automatic
 daily ranking, an exhaustive commodity catalogue, or evidence of bargain frequency.
 Regional daily/AH volume is not faction-specific demand or guaranteed personal sales.
 
-Every available routine slot can search up to 100 eligible list keys. Keys rotate
-oldest-completed-first without the broad mode's ten-second cooldown or proximity
-boost. An eligible 101-key pool can be covered in two batch replies, but actual
+Every available routine slot can search up to 100 eligible list keys. Keys use the
+same oldest-completed-first rotation as broad-book batches. An eligible 101-key
+pool can be covered in two batch replies, but actual
 coverage depends on live eligibility, latency, detail searches and purchase pauses.
 No routine broad-category query is sent in this mode. Manual watches, explicit
 deep/full scans and existing displayed-offer refreshes remain available.
@@ -114,14 +118,19 @@ live response semantics still need validation. Existing explicit off settings ar
 preserved. `/fsn batch off` stops new batches; an in-flight request keeps
 ownership until it completes or times out. `/fsn status` reports sent/completed
 batches, requested keys in completed batches (including repeat visits), returned
-rows, failures, and the last response time.
+rows, failures, and the last response time. Batch-only revisit last/mean/max
+measures the interval between completed summaries for each requested item,
+including empty complete replies. It excludes individual validation events;
+the first check has no revisit interval, and counts include repeated items.
 
 Batches use automatic target opportunities after queued candidates, watches and
 due displayed-deal refreshes. Broad category discovery keeps its reserved slots
-to find unfamiliar items. Keys with fresh market history rotate oldest-check-first
-with a minimum ten-second revisit interval. Deep scans retain their own browse
-channel; batch requests do not run alongside them. Item checks resume when no
-batch keys are due or the required APIs are absent.
+to find unfamiliar items. Eligible keys with fresh references rotate
+oldest-check-first continuously, filling each batch up to 100 keys. There is no
+per-item ten-second cooldown or proximity boost. Shared one-second request
+spacing and server readiness still apply. Deep scans retain their own browse
+channel; batch requests do not run alongside them. Individual checks remain the
+fallback when no batch is eligible, batching is off, or its APIs are unavailable.
 
 Unreadable, incomplete, unexpected or duplicate rows, submission errors, dropped
 requests and five-second timeouts disable batches for the current UI session.
@@ -140,7 +149,12 @@ profit boost; summary profit is only a priority hint, not validated earnings.
 There is no 1% change cutoff: unchanged summaries and small quantity changes
 remain eligible on later visits. Existing duplicate-alert checks still apply.
 
-Local tests establish scheduling and fallback behaviour, not a live speedup.
+In the deterministic 205-item, 40-slot comparison (immediate replies, no candidates
+or purchase pauses), continuous rotation checks 3,000 item keys versus 820 before,
+with the same 10 broad queries and 40 total requests. Mean batch revisit falls
+from 10.18s to 2.71s; maximum from 11s to 4s. Delayed-reply and 1,000-item tests also
+cover rotation, spacing and fairness. These tests establish scheduling behavior,
+not a measured live speedup.
 During the default-on rollout, compare batches on/off with the same
 known items: completed keys per minute, revisit delays, candidate-to-alert time,
 timeouts and stale-result rejections. Last response time is not listing age.
@@ -207,8 +221,8 @@ pages and the bounded five-second focused Buy window still take precedence.
 These are scheduling priorities, not faster server requests or instant alerts.
 
 Batch summaries revisit up to 100 known eligible items per request. Oldest checks
-lead, with a bounded five-second priority boost for a fresh near-reference-floor
-sighting. The existing ten-second per-item batch cooldown remains. Unknown items
+lead without a per-item cooldown, allowing continuous coverage at the existing
+request rate. Unknown items
 still enter through broad discovery and full/deep scans, not a guessed item list.
 Every deep-scan page now evaluates candidates before learning its own prices;
 complete live tiers are still mandatory before admission. Deep browse requests

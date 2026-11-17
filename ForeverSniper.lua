@@ -3707,7 +3707,10 @@ canQuery = function(paging)
     -- The live API is authoritative. Shared SENT/QUEUED events can leave the
     -- cached flag false when a ready event is missing or arrives out of order.
     throttleReady = true
-    if GetTime() - lastQueryAt < queryPacing().interval then return false end
+    if GetTime() - lastQueryAt < queryPacing().interval then
+        S.wakeSweep()
+        return false
+    end
     return true
 end
 
@@ -3965,27 +3968,21 @@ do
             if not pool then return false end
         end
         for rawID in pairs(pool) do
-            local b = db.book[rawID] or {}
             local id = num(rawID)
             local commodity = id and commodityFor(id)
             if cfg.targeted and id and commodity == nil then requestItemLoad(id) end
             local checked = id and (S.batchChecked[id] or -60)
-            if id and id > 0 and id % 1 == 0 and not watchByID[id] and not db.blacklist[id] and commodity == true
-                and now - checked >= (cfg.targeted and 0 or 10) then
+            if id and id > 0 and id % 1 == 0 and not watchByID[id] and not db.blacklist[id] and commodity == true then
                 local market = S.marketReference(id)
                 if market and market >= cfg.minUnit then
-                    local samples = b.s or {}
-                    local stamp, price = num(samples[#samples - 1]), num(samples[#samples])
-                    -- A small, bounded near-line boost improves hot-item revisits
-                    -- without letting them continually displace older coverage.
-                    local hot = stamp and stamp <= time() and time() - stamp <= 120
-                        and price and price > 0 and price <= market * 0.85
-                    candidates[#candidates + 1] = {id=id, checked=checked, priority=checked - (not cfg.targeted and hot and 5 or 0)}
+                    candidates[#candidates + 1] = {id=id, checked=checked}
                 end
             end
         end
+        -- Spend each available monitoring slot on up to 100 oldest keys. A
+        -- per-item cooldown wastes batch capacity on single-item fallback checks.
         table.sort(candidates, function(a, b)
-            if a.priority ~= b.priority then return a.priority < b.priority end
+            if a.checked ~= b.checked then return a.checked < b.checked end
             return a.id < b.id
         end)
         local keys, ids = {}, {}
@@ -4031,15 +4028,23 @@ do
             seen[id] = true
         end
         S.batchSearch = nil
+        local stats, completedAt = S.sweepStats, GetTime()
         for id in pairs(owner.ids) do
-            S.batchChecked[id] = GetTime()
+            local previous = S.batchChecked[id]
+            if previous and completedAt >= previous then
+                local gap = completedAt - previous
+                stats.batchRevisitLast = gap
+                stats.batchRevisitMax = math.max(stats.batchRevisitMax or 0, gap)
+                stats.batchRevisitCount = (stats.batchRevisitCount or 0) + 1
+                stats.batchRevisitTotal = (stats.batchRevisitTotal or 0) + gap
+            end
+            S.batchChecked[id] = completedAt
             S.noteRevisit(id)
             if owner.targeted then
                 S.targetedSeen = S.targetedSeen or {}
                 S.targetedSeen[id] = true
             end
         end
-        local stats = S.sweepStats
         stats.batchCompleted = (stats.batchCompleted or 0) + 1
         stats.batchKeys = (stats.batchKeys or 0) + owner.count
         stats.batchRows = (stats.batchRows or 0) + #rows
@@ -4111,7 +4116,10 @@ local function sweepQuery()
         if not targetedPool then return end
     end
     local prebuy = cfg.prebuy and S.prebuyCheck
-    if prebuy and prebuy.completedAt and GetTime() - prebuy.completedAt <= 2 then return end
+    if prebuy and prebuy.completedAt and GetTime() - prebuy.completedAt <= 2 then
+        S.wakeSweep(prebuy.completedAt + 2 + 0.01)
+        return
+    end
     if prebuy and not prebuy.finished and not prebuy.completedAt
         and GetTime() - prebuy.t < 15 and not db.blacklist[prebuy.id] then
         local candidate = S.liveCandidates and S.liveCandidates[prebuy.id]
@@ -4131,7 +4139,10 @@ local function sweepQuery()
         if not priority.buyWindowUntil then priority.buyWindowUntil = GetTime() + 5 end
         -- One bounded human-click opportunity per focus, starting only once the
         -- live API is ready. Never abandon owned pages or pause discovery forever.
-        if GetTime() < priority.buyWindowUntil then return end
+        if GetTime() < priority.buyWindowUntil then
+            S.wakeSweep(priority.buyWindowUntil)
+            return
+        end
     end
     sweepCount = sweepCount + 1
     local discoveryDue = not cfg.targeted and S.discoveryDue
@@ -4437,14 +4448,17 @@ startDeepScan = function(force)
     deepSend()
 end
 
-function S.wakeSweep()
-    if not S.sweepTicker or not S.ahOpen or not cfg.enabled or S.sweepWake then return end
+function S.wakeSweep(notBefore)
+    if not S.sweepTicker or not S.ahOpen or not cfg.enabled then return end
+    local now = GetTime()
+    local due = math.max(now + 0.01, lastQueryAt + queryPacing().interval, notBefore or 0)
+    if S.sweepWake and S.sweepWake.at <= due then return end
     local owner = S.sweepTicker
-    local wake = {}
+    local wake = {at=due}
     S.sweepWake = wake
     -- Defer even synchronous cached replies. Coalesce event bursts and share
     -- the same spacing gate with the watchdog and every other query lane.
-    after(math.max(0.01, lastQueryAt + queryPacing().interval - GetTime()), function()
+    after(due - now, function()
         if S.sweepWake ~= wake then return end
         S.sweepWake = nil
         if S.sweepTicker ~= owner or not S.ahOpen or not cfg.enabled then return end
@@ -5939,6 +5953,9 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             S.batchDisabled or (cfg.batch and "enabled (experimental)" or "off"),
             ss.batchSent or 0, ss.batchCompleted or 0, ss.batchKeys or 0,
             ss.batchRows or 0, ss.batchFailures or 0, ss.batchLatency or 0)
+        printf("batch revisit last/mean/max %.2f/%.2f/%.2fs (%d repeated item checks); oldest-first rotation. Includes scheduling and server waits, not listing age.",
+            ss.batchRevisitLast or 0, (ss.batchRevisitTotal or 0) / math.max(1, ss.batchRevisitCount or 0),
+            ss.batchRevisitMax or 0, ss.batchRevisitCount or 0)
         printf("targeted list: %s. /fsn targeted on|off", S.targetedStatus())
         printf("prebuy new-search test: %s; timing evidence in /fsn diagnostics. No server snapshot age is available.", cfg.prebuy and "on (two presses)" or "off (normal one-press)")
         printf("automatic item checks: %d sent, %d completed, %d distinct targets; last target: %s (stock movement is not confirmed sales).",
