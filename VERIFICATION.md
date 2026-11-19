@@ -481,3 +481,37 @@ gates, candidate-before-background refresh and separate response timing. The ful
 existing purchase/identity/liquidity suite still passes. Extended AH simulation
 remains outside this passing lifecycle gate. No game files or saved data changed;
 deployment requires exact-commit CI and owner approval.
+
+### Evidence for repeated cheap-tier / higher-quote mismatch
+
+After the speed build was deployed, the owner reported item 2592 x33 approved
+under 34 copper /1122 total, then quoted at 135 copper /4479 total. Quote age was
+0.33 seconds. Diagnostics contained the refusal but no result-identity failure.
+No wrong-item row or source of the cheap prices was captured. No purchase was
+confirmed by this refusal. The subsequent internal auction error is not enough
+to establish a root cause.
+
+Important timing distinction: quote age measures Buy-click-to-quote, not price
+snapshot age. Existing policy allows a completed snapshot up to 20 seconds old
+and fallback to that snapshot if a direct getter returns loading/empty outside
+a completed-result event. An hour-old TSM feed can make the reference and ceiling
+outdated but does not supply the AH tier quantities used to approve a full lot.
+Neither stale TSM data nor stale AH tiers have been established as the cause.
+
+Diagnostic-only branch `fix/commodity-tier-evidence`, stacked on PR #10, records
+one purchase-tier entry at the Buy click, before starting the quote. It contains
+the live-API versus completed-fallback source, completed-event age, read age,
+tier count, approved quantity/cost and the first three raw row scalar values
+(item ID, copper unit price, quantity, owned quantity, auction ID when readable).
+The raw evidence is copied, bounded to three rows and contains no seller names.
+Live API means a direct getter read, not proof of a fresh server response. Local
+event/read ages are not listing ages. Existing 50-entry diagnostics retention
+applies. No price scaling, thresholds, expiry, fallback or purchase guards change.
+
+Validation: 170 tests pass. New regressions cover direct API reads with a
+ten-second-old completed event, loading/empty fallback with preserved caps, raw
+copper/auction ID values, bounded evidence and immunity to API row-table mutation.
+Secret lint and strict load/lifecycle simulation pass; extended AH simulation is
+not claimed. No deployment for this diagnostic branch is authorized yet. The
+remaining question is whether the next mismatch uses locally old completed tiers,
+fallback, or a direct API read still reporting cheap rows.
