@@ -111,6 +111,48 @@ test('liquidity adds a bounded priority boost without starving older candidates'
   assert(S.candidatePriority({id=2,t=now-8})>S.candidatePriority({id=1,t=now,profit=1000000000}))
 `));
 
+test('hardware-origin remainder recovery forces a new search ahead of focus and discovery debt', () => check(`
+  local retry={id=456,expires=110}
+  S.remainderRetry=retry
+  S.liveCandidates={[456]={id=456,t=now,line=10,market=100,remainder=retry,forceSearch=true}}
+  focus={id=123,line=10}; S.dealFocus={deal=focus,buyWindowUntil=105}
+  S.discoveryDue=true
+  requestItemSearch=function(id,commodity,separateOwner,forceSearch)
+    assert(id==456 and commodity and separateOwner and forceSearch)
+    record('target',id)
+  end
+  sweepQuery()
+  assert(count('target',456)==1 and count('browse')==0 and S.discoveryDue)
+  assert(S.liveCandidate.remainder==retry and not S.liveCandidates[456])
+`));
+
+test('remainder recovery retains pacing, ownership, native-form and purchase gates', () => {
+  for (const change of ['ready=false', 'nativeSell=true', 'S.scanning=true', 'S.snipePending={}',
+    'db.unsettledPurchase={}', 'S.ahOpen=false', 'cfg.enabled=false', 'lastQueryAt=now',
+    'S.liveCandidate={id=999,t=now}', 'S.batchSearch={t=now}']) check(`
+    local retry={id=456,expires=110}; S.remainderRetry=retry
+    S.liveCandidates={[456]={id=456,t=now,remainder=retry,forceSearch=true}}
+    ${change}
+    sweepQuery(); assert(#queries==0, '${change}')
+  `);
+});
+
+test('expired or blacklisted recovery never dispatches its queued request', () => {
+  for (const change of ['now=110', 'db.blacklist[456]=true']) check(`
+    local retry={id=456,expires=110}; S.remainderRetry=retry
+    S.liveCandidates={[456]={id=456,t=now,remainder=retry,forceSearch=true}}
+    ${change}
+    sweepQuery()
+    assert(count('target',456)==0 and not S.remainderRetry and not S.liveCandidates[456])
+  `);
+});
+
+test('stopping the scanner revokes recovery before a restart', () => check(`
+  S.remainderRetry={id=456,expires=110}
+  stopSweeping()
+  assert(not S.remainderRetry)
+`));
+
 test('sales caps refresh owned stock with the manual cap off', () => check(`
   cfg.sales=true; local sent=0
   function S.requestSellingOwned() sent=sent+1; return true end

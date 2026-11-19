@@ -140,6 +140,144 @@ test('purchase price uses click-time tiers when the displayed lot shrinks', () =
   assert(S.snipePending.tolTotal==20)
 `));
 
+const remainderTrial = `
+  S.sweepStats={}
+  snapshot({{price=600,quantity=4},{price=1099,quantity=7},{price=1100,quantity=6}})
+  local original={itemID=123,line=600,units=4,cost=2400,market2=1098,kind='market'}
+  quickBuy(original)
+  handlers.COMMODITY_PRICE_UPDATED(974,3897)
+  assert(calls.start==1 and calls.confirm==0 and not S.snipePending)
+  local retry=S.remainderRetry
+  assert(retry and retry.failedUnits==4 and retry.line==600 and retry.cost==2400)
+  local function completeRemainder(quantity)
+    rows[1].quantity=quantity
+    S.liveCandidate=S.liveCandidates[123]; S.liveCandidates[123]=nil
+    assert(S.liveCandidate.remainder==S.remainderRetry and S.liveCandidate.forceSearch)
+    onCommodityResults(123)
+  end
+  local function buyRemainder()
+    assert(captured and captured.sweep)
+    quickBuy({itemID=123,line=captured.sweep.line,units=captured.sweep.units,
+      cost=captured.sweep.cost,market2=captured.market,kind=captured.kind})
+  end
+`;
+
+test('the observed 4-at-600 failure recovers one reported remaining unit on the next hardware press', () => check(remainderTrial + `
+  completeRemainder(1)
+  assert(captured.sweep.units==1 and captured.sweep.cost==600 and captured.sweep.line==600)
+  assert(calls.start==1 and calls.confirm==0, 'search completion must not start a buy')
+  buyRemainder()
+  assert(calls.start==2 and calls.startArgs[2]==1 and calls.startArgs[3]==600)
+  handlers.COMMODITY_PRICE_UPDATED(600,600)
+  assert(calls.confirm==1 and calls.confirmArgs[2]==1 and db.unsettledPurchase)
+  assert(S.session.buys==0)
+  handlers.COMMODITY_PURCHASE_SUCCEEDED()
+  assert(S.session.buys==1 and S.session.spent==600 and db.stockPending['123']==1)
+  assert(not S.remainderRetry)
+`));
+
+test('unchanged cached quantity is halved on separate presses down to one without relaxing price caps', () => check(remainderTrial + `
+  completeRemainder(4)
+  assert(captured.sweep.units==2 and captured.sweep.cost==1200)
+  buyRemainder(); assert(calls.startArgs[2]==2)
+  handlers.COMMODITY_PRICE_UPDATED(849,1699)
+  assert(calls.confirm==0 and S.remainderRetry.failedUnits==2)
+  assert(S.remainderRetry.expires==retry.expires)
+  completeRemainder(4)
+  assert(captured.sweep.units==1 and captured.sweep.cost==600)
+  buyRemainder(); assert(calls.startArgs[2]==1)
+  handlers.COMMODITY_PRICE_UPDATED(1099,1099)
+  assert(calls.confirm==0 and not S.remainderRetry and calls.start==3)
+`));
+
+test('a fresh smaller remainder is taken whole rather than needlessly halved', () => check(remainderTrial + `
+  completeRemainder(3)
+  assert(captured.sweep.units==3 and captured.sweep.cost==1800)
+  buyRemainder(); handlers.COMMODITY_PRICE_UPDATED(600,1800)
+  assert(calls.startArgs[2]==3 and calls.confirmArgs[2]==3)
+`));
+
+test('recovery waits for its owned complete search and does not consume an unowned or partial event', () => check(remainderTrial + `
+  onCommodityResults(123)
+  assert(S.liveCandidates[123] and not captured and calls.start==1)
+  local terms,reason=commodityOfferTerms(123,600,4,2400,1098,'market')
+  assert(not terms and reason=='loading')
+  S.liveCandidate=S.liveCandidates[123]; S.liveCandidates[123]=nil
+  C_AuctionHouse.HasFullCommoditySearchResults=function() return false end
+  onCommodityResults(123)
+  assert(S.liveCandidate and not captured and calls.start==1)
+  C_AuctionHouse.HasFullCommoditySearchResults=function() return true end
+  rows[1].quantity=1; onCommodityResults(123)
+  assert(captured.sweep.units==1 and calls.start==1)
+`));
+
+test('recovery caps survive another complete result and late responses cannot revive expired recovery', () => check(remainderTrial + `
+  completeRemainder(4)
+  S.deals={{id=123,line=600,market=1098,kind='market',units=2,cost=1200}}
+  onCommodityResults(123)
+  assert(captured.sweep.units==2 and S.commoditySnapshots[123].remainder==retry)
+  now=retry.expires
+  buyRemainder(); assert(calls.start==1)
+  captured=nil; onCommodityResults(123)
+  assert(not captured)
+`));
+
+test('smaller recovery still enforces profit, budget, exposure and complete-data guards', () => {
+  for (const change of ['cfg.profit=10000', 'cfg.maxSpend=600', 'cfg.maxStock=1; held=1',
+    'cfg.overhang=1', 'rows[1].itemID=456', 'rows[2].quantity=0/0']) check(remainderTrial + `
+    ${change}
+    completeRemainder(1)
+    assert(not captured and calls.start==1 and calls.confirm==0)
+  `);
+});
+
+test('a recovery quote rechecks changed wallet and never confirms a different quantity', () => {
+  for (const change of ['cfg.maxSpend=599', 'rows[1].quantity=0', 'cfg.profit=10000']) check(remainderTrial + `
+    completeRemainder(1); buyRemainder()
+    ${change}
+    handlers.COMMODITY_PRICE_UPDATED(600,600)
+    assert(calls.confirm==0 and not db.unsettledPurchase)
+  `);
+});
+
+test('recovery never expands the original ceiling, total or resale reference', () => check(remainderTrial + `
+  completeRemainder(4)
+  quickBuy({itemID=123,line=1099,units=20,cost=20000,market2=5000,kind='market'})
+  assert(calls.startArgs[2]==2 and calls.startArgs[3]==600)
+  assert(S.snipePending.maxUnit==600 and S.snipePending.expected==1200)
+  handlers.COMMODITY_PRICE_UPDATED(601,1202)
+  assert(calls.confirm==0)
+  completeRemainder(4)
+  local terms=S.remainderTerms(123,1099,20,20000,5000,'market',S.commoditySnapshots[123])
+  assert(terms.line==600 and terms.units==1 and terms.resale<=1098)
+`));
+
+test('skip and clear revoke recovery even if a delayed owned result arrives', () => {
+  for (const action of ['S.dismissDeal(123)', 'S.clearFeedDeals()']) check(remainderTrial + `
+    local function refreshDealPresentation() end
+    ${section('function S.dismissDeal(', '\nlocal function finishPurchase(')}
+    local old=S.liveCandidates[123]
+    ${action}
+    assert(not S.remainderRetry and not (S.liveCandidates and S.liveCandidates[123]))
+    S.liveCandidate=old; rows[1].quantity=1
+    onCommodityResults(123)
+    assert(not captured and calls.start==1 and calls.confirm==0)
+  `);
+});
+
+test('Buy best stays on the recovery item instead of buying a different higher-profit offer', () => check(`
+  local order={{id=456},{id=123}}
+  local function collectDealGroups() return order end
+  local function commodityOfferReady() return true end
+  local bought
+  quickBuy=function(row) bought=row.itemID end
+  ${section('local function feedBestBuy()', '\nlocal function feedBestSkip()')}
+  S.remainderRetry={id=123,expires=110}
+  feedBestBuy(); assert(bought==123)
+  bought=nil; order={{id=456}}; feedBestBuy(); assert(not bought)
+  now=110; feedBestBuy(); assert(bought==456)
+`));
+
 test('synchronous start quote sees its owner and confirmation retains the native two arguments', () => check(`
   C_AuctionHouse.StartCommoditiesPurchase=function(...)
     calls.start=calls.start+1; calls.startArgs={...}

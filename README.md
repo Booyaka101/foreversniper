@@ -173,6 +173,35 @@ They are estimates, not proof of demand or realised profit. Existing quality,
 competition, profit, complete-result, and freshness checks still apply. Absolute
 watch rules and vendor exits retain their existing full-lot selection.
 
+## Recovering remaining cheap stock
+
+After a quote exceeds the approved unit price or exact total, the addon cancels
+it and prioritises a new item search instead of refreshing the contradicted cache.
+The original offer is retired. A complete result can produce a smaller **RETRY**
+offer at the same or a lower ceiling:
+
+- If fewer cheap units are reported, use that remaining quantity.
+- If the failed quantity is still reported, try at most half the previous request,
+  rounded down, with a minimum of one. This is a sizing strategy, not evidence
+  that those units remain on the server.
+- Press Buy or the existing Buy binding again for each new quote. The binding
+  stays on the recovery item during its ten-second window. Another price rejection
+  can reduce the quantity again, without extending that window. A rejected
+  one-unit quote ends recovery. Skip, Clear, stopping the scanner or closing the
+  AH cancels recovery as well.
+
+The API requires confirmation to match the requested quantity; it cannot convert
+an expensive four-unit quote into a one-unit purchase. Search callbacks never
+start purchases. Each replacement quote retains exact total/unit caps and
+rechecks budget, deposit, profit, liquidity, stock and item policies. Only a
+server-confirmed outcome records spending and stock.
+
+Recovery deliberately permits a partial cheap tier, unlike normal discovery's
+complete-prefix selection. Profit uses no higher than the original exit reference,
+and leftover cheap units count toward the competition limit. Cheap stock may
+remain, so this is not a claim that the floor is cleared or that resale is assured.
+`/fsn diagnostics` includes `remainder retry` and `remainder ready` records.
+
 ## Spending and stock controls
 
 ```text
