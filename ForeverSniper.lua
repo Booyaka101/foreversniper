@@ -107,7 +107,13 @@ local function err(domain, e)
 end
 
 local function diagnostic(domain, message)
-    push(db.diagnostics, 50, {t=time(), domain=domain, err=message})
+    -- Resolve at event time: don't pin the pre-load SavedVariables table.
+    ForeverSniperTrace = ForeverSniperTrace or {seq=0, records={}}
+    local trace = ForeverSniperTrace
+    trace.seq = trace.seq + 1
+    local record = {seq=trace.seq, t=time(), domain=domain, err=message}
+    push(trace.records, 250, record)
+    push(db.diagnostics, 50, record)
 end
 
 local function printf(fmt, ...)
@@ -120,9 +126,14 @@ local function printRecordedLog(informational)
         if (record.domain == "boot") == informational then records[#records + 1] = record end
     end
     if informational then
-        for _, record in ipairs(db.diagnostics) do records[#records + 1] = record end
+        for _, record in ipairs(ForeverSniperTrace and ForeverSniperTrace.records or db.diagnostics) do
+            records[#records + 1] = record
+        end
     end
-    table.sort(records, function(a, b) return (a.t or 0) < (b.t or 0) end)
+    table.sort(records, function(a, b)
+        if a.t == b.t then return (a.seq or 0) < (b.seq or 0) end
+        return (a.t or 0) < (b.t or 0)
+    end)
     if #records == 0 then
         printf(informational and "no recorded diagnostics." or "no recorded failures. Startup traces: /fsn diagnostics.")
     end
@@ -978,6 +989,40 @@ do
             completedAt=snapshot and snapshot.t, validatedAt=timing.validatedAt,
             feedRenderedAt=timing.feedRenderedAt,
             method=timing.method, source=source, clickAt=GetTime(), prebuy=cfg.prebuy == true}
+    end
+
+    function S.purchaseResult(p, outcome)
+        if not p then return end
+        local text = string.format("attempt %s; item %s x%s; expected %sc; %s",
+            tostring(p.attempt or "?"), tostring(p.deal and p.deal.id or "?"), tostring(p.units or "?"),
+            tostring(p.expected or "?"), outcome)
+        diagnostic("purchase result", text)
+        if S.captureFailure and (outcome:find("failed",1,true) or outcome:find("rejected",1,true)
+            or outcome:find("refused",1,true) or outcome:find("timed out",1,true)
+            or outcome:find("unavailable",1,true) or outcome:find("error",1,true)) then
+            S.captureFailure = nil
+            C_Timer.After(0, function()
+                local panel = CreateFrame("Frame", nil, UIParent)
+                panel:SetFrameStrata("TOOLTIP")
+                panel:SetSize(600, 186)
+                panel:SetPoint("CENTER")
+                local bg = panel:CreateTexture(nil,"BACKGROUND")
+                bg:SetAllPoints(); bg:SetColorTexture(0,0,0,0.95)
+                local label = panel:CreateFontString(nil,"OVERLAY","GameFontNormal")
+                label:SetPoint("TOPLEFT",12,-12); label:SetWidth(576); label:SetJustifyH("LEFT")
+                local lines = {"Forever Sniper failure capture", text}
+                for i=#db.diagnostics,1,-1 do
+                    local r = db.diagnostics[i]
+                    if r.domain == "purchase request" then break end
+                    if r.domain == "purchase quote" or r.domain == "purchase timing" then
+                        lines[#lines+1] = r.err
+                    end
+                end
+                label:SetText(table.concat(lines,"\n"))
+                C_Timer.After(0.3, Screenshot)
+                C_Timer.After(2,function() panel:Hide() end)
+            end)
+        end
     end
 
     function S.logPurchaseTiming(p, outcome)
@@ -2144,6 +2189,7 @@ local function retirePurchase(reason)
     -- Cancel may synchronously emit another quote. Retire ownership first so
     -- that callback cannot confirm the purchase we are cancelling.
     S.snipePending = nil
+    S.purchaseResult(p, (p.confirmed and "outcome unknown: " or "") .. reason)
     if p.confirmed then
         -- Keep this across a normal reload. Outcome events carry no request ID,
         -- so only this session's owner may reconcile a late server event.
@@ -2207,6 +2253,11 @@ function S.offerAvailable(offer)
 end
 
 function S.dismissDeal(itemID)
+    local observed = S.observedOffers and S.observedOffers[itemID]
+    if observed then
+        S.seen[tostring(itemID) .. ":" .. tostring(observed.price)] = time()
+        S.observedOffers[itemID] = nil
+    end
     if S.remainderRetry and S.remainderRetry.id == itemID then S.remainderRetry = nil end
     for _, d in ipairs(S.deals) do if d.id == itemID then d.gone = true end end
     for _, field in ipairs({"liveCandidate", "autoSearch", "watchSearch"}) do
@@ -2239,6 +2290,7 @@ local function finishPurchase(p, source)
         printf("stored purchase details are invalid; buying stays locked. Verify the outcome before /fsn purchase failed.")
         return
     end
+    S.purchaseResult(p, source)
     db.unsettledPurchase, S.outcomeOwner, S.snipePending = nil, nil, nil
     S.remainderRetry = nil
     S.session.spent = (S.session.spent or 0) + total
@@ -2409,7 +2461,7 @@ end
 -- item are one position at a blended price - and the wallet only counts
 -- groups it can buy WHOLE (a partial wall can't be flipped: the rest of the
 -- wall anchors the price at your cost)
-local function collectDealGroups()
+local function collectDealGroups(forBuy)
     local walletCap = math.floor((GetMoney() or 0) * 0.95)
     local groups, order = {}, {}
     for _, cand in ipairs(S.deals) do
@@ -2421,35 +2473,41 @@ local function collectDealGroups()
             if not previous or (cand.t or 0) > (previous.t or 0) then groups[cand.id] = cand end
         end
     end
+    local evaluated = {}
     for _, cand in pairs(groups) do
-        local _, reason = commodityOfferTerms(cand.id, cand.line, cand.units, cand.cost, cand.market, cand.kind)
-        if cand.cost <= math.min(walletCap, cfg.maxSpend or 0)
+        local terms, reason = commodityOfferTerms(cand.id, cand.line, cand.units, cand.cost, cand.market, cand.kind)
+        if (not forBuy or terms) and (terms and terms.cost or cand.cost) <= math.min(walletCap, cfg.maxSpend or 0)
             and time() - (cand.t or 0) <= 300 and not db.blacklist[cand.id]
             and reason ~= "budget" and reason ~= "profit" and reason ~= "empty" and reason ~= "invalid"
-            and reason ~= "quality" and reason ~= "stackable" and reason ~= "overhang" then order[#order + 1] = cand end
+            and reason ~= "quality" and reason ~= "stackable" and reason ~= "overhang" then
+            order[#order + 1] = cand
+            evaluated[cand] = terms
+        end
     end
-    table.sort(order, function(a, b) return (a.profit or 0) > (b.profit or 0) end)
-    return order
+    table.sort(order, function(a, b)
+        return ((evaluated[a] or a).profit or 0) > ((evaluated[b] or b).profit or 0)
+    end)
+    return order, evaluated
 end
 
 local function feedBestBuy()
     -- the best affordable GROUP: highest total profit wins; items cooling
     -- down from a failed buy are skipped
-    local order = collectDealGroups()
+    local order, evaluated = collectDealGroups(true)
     local retry = S.remainderRetry
     if retry and GetTime() >= retry.expires then retry = nil end
     local best
     for _, g in ipairs(order) do
         local cooling = buyFailUntil[g.id] and GetTime() < buyFailUntil[g.id]
-        if not cooling and (not retry or retry.id == g.id)
-            and commodityOfferReady(g.id, g.link, g.line, g.units, g.cost, g.market, g.kind) then best = g break end
+        if not cooling and commodityFor(g.id) == true and (not retry or retry.id == g.id) then best = g break end
     end
     if not best then
         printf("no fresh deal to buy right now - the sweep is on it, press again in a moment.")
         return
     end
-    quickBuy({ itemID = best.id, link = best.link, line = best.line, units = best.units,
-                cost = best.cost, market2 = best.market, kind = best.kind, t = best.t, offer = best })
+    local terms = evaluated[best]
+    quickBuy({ itemID = best.id, link = best.link, line = terms.line or best.line, units = terms.units,
+                cost = terms.cost, market2 = best.market, kind = best.kind, t = best.t, offer = best })
 end
 local function feedBestSkip()
     local d = collectDealGroups()[1]
@@ -3046,6 +3104,11 @@ local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
     recordGate("offer", "validated position", itemID)
     sweep.kind = kind
     if updateExistingDeal(itemID, link, unit, market, sweep) then
+        local observed = S.observedOffers and S.observedOffers[itemID]
+        if observed and observed.returned and observed.price == unit then
+            observed.absent, observed.returned, observed.at = nil, nil, time()
+            S.seen[tostring(itemID) .. ":" .. tostring(unit)] = observed.at
+        end
         refreshFeed()
         renderPopup()
     end
@@ -3060,6 +3123,8 @@ local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
     if bought and now - bought.t < 300 and unit >= (bought.price or 0) then return end
     S.lastAlert[key] = { t = now, price = unit }
     S.seen[tostring(itemID) .. ":" .. tostring(unit)] = now
+    S.observedOffers = S.observedOffers or {}
+    S.observedOffers[itemID] = {price=unit, at=now}
 
     sweep = sweep or { units = 1, cost = unit }
     db.stats.deals = (db.stats.deals or 0) + 1
@@ -3651,6 +3716,21 @@ local function isNewListing(itemID, price)
     return not S.seen[k] or time() - S.seen[k] >= 60
 end
 
+-- Only a complete, membership-checked batch can treat an omitted key as absent.
+-- Keep the alert cooldown; re-arm validation only on a witnessed floor return.
+function S.observeBatchFloor(id, floor)
+    local o = S.observedOffers and S.observedOffers[id]
+    if not o then return end
+    if time() - o.at >= 60 then
+        S.observedOffers[id] = nil
+    elseif not floor or floor > o.price then
+        o.absent = true
+    elseif o.absent and floor == o.price then
+        S.seen[tostring(id) .. ":" .. tostring(floor)] = nil
+        o.absent, o.returned = nil, true
+    end
+end
+
 -- request the client to cache an item's info; quality checks pass next sweep
 requestItemLoad = function(itemID)
     if C_Item and C_Item.RequestLoadItemDataByID then
@@ -4125,11 +4205,13 @@ do
                 S.failBatch("unexpected summary rows; individual fallback")
                 return true
             end
-            seen[id] = true
+            seen[id] = quantity > 0 and price or 0
         end
         S.batchSearch = nil
         local stats, completedAt = S.sweepStats, GetTime()
         for id in pairs(owner.ids) do
+            local floor = seen[id]
+            S.observeBatchFloor(id, floor and floor > 0 and floor or nil)
             local previous = S.batchChecked[id]
             if previous and completedAt >= previous then
                 local gap = completedAt - previous
@@ -5166,9 +5248,9 @@ onOptional("MAIL_SHOW", function() scanMailbox() end)
 
 on("PLAYER_LOGIN", function()
     buildPopup()
-    diagnostic("boot", string.format("login: book=%d seen=%d saved counter=%s enabled=%s",
+    diagnostic("boot", string.format("login: book=%d seen=%d saved counter=%s enabled=%s runtime DB matches saved global=%s",
         countKeys(db.book or {}), countKeys(db.seen or {}),
-        tostring(db.stats and db.stats.book), tostring(cfg.enabled)))
+        tostring(db.stats and db.stats.book), tostring(cfg.enabled), tostring(db == ForeverSniperDB)))
     db.stats.book = countKeys(db.book)
     -- the desktop app's overnight briefing (file-based, written while the game
     -- was closed): print once, then clear so it never shows twice
@@ -5547,6 +5629,11 @@ local function onCommodityResults(itemID)
     itemID = num(itemID)
     if not itemID or itemID < 1 or itemID % 1 ~= 0 then return end
     S.wakeSweep()
+    local waiting = S.liveCandidates and S.liveCandidates[itemID]
+    if waiting and waiting.forceSearch and not (S.liveCandidate and S.liveCandidate.id == itemID
+        or S.watchSearch and S.watchSearch.id == itemID or S.autoSearch and S.autoSearch.id == itemID) then
+        return
+    end
     local snapshot, reason, identity = readCommodityTiers(itemID)
     if identity then diagnostic("commodity result identity", identity) end
     if snapshot then
@@ -5598,7 +5685,7 @@ local function onCommodityResults(itemID)
     -- A completed automatic check may just have queued this candidate. Its
     -- event-owned full tiers already satisfy preparation; do not search twice.
     local queued = snapshot and S.liveCandidates and S.liveCandidates[itemID]
-    if queued and not queued.prebuy and not queued.remainder then
+    if queued and not queued.prebuy and not queued.remainder and not queued.forceSearch then
         if not c or c.id ~= itemID then c = queued end
         S.liveCandidates[itemID] = nil
     end
@@ -5751,6 +5838,7 @@ on("COMMODITY_PURCHASE_SUCCEEDED", function()
 end)
 on("COMMODITY_PURCHASE_FAILED", function()
     local p = S.snipePending or S.outcomeOwner
+    S.purchaseResult(p, "server reported purchase failed")
     if S.outcomeOwner and db.unsettledPurchase == S.outcomeOwner then
         db.unsettledPurchase, S.outcomeOwner = nil, nil
     end
@@ -5914,6 +6002,7 @@ end
 -- Slash commands ---------------------------------------------------------------------
 
 local HELP = {
+    "/fsn capture once | off - save one local full-game screenshot on the next purchase failure",
     "|cffff7d0aForever Sniper|r - it watches, you buy",
     "|cffffd100core|r",
     "/fsn                  status",
@@ -6108,6 +6197,11 @@ SlashCmdList.FOREVERSNIPER = function(msg)
 
     if cmd == "help" or cmd == "?" then
         for _, line in ipairs(HELP) do print("  " .. line) end
+
+    elseif cmd == "capture" then
+        S.captureFailure = rest == "once" and type(Screenshot) == "function" or nil
+        printf(S.captureFailure and "next purchase failure will save one full game screenshot locally." or
+            "failure capture off. /fsn capture once arms one screenshot; /fsn capture off cancels.")
 
     elseif cmd == "" or cmd == "status" then
         printf("%s | %d full snapshots done | book %d items | %d alerts fired",

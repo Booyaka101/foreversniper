@@ -76,6 +76,7 @@ local on = onOptional
 `;
 
 const production = section('local SCAN_CATEGORIES =', '\nif db.boughtAt == nil')
+  + section('function S.observeBatchFloor(', '\n-- request the client to cache')
   + section('local throttleReady, pagePending', '\nS.autoChecked =')
   + section('local function queryPacing()', '\nlocal function requestItemSearch')
   + section('canQuery = function(paging, urgent)', '\nlocal function discoveryScope')
@@ -601,6 +602,21 @@ test('batch revisit metrics exclude individual validation and do not invent a fi
   now=103; assert(S.startBatch()); S.readBatch()
   assert(S.sweepStats.batchRevisitLast==3 and S.sweepStats.batchRevisitCount==1)
   assert(S.sweepStats.batchRevisitTotal==3 and S.sweepStats.batchRevisitMax==3)
+`));
+
+test('complete batch absence or higher floor re-arms a same-price return, not unchanged rows', () => batchCheck(`
+  db.book={[123]={s={100}}}
+  local function reply(price)
+    resultRows=price and {{itemKey={itemID=123},minPrice=price,totalQuantity=4}} or {}
+    assert(S.startBatch()); S.readBatch(); now=now+1
+  end
+  for _,disappearance in ipairs({false,100}) do
+    local o={price=10,at=now}
+    S.observedOffers={[123]=o}; S.seen['123:10']=now
+    reply(10); assert(not o.absent and S.seen['123:10'])
+    reply(disappearance); assert(o.absent and S.seen['123:10'])
+    reply(10); assert(o.returned and not S.seen['123:10'])
+  end
 `));
 
 for (const priority of [false, true]) test(`1146-item broad coverage benchmark with material priority ${priority}`, () => batchCheck(`

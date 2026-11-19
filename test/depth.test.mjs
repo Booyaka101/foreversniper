@@ -267,7 +267,7 @@ test('skip and clear revoke recovery even if a delayed owned result arrives', ()
 
 test('Buy best stays on the recovery item instead of buying a different higher-profit offer', () => check(`
   local order={{id=456},{id=123}}
-  local function collectDealGroups() return order end
+  local function collectDealGroups() local terms={}; for _,d in ipairs(order) do terms[d]=d end; return order,terms end
   local function commodityOfferReady() return true end
   local bought
   quickBuy=function(row) bought=row.itemID end
@@ -288,6 +288,30 @@ test('synchronous start quote sees its owner and confirmation retains the native
   assert(calls.start==1 and calls.startArgs[3]==10 and calls.confirm==1)
   assert(#calls.confirmArgs==2 and calls.confirmArgs[1]==123 and calls.confirmArgs[2]==10)
   assert(db.unsettledPurchase and db.unsettledPurchase==S.snipePending)
+`));
+
+test('an unsolicited full or empty result cannot consume a queued fresh validation', () => check(`
+  local candidate={id=123,line=10,market=100,kind='market',forceSearch=true,t=now,detectedAt=now}
+  S.liveCandidates={[123]=candidate}
+  local original=snapshot({{price=10,quantity=2},{price=100,quantity=5}})
+  onCommodityResults(123)
+  assert(S.liveCandidates[123]==candidate and S.commoditySnapshots[123]==original and not captured)
+  local live=rows; rows={}; onCommodityResults(123); rows=live
+  assert(S.liveCandidates[123]==candidate and S.commoditySnapshots[123]==original)
+  S.liveCandidates[123]=nil; S.liveCandidate=candidate; S.sweepStats={}
+  onCommodityResults(123)
+  assert(captured.sweep.units==2 and calls.start==0)
+`));
+
+test('Buy best uses affordable reduced live terms and rechecks on the actual press', () => check(`
+  snapshot({{price=10,quantity=2},{price=100,quantity=4}})
+  cfg.maxSpend=30
+  S.deals={{id=123,t=now,line=10,unit=10,units=10,cost=100,profit=500,market=100,kind='market'}}
+  ${section('local function collectDealGroups(', '\nlocal function feedBestSkip()')}
+  feedBestBuy()
+  assert(calls.start==1 and calls.startArgs[2]==2 and S.snipePending.expected==20)
+  cfg.maxSpend=19; handlers.COMMODITY_PRICE_UPDATED(10,20)
+  assert(calls.confirm==0)
 `));
 
 test('synchronous overpriced start quote is still rejected', () => check(`
