@@ -34,7 +34,8 @@ local C_AuctionHouse = {
   ConfirmCommoditiesPurchase=function() calls.confirm=calls.confirm+1 end,
 }
 `;
-const production = section('local function retirePurchase(reason)', '\nlocal function purchaseDetails')
+const production = section('do\n    -- Session-only monotonic timestamps.', '\nlocal function prepareCommodityDeal')
+  + section('local function retirePurchase(reason)', '\nlocal function purchaseDetails')
   + section('on("COMMODITY_PRICE_UPDATED", function', '\n-- merchant learner:');
 function check(body) {
   run(setup + production + `

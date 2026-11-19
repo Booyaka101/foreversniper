@@ -96,6 +96,148 @@ function salesCheck(body) {
     + production + prepared + salesAPI.replace(/\bcalls\b/g, 'apiCalls') + body);
 }
 
+test('purchase timing separates validation age from the fast quote response', () => check(`
+  local saved=snapshot({{price=10,quantity=10},{price=100,quantity=1}})
+  saved.t=97.11
+  saved.timing={detectedAt=90,searchAt=94,validatedAt=97.11,method='refresh commodity'}
+  quickBuy({itemID=123,line=10,units=10,cost=100,market2=100,kind='market'})
+  assert(calls.start==1 and S.snipePending.timing.completedAt==97.11)
+  now=100.32
+  handlers.COMMODITY_PRICE_UPDATED(11,110)
+  local message
+  for _,entry in ipairs(diagnostics) do if entry.domain=='purchase timing' then message=entry.message end end
+  assert(message and message:find('attempt 1; item 123',1,true))
+  assert(message:find('detect-to-search 4.00s',1,true))
+  assert(message:find('search-to-complete 3.11s',1,true))
+  assert(message:find('validate-to-click 2.89s',1,true))
+  assert(message:find('click-to-quote 0.32s',1,true))
+  assert(message:find('detect-to-quote 10.32s',1,true))
+  assert(message:find('refresh commodity',1,true) and calls.confirm==0)
+`));
+
+test('missing timing stays unknown and fallback reads do not reset completion age', () => check(`
+  local saved=snapshot({{price=10,quantity=10},{price=100,quantity=1}})
+  saved.t=97
+  C_AuctionHouse.HasFullCommoditySearchResults=function() return false end
+  quickBuy({itemID=123,line=10,units=10,cost=100,market2=100,kind='market'})
+  now=100.3; handlers.COMMODITY_PRICE_UPDATED(11,110)
+  local message
+  for _,entry in ipairs(diagnostics) do if entry.domain=='purchase timing' then message=entry.message end end
+  assert(message:find('detect-to-search unknown',1,true))
+  assert(message:find('search-to-complete unknown',1,true))
+  assert(message:find('completed-age-at-click 3.00s',1,true))
+  assert(message:find('completed fallback',1,true) and calls.confirm==0)
+`));
+
+const prebuyTrial = `
+  cfg.prebuy=true
+  local row={itemID=123,line=10,units=10,cost=100,market2=100,kind='market'}
+  snapshot({{price=10,quantity=10},{price=100,quantity=1}})
+  quickBuy(row)
+  assert(calls.start==0 and S.prebuyCheck and S.liveCandidates[123].prebuy==S.prebuyCheck)
+  local check=S.prebuyCheck
+  quickBuy(row); assert(S.prebuyCheck==check and calls.start==0)
+  S.liveCandidate=S.liveCandidates[123]; S.liveCandidates[123]=nil
+  S.liveCandidate.searchStartedAt=100.5
+  S.searchMethods={[123]='new item search'}
+  now=100.8
+`;
+
+test('prebuy requires a second hardware call after a new complete search', () => check(prebuyTrial + `
+  onCommodityResults(123)
+  assert(calls.start==0 and S.prebuyReady(123,10))
+  assert(S.commoditySnapshots[123].timing.method=='new item search')
+  now=101
+  quickBuy(row)
+  assert(calls.start==1 and S.snipePending.timing.prebuy)
+  now=101.25; handlers.COMMODITY_PRICE_UPDATED(10,100)
+  assert(calls.confirm==1)
+`));
+
+test('prebuy records cheap tiers disappearing on the new search without buying', () => check(prebuyTrial + `
+  rows={{itemID=123,unitPrice=28,quantity=100,numOwnerItems=0}}
+  onCommodityResults(123)
+  assert(calls.start==0 and captured==nil)
+  local message
+  for _,entry in ipairs(diagnostics) do if entry.domain=='prebuy result' then message=entry.message end end
+  assert(message and message:find('before x10/100, after x0/0',1,true))
+  quickBuy(row); assert(calls.start==0 and calls.confirm==0)
+`));
+
+test('prebuy still refuses contradictory quotes after a new search', () => check(prebuyTrial + `
+  onCommodityResults(123); quickBuy(row)
+  assert(calls.start==1)
+  now=101; handlers.COMMODITY_PRICE_UPDATED(28,280)
+  assert(calls.confirm==0 and not S.snipePending)
+  local message
+  for _,entry in ipairs(diagnostics) do if entry.domain=='purchase timing' then message=entry.message end end
+  assert(message:find('mode new-search test; query new item search',1,true))
+`));
+
+test('prebuy cannot authorize incomplete, foreign or expired search results', () => {
+  for (const change of [
+    'C_AuctionHouse.HasFullCommoditySearchResults=function() return false end',
+    'rows[1].itemID=999',
+  ]) check(prebuyTrial + `
+    ${change}; onCommodityResults(123)
+    assert(not S.prebuyReady(123,10) and calls.start==0)
+  `);
+  check(prebuyTrial + `
+    onCommodityResults(999)
+    assert(not S.prebuyReady(123,10) and calls.start==0)
+  `);
+  check(prebuyTrial + `
+    onCommodityResults(123)
+    now=103; assert(not S.prebuyReady(123,10))
+    quickBuy(row); assert(calls.start==0 and S.prebuyCheck~=check)
+  `);
+});
+
+test('prebuy authorization is bound to item, ceiling and the completed snapshot', () => check(prebuyTrial + `
+  onCommodityResults(123)
+  assert(not S.prebuyReady(999,10) and not S.prebuyReady(123,11))
+  local saved=S.commoditySnapshots[123]
+  S.commoditySnapshots[123]={t=now,tiers=saved.tiers}
+  assert(not S.prebuyReady(123,10))
+  S.commoditySnapshots[123]=saved
+  C_AuctionHouse.HasFullCommoditySearchResults=function() return false end
+  quickBuy(row)
+  assert(calls.start==0 and S.prebuyCheck~=check)
+`));
+
+test('prebuy retains purchase locks, budgets and eligibility checks on the second press', () => {
+  for (const change of [
+    'db.unsettledPurchase={}', 'cfg.enabled=false', 'S.ahOpen=false',
+    'db.blacklist[123]=true', 'wallet=100', 'S.batchSearch={}',
+  ]) check(prebuyTrial + `
+    onCommodityResults(123); ${change}; quickBuy(row)
+    assert(calls.start==0 and calls.confirm==0)
+  `);
+});
+
+test('unowned result events cannot consume a queued prebuy request', () => check(`
+  cfg.prebuy=true
+  snapshot({{price=10,quantity=10},{price=100,quantity=1}})
+  quickBuy({itemID=123,line=10,units=10,cost=100,market2=100,kind='market'})
+  local queued=S.liveCandidates[123]
+  onCommodityResults(123)
+  assert(S.liveCandidates[123]==queued and not S.prebuyReady(123,10))
+  assert(calls.start==0)
+`));
+
+test('partial prebuy replies retain ownership until complete and a quote consumes the check', () => check(prebuyTrial + `
+  C_AuctionHouse.HasFullCommoditySearchResults=function() return false end
+  C_AuctionHouse.RequestMoreCommoditySearchResults=function() end
+  onCommodityResults(123)
+  assert(S.liveCandidate and S.liveCandidate.needsPage and not check.finished)
+  assert(not S.prebuyReady(123,10) and calls.start==0)
+  C_AuctionHouse.HasFullCommoditySearchResults=function() return true end
+  now=101; onCommodityResults(123)
+  assert(S.prebuyReady(123,10) and calls.start==0)
+  quickBuy(row)
+  assert(calls.start==1 and not S.prebuyCheck)
+`));
+
 test('fresh sale averages cap resale profit without raising lower live exits', () => {
   salesCheck(`salesFeed(); values.dbregionsaleavg=50
     local terms=S.optimizedCommodityTerms(123,10,100,'market',snapshot({{price=10,quantity=10},{price=100,quantity=1}}))

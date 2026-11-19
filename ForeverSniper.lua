@@ -21,6 +21,7 @@ local DEFAULTS = {
     sweep     = 2,       -- fallback scheduler tick; ready events also wake paced searches
     batch     = true,    -- owner-approved rollout; failures retain individual fallback
     targeted  = false,   -- opt-in Normal Horde material list; no routine broad discovery
+    prebuy    = false,   -- diagnostic two-press new-search comparison, not faster buying
     tsm       = true,    -- verified realm pricing bootstraps discovery; local history caps it
     sales     = true,    -- fresh TSM sales data only tightens market/dump estimates
     saleRate  = 0.05,    -- minimum regional posting success rate when known
@@ -938,7 +939,10 @@ local function commodityTiersForBuy(itemID)
     local saved = S.commoditySnapshots[itemID]
     if not saved or GetTime() < saved.t or GetTime() - saved.t > COMMODITY_SNAPSHOT_AGE then return nil, "loading" end
     local snapshot, reason = readCommodityTiers(itemID)
-    if snapshot then snapshot.t = saved.t return snapshot, nil, "live API" end
+    if snapshot then
+        snapshot.t, snapshot.timing = saved.t, saved.timing
+        return snapshot, nil, "live API"
+    end
     -- A refresh may clear the API's result table. Keep the completed search
     -- that produced the offer, not a partial refresh or persisted deal row.
     if reason == "loading" or reason == "empty" then return saved, nil, "completed fallback: " .. reason end
@@ -959,6 +963,82 @@ local function commodityLot(snapshot, line)
         end
     end
     return units, cost, first, competing, competingUnits
+end
+
+do
+    -- Session-only monotonic timestamps. Missing stages stay unknown, never 0s.
+    function S.purchaseTiming(snapshot, source)
+        local timing = snapshot and snapshot.timing or {}
+        return {detectedAt=timing.detectedAt, searchAt=timing.searchAt,
+            completedAt=snapshot and snapshot.t, validatedAt=timing.validatedAt,
+            method=timing.method, source=source, clickAt=GetTime(), prebuy=cfg.prebuy == true}
+    end
+
+    function S.logPurchaseTiming(p, outcome)
+        if not p.timing then return end
+        local timing = p.timing
+        local function elapsed(start, finish)
+            if not start or not finish or finish < start then return "unknown" end
+            return string.format("%.2fs", finish - start)
+        end
+        diagnostic("purchase timing", string.format("attempt %d; item %d; %s; mode %s; query %s; detect-to-search %s; search-to-complete %s; validate-to-click %s; click-to-quote %s; detect-to-quote %s; completed-age-at-click %s; %s (not server snapshot age)",
+            p.attempt, p.deal.id, outcome, timing.prebuy and "new-search test" or "normal",
+            timing.method or "unknown", elapsed(timing.detectedAt, timing.searchAt),
+            elapsed(timing.searchAt, timing.completedAt), elapsed(timing.validatedAt, timing.clickAt),
+            elapsed(timing.clickAt, GetTime()), elapsed(timing.detectedAt, GetTime()),
+            elapsed(timing.completedAt, timing.clickAt), timing.source or "unknown"))
+    end
+
+    function S.prebuyReady(itemID, line)
+        local check = S.prebuyCheck
+        return check and check.id == itemID and check.line == line and check.completedAt
+            and GetTime() >= check.completedAt and GetTime() - check.completedAt <= 2
+            and S.commoditySnapshots[itemID] == check.snapshot
+    end
+
+    function S.prebuyGate(r, line, snapshot, source)
+        if not cfg.prebuy then return true end
+        if source == "live API" and S.prebuyReady(r.itemID, line) then return true end
+        local check = S.prebuyCheck
+        if check and check.id == r.itemID and not check.finished and GetTime() - check.t < 15 then
+            printf("new-search check is queued or loading; wait for completion, then press BUY again.")
+            return false
+        end
+        for _, field in ipairs({"liveCandidate", "autoSearch", "watchSearch"}) do
+            if S[field] and S[field].id == r.itemID then
+                printf("this item's search is still in progress; press BUY after it finishes.")
+                return false
+            end
+        end
+        local units, cost = commodityLot(snapshot, line)
+        check = {id=r.itemID, line=line, t=GetTime(), units=units, cost=cost,
+            before=snapshot.evidence or "unavailable"}
+        S.prebuyCheck = check
+        S.liveCandidates = S.liveCandidates or {}
+        S.liveCandidates[r.itemID] = {id=r.itemID, line=line, link=r.link,
+            market=r.market2, kind=r.kind, refresh=true, prebuy=check,
+            t=GetTime(), detectedAt=snapshot.timing and snapshot.timing.detectedAt}
+        diagnostic("prebuy search", string.format("item %d; before x%d/%d copper; requesting SendSearchQuery, not RefreshCommoditySearchResults; no purchase until another hardware press", r.itemID, units, cost))
+        printf("new item search queued; nothing purchased. Press BUY again within 2s of its completion if the offer remains eligible.")
+        S.wakeSweep()
+        return false
+    end
+
+    function S.completePrebuy(owner, snapshot, reason)
+        local check = owner and owner.prebuy
+        if not check or check ~= S.prebuyCheck or check.finished then return end
+        check.finished = true
+        if snapshot then
+            check.completedAt, check.snapshot = GetTime(), snapshot
+            local units, cost = commodityLot(snapshot, check.line)
+            diagnostic("prebuy result", string.format("item %d; before x%d/%d, after x%d/%d copper; first 3 rows before=%s; after=%s; queued %.2fs; search %.2fs (no server timestamp)",
+                check.id, check.units, check.cost, units, cost, check.before, snapshot.evidence or "unavailable",
+                owner.searchStartedAt - check.t, GetTime() - owner.searchStartedAt))
+            printf("new search completed for item %d: x%d under the ceiling. Nothing purchased; press BUY again if still eligible.", check.id, units)
+        else
+            diagnostic("prebuy result", string.format("item %d; new search %s; no purchase", check.id, reason or "unreadable"))
+        end
+    end
 end
 
 local function prepareCommodityDeal(itemID, link, line, market, kind)
@@ -1326,15 +1406,19 @@ local function noteQueryAttempt()
     lastQueryAt = now
 end
 
-local function requestItemSearch(itemID, commodity, separateOwner)
+local function requestItemSearch(itemID, commodity, separateOwner, forceSearch)
     local ah = C_AuctionHouse
     local key = ah.MakeItemKey and ah.MakeItemKey(itemID) or {itemID=itemID}
-    local has = ah.HasSearchResults and ah.HasSearchResults(key)
+    local has = not forceSearch and ah.HasSearchResults and ah.HasSearchResults(key)
+    S.searchMethods = S.searchMethods or {}
     if has and commodity == true and ah.RefreshCommoditySearchResults then
+        S.searchMethods[itemID] = "refresh commodity"
         ah.RefreshCommoditySearchResults(itemID)
     elseif has and commodity == false and ah.RefreshItemSearchResults then
+        S.searchMethods[itemID] = "refresh item"
         ah.RefreshItemSearchResults(key)
     else
+        S.searchMethods[itemID] = "new item search"
         local sort = Enum and Enum.AuctionHouseSortOrder
         ah.SendSearchQuery(key, {{sortOrder=sort and sort.Price or 0, reverseSort=false}}, separateOwner)
     end
@@ -1962,6 +2046,10 @@ commodityActionState = function(itemID, link, line, units, cost, market, kind)
     if reason == "stackable" then return "Type", false, "Market flips require verified stackable items." end
     if reason == "overhang" then return "Stock", false, "Complete live competing stock exceeds your overhang limit." end
     if reason == "empty" then return "Gone", false, "No units remain below the approved ceiling." end
+    if ready and cfg.prebuy then
+        return S.prebuyReady(itemID, line) and "Buy" or "Check", true,
+            "New-search test: first press searches; press again within 2s of completion to start a guarded quote."
+    end
     return ready and "Buy" or "Load", ready,
         ready and "One click buys this complete position after the live quote passes validation."
             or "Waiting for validated live tiers. The scanner prepares these automatically."
@@ -2177,9 +2265,12 @@ quickBuy = function(r)
         return
     end
     local buyUnits, expected = terms.units, terms.cost
+    if not S.prebuyGate(r, line, snapshot, source) then return end
+    S.prebuyCheck = nil -- A completed check authorizes only one quote attempt.
+    S.purchaseSequence = (S.purchaseSequence or 0) + 1
     if snapshot then
-        diagnostic("purchase tiers", string.format("item %d; %s; completed age %.2fs; read age %.2fs; %d tiers; approved x%d/%d copper; first 3 rows item:unit:quantity:owned:auctionID=%s",
-            r.itemID, source, GetTime() - snapshot.t, GetTime() - (snapshot.readAt or snapshot.t),
+        diagnostic("purchase tiers", string.format("item %d; attempt %d; %s; completed age %.2fs; read age %.2fs; %d tiers; approved x%d/%d copper; first 3 rows item:unit:quantity:owned:auctionID=%s",
+            r.itemID, S.purchaseSequence, source, GetTime() - snapshot.t, GetTime() - (snapshot.readAt or snapshot.t),
             #snapshot.tiers, buyUnits, expected, snapshot.evidence or "unavailable"))
     end
     pcall(C_AuctionHouse.CancelCommoditiesPurchase)
@@ -2189,6 +2280,7 @@ quickBuy = function(r)
         walletCap = terms.walletCap, reserve = terms.reserve, t = GetTime(),
         market = r.market2, kind = terms.kind,
         offer = r.offer,
+        attempt = S.purchaseSequence, timing = S.purchaseTiming(snapshot, source),
     }
     local pending = S.snipePending
     C_Timer.After(6, function()
@@ -2825,10 +2917,13 @@ local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
         -- before exposing an actionable lot or claiming its profit.
         S.liveCandidates = S.liveCandidates or {}
         local queued = S.liveCandidates[itemID]
+        local detectedAt = GetTime()
+        if queued then detectedAt = queued.detectedAt end
         S.liveCandidates[itemID] = { kind = kind, id = itemID, link = link,
             line = sweep.line or unit, market = market, profit = sweep.profit,
-            detectedAt = queued and (queued.detectedAt or queued.t) or GetTime(),
-            t = queued and queued.t or GetTime(), refresh = queued and queued.refresh }
+            detectedAt = detectedAt,
+            t = queued and queued.t or GetTime(), refresh = queued and queued.refresh,
+            prebuy = queued and queued.prebuy }
         if not queued then recordGate("offer", "queued for live tiers", itemID) end
         return
     end
@@ -3597,7 +3692,7 @@ local function sendTargetSearch(field, target)
     noteQueryAttempt()
     -- Own the request before invoking the client: custom clients can deliver
     -- a cached response synchronously from RefreshCommoditySearchResults.
-    local ok, e = pcall(requestItemSearch, target.id, target.commodity, true)
+    local ok, e = pcall(requestItemSearch, target.id, target.commodity, true, target.prebuy ~= nil)
     if not ok then
         if S[field] == target then S[field] = nil end
         err("target search", e)
@@ -3983,6 +4078,8 @@ local function sweepQuery()
         targetedPool = S.targetedPool()
         if not targetedPool then return end
     end
+    local prebuy = cfg.prebuy and S.prebuyCheck
+    if prebuy and prebuy.completedAt and GetTime() - prebuy.completedAt <= 2 then return end
     local focus = focusedDeal()
     if focus and S.dealFocus then
         local priority = S.dealFocus
@@ -5248,6 +5345,13 @@ local function onCommodityResults(itemID)
         owner.needsPage = type(C_AuctionHouse.RequestMoreCommoditySearchResults) == "function"
         return
     end
+    if owner and owner.id == itemID then
+        if snapshot then
+            snapshot.timing = {detectedAt=owner.detectedAt, searchAt=owner.searchStartedAt,
+                method=S.searchMethods and S.searchMethods[itemID]}
+        end
+        S.completePrebuy(owner, snapshot, reason)
+    end
     local target = S.autoSearch
     if target and target.id == itemID then
         S.autoSearch = nil
@@ -5271,7 +5375,7 @@ local function onCommodityResults(itemID)
     -- A completed automatic check may just have queued this candidate. Its
     -- event-owned full tiers already satisfy preparation; do not search twice.
     local queued = snapshot and S.liveCandidates and S.liveCandidates[itemID]
-    if queued then
+    if queued and not queued.prebuy then
         if not c or c.id ~= itemID then c = queued end
         S.liveCandidates[itemID] = nil
     end
@@ -5295,6 +5399,9 @@ local function onCommodityResults(itemID)
         end
         local terms, rejected = S.optimizedCommodityTerms(itemID, c.line, c.market, c.kind, snapshot)
         if terms then
+            snapshot.timing = snapshot.timing or {}
+            snapshot.timing.detectedAt = c.detectedAt
+            snapshot.timing.validatedAt = GetTime()
             if c.detectedAt then
                 local stats = S.sweepStats
                 stats.validationLast = math.max(0, GetTime() - c.detectedAt)
@@ -5353,6 +5460,7 @@ on("COMMODITY_PRICE_UPDATED", function(unitPrice, totalPrice)
         elseif u > ceiling then rejected = "unit price above approved ceiling"
         elseif t > sp.tolTotal then rejected = "total above approved purchase cost"
         elseif t > budget then rejected = "total above current budget" end
+        S.logPurchaseTiming(sp, rejected or "price caps passed")
         if rejected then
             local detail = string.format("%s; item %d x%d; quote unit/total %s/%s copper; caps unit/total/budget %.0f/%.0f/%.0f copper; age %.2fs",
                 rejected, sp.deal.id, sp.units, tostring(u), tostring(t), ceiling, sp.tolTotal, budget, age)
@@ -5596,6 +5704,7 @@ local HELP = {
     "/fsn sweep 3          fallback tick seconds (2-30); ready events wake paced searches",
     "/fsn batch on|off     experimental 100-key summaries; failures fall back to item checks",
     "/fsn targeted on|off  101 Normal Horde / Forever-EU materials; no routine broad queries",
+    "/fsn prebuy on|off    diagnostic new-search test: first press searches, second buys",
     "/fsn max 250g         spend cap per Buy click",
     "/fsn keep 10g         keep this gold untouched (5% wallet buffer also applies)",
     "/fsn stock 200        default per-item exposure cap (0 = off)",
@@ -5784,6 +5893,7 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             ss.batchSent or 0, ss.batchCompleted or 0, ss.batchKeys or 0,
             ss.batchRows or 0, ss.batchFailures or 0, ss.batchLatency or 0)
         printf("targeted list: %s. /fsn targeted on|off", S.targetedStatus())
+        printf("prebuy new-search test: %s; timing evidence in /fsn diagnostics. No server snapshot age is available.", cfg.prebuy and "on (two presses)" or "off (normal one-press)")
         printf("automatic item checks: %d sent, %d completed, %d distinct targets; last target: %s (stock movement is not confirmed sales).",
             ss.autoSent or 0, ss.autoCompleted or 0, ss.autoUnique or 0, tostring(ss.lastTarget or "none"))
         if cfg.targeted then
@@ -6005,6 +6115,13 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             printf("batch discovery %s (experimental; full live tiers still required).", cfg.batch and "on" or "off")
             S.wakeSweep()
         else printf("usage: /fsn batch on|off; current: %s", cfg.batch and "on" or "off") end
+
+    elseif cmd == "prebuy" then
+        if rest == "on" or rest == "off" then
+            cfg.prebuy = rest == "on"
+            S.prebuyCheck = nil
+        elseif rest ~= "" then printf("usage: /fsn prebuy [on|off]") end
+        printf("prebuy new-search test %s. First BUY press searches, second starts a guarded quote within 2s of completion; no automatic purchase after search.", cfg.prebuy and "on" or "off")
 
     elseif cmd == "targeted" then
         if rest == "on" or rest == "off" then
