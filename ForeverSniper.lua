@@ -2273,6 +2273,10 @@ quickBuy = function(r)
     end
     local buyUnits, expected = terms.units, terms.cost
     if not S.prebuyGate(r, line, snapshot, source) then return end
+    -- Match the native buy display's sanitized average, including mixed tiers.
+    -- This request argument does not replace the exact total and unit quote caps.
+    local priceIncrement = C_AuctionHouse.SupportsCopperValues and not C_AuctionHouse.SupportsCopperValues() and 100 or 1
+    local requestUnitPrice = math.ceil(expected / buyUnits / priceIncrement) * priceIncrement
     S.prebuyCheck = nil -- A completed check authorizes only one quote attempt.
     S.purchaseSequence = (S.purchaseSequence or 0) + 1
     if snapshot then
@@ -2284,6 +2288,7 @@ quickBuy = function(r)
     S.snipePending = {
         deal = { id = r.itemID, link = r.link }, units = buyUnits,
         tolTotal = expected, maxUnit = line, expected = expected,
+        requestUnitPrice = requestUnitPrice,
         walletCap = terms.walletCap, reserve = terms.reserve, t = GetTime(),
         market = r.market2, kind = terms.kind,
         offer = r.offer,
@@ -2297,7 +2302,9 @@ quickBuy = function(r)
         printf(pending.confirmed and "purchase outcome unknown; further buys are locked. Check mail and /fsn purchase." or "purchase quote timed out; nothing confirmed.")
         if S.feedRefresh then S.feedRefresh() end
     end)
-    local ok, e = pcall(C_AuctionHouse.StartCommoditiesPurchase, r.itemID, buyUnits)
+    diagnostic("purchase request", string.format("attempt %d; item %d x%d; request unit %d copper; expected total %d copper",
+        pending.attempt, r.itemID, buyUnits, requestUnitPrice, expected))
+    local ok, e = pcall(C_AuctionHouse.StartCommoditiesPurchase, r.itemID, buyUnits, requestUnitPrice)
     if not ok then
         err("StartCommoditiesPurchase", e)
         -- A callback can submit the quote before the API raises. Never discard

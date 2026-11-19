@@ -23,8 +23,13 @@ local C_AuctionHouse = {
     HasFullCommoditySearchResults=function() return true end,
     GetNumCommoditySearchResults=function() return #rows end,
     GetCommoditySearchResultInfo=function(_,i) return rows[i] end,
-    StartCommoditiesPurchase=function() calls.start=calls.start+1 end,
-    ConfirmCommoditiesPurchase=function() calls.confirm=calls.confirm+1 end,
+    StartCommoditiesPurchase=function(...)
+        calls.start=calls.start+1; calls.startArgs={...}
+    end,
+    ConfirmCommoditiesPurchase=function(...)
+        calls.confirm=calls.confirm+1; calls.confirmArgs={...}
+    end,
+    SupportsCopperValues=function() return true end,
     CancelCommoditiesPurchase=function() end,
 }
 local C_Timer = {After=function() end}
@@ -95,6 +100,76 @@ function salesCheck(body) {
   run(setup + fixture.replace(/\bcalls\b/g, 'apiCalls') + salesEnvironment + provider
     + production + prepared + salesAPI.replace(/\bcalls\b/g, 'apiCalls') + body);
 }
+
+test('purchase start sends the native price argument for the observed Mageweave lot', () => check(`
+  local saved=snapshot({{price=123,quantity=20},{price=413,quantity=103},{price=414,quantity=417}})
+  S.commoditySnapshots[4338]=saved
+  for _,row in ipairs(rows) do row.itemID=4338 end
+  quickBuy({itemID=4338,line=123,units=20,cost=2460,market2=413,kind='market'})
+  assert(calls.start==1 and #calls.startArgs==3)
+  assert(calls.startArgs[1]==4338 and calls.startArgs[2]==20 and calls.startArgs[3]==123)
+  assert(S.snipePending.tolTotal==2460 and S.snipePending.maxUnit==123)
+  local message
+  for _,entry in ipairs(diagnostics) do if entry.domain=='purchase request' then message=entry.message end end
+  assert(message and message:find('item 4338 x20; request unit 123 copper; expected total 2460 copper',1,true))
+  handlers.COMMODITY_PRICE_UPDATED(413,8260)
+  assert(calls.confirm==0 and not S.snipePending)
+`));
+
+test('mixed-tier start uses the rounded-up average rather than the line or highest tier', () => check(`
+  snapshot({{price=10,quantity=2},{price=12,quantity=1},{price=100,quantity=1}})
+  quickBuy({itemID=123,line=15,units=3,cost=32,market2=100,kind='market'})
+  assert(calls.start==1 and calls.startArgs[3]==11)
+  assert(S.snipePending.tolTotal==32 and S.snipePending.maxUnit==15)
+  handlers.COMMODITY_PRICE_UPDATED(11,33)
+  assert(calls.confirm==0 and not S.snipePending, 'rounding must not increase the approved total')
+`));
+
+test('native price rounding respects clients without copper prices', () => check(`
+  C_AuctionHouse.SupportsCopperValues=function() return false end
+  snapshot({{price=100,quantity=2},{price=200,quantity=1},{price=1000,quantity=1}})
+  quickBuy({itemID=123,line=200,units=3,cost=400,market2=1000,kind='market'})
+  assert(calls.start==1 and calls.startArgs[3]==200)
+  assert(S.snipePending.tolTotal==400)
+`));
+
+test('purchase price uses click-time tiers when the displayed lot shrinks', () => check(`
+  snapshot({{price=10,quantity=2},{price=100,quantity=1}})
+  quickBuy({itemID=123,line=15,units=3,cost=32,market2=100,kind='market'})
+  assert(calls.start==1 and calls.startArgs[2]==2 and calls.startArgs[3]==10)
+  assert(S.snipePending.tolTotal==20)
+`));
+
+test('synchronous start quote sees its owner and confirmation retains the native two arguments', () => check(`
+  C_AuctionHouse.StartCommoditiesPurchase=function(...)
+    calls.start=calls.start+1; calls.startArgs={...}
+    assert(S.snipePending and S.snipePending.requestUnitPrice==10)
+    handlers.COMMODITY_PRICE_UPDATED(10,100)
+  end
+  offer()
+  assert(calls.start==1 and calls.startArgs[3]==10 and calls.confirm==1)
+  assert(#calls.confirmArgs==2 and calls.confirmArgs[1]==123 and calls.confirmArgs[2]==10)
+  assert(db.unsettledPurchase and db.unsettledPurchase==S.snipePending)
+`));
+
+test('synchronous overpriced start quote is still rejected', () => check(`
+  C_AuctionHouse.StartCommoditiesPurchase=function(...)
+    calls.start=calls.start+1; calls.startArgs={...}
+    handlers.COMMODITY_PRICE_UPDATED(11,110)
+  end
+  offer()
+  assert(calls.start==1 and calls.startArgs[3]==10 and calls.confirm==0)
+  assert(not S.snipePending and not db.unsettledPurchase)
+`));
+
+test('unowned complete events do not inherit a previous request timestamp', () => check(`
+  local saved=snapshot({{price=10,quantity=10},{price=100,quantity=1}})
+  saved.timing={searchAt=95,method='new item search'}
+  now=101; onCommodityResults(123)
+  assert(S.commoditySnapshots[123]~=saved and not S.commoditySnapshots[123].timing)
+  quickBuy({itemID=123,line=10,units=10,cost=100,market2=100,kind='market'})
+  assert(S.snipePending and not S.snipePending.timing.searchAt)
+`));
 
 test('purchase timing separates validation age from the fast quote response', () => check(`
   local saved=snapshot({{price=10,quantity=10},{price=100,quantity=1}})
