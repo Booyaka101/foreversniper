@@ -200,6 +200,40 @@ watch rules and vendor exits retain their existing full-lot selection.
 
 ## Recovering remaining cheap stock
 
+### Local debugging
+
+The last 250 diagnostic records, including requests, quote decisions and
+purchase outcomes, are stored in `ForeverSniperTrace` inside the addon's
+SavedVariables file. A sequence number orders events within the same second.
+WoW writes this to disk on `/reload` or a clean logout. After closing the AH
+and reloading, the desktop reader can show the records without modifying the
+save or requiring the game to exit:
+
+```sh
+node tools/purchase-trace.mjs
+node tools/purchase-trace.mjs --wait-save
+```
+
+The first command reads the latest disk save. The second waits for the next
+save, prints one report and exits (ten-minute timeout). Use `--sv <file>` to
+choose an account or `--wow-root <folder>` for a different installation.
+Older saves without a separate trace use the legacy diagnostics if present.
+
+For live debugging without reloading, run `node tools/purchase-trace.mjs
+--wait-shot` on the desktop and `/fsn capture once` in game. On the next failed
+purchase or refused quote, the addon shows a diagnostic overlay and requests
+one **full game screenshot**, including other visible UI and chat. It stays in
+WoW's local `Screenshots` folder; nothing is uploaded. The desktop watcher
+reports the next screenshot path, so check for the Forever Sniper overlay to
+distinguish it from a manual screenshot. The watcher exits after one file or
+ten minutes. `/fsn capture off` disarms the in-game capture; reload also disarms
+it. The client must support screenshots and have the UI visible.
+
+An active debugging session can inspect the reported file immediately. These
+tools do not run a permanent assistant or automatically change the addon.
+
+### Smaller guarded retries
+
 After a quote exceeds the approved unit price or exact total, the addon cancels
 it and prioritises a new item search instead of refreshing the contradicted cache.
 The original offer is retired. A complete result can produce a smaller **RETRY**
