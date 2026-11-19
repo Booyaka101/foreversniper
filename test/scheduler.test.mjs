@@ -78,7 +78,7 @@ local on = onOptional
 const production = section('local SCAN_CATEGORIES =', '\nif db.boughtAt == nil')
   + section('local throttleReady, pagePending', '\nS.autoChecked =')
   + section('local function queryPacing()', '\nlocal function requestItemSearch')
-  + section('canQuery = function(paging)', '\nlocal function discoveryScope')
+  + section('canQuery = function(paging, urgent)', '\nlocal function discoveryScope')
   + section('do\n    -- Seed only,', '\ndo\n    function S.failBatch')
   + section('do\n    function S.failBatch', '\nlocal function sweepQuery()')
   + section('local function sweepQuery()', '\n-- DEEP')
@@ -571,10 +571,10 @@ test('event-driven broad rotation sustains coverage with delayed replies and no 
     after(0.3,handlers.AUCTION_HOUSE_BROWSE_RESULTS_UPDATED)
   end
   startSweeping(); advance(140)
-  assert(count('batch')>=29 and count('browse')>=9 and count('target')==0)
-  assert(maxGap>0 and maxGap<=4.05)
-  for id=1,205 do assert(checked[id] and now-checked[id]<=4.05) end
-  for i=2,#queries do assert(queries[i].t-queries[i-1].t>=1) end
+  assert(count('batch')>=29 and count('browse')>=9 and count('target')==0, 'query counts')
+  assert(maxGap>0 and maxGap<=4.05, 'revisit gap '..maxGap)
+  for id=1,205 do assert(checked[id] and now-checked[id]<=4.05, 'coverage '..id) end
+  for i=2,#queries do assert(queries[i].t-queries[i-1].t>=1, 'spacing '..(queries[i].t-queries[i-1].t)) end
 `));
 
 test('large eligible pools retain oldest-first fairness across successive passes', () => batchCheck(`
@@ -601,6 +601,131 @@ test('batch revisit metrics exclude individual validation and do not invent a fi
   now=103; assert(S.startBatch()); S.readBatch()
   assert(S.sweepStats.batchRevisitLast==3 and S.sweepStats.batchRevisitCount==1)
   assert(S.sweepStats.batchRevisitTotal==3 and S.sweepStats.batchRevisitMax==3)
+`));
+
+for (const priority of [false, true]) test(`1146-item broad coverage benchmark with material priority ${priority}`, () => batchCheck(`
+  for id=206,1146 do db.book[id]={s={100}} end
+  local seed={}; for id=1,101 do seed[id]=true end
+  S.targetedItems=seed
+  ${priority ? 'ForeverSniperTSM={marketIdentity=function() return "normal-horde","forever-eu" end}' : ''}
+  local checked,metrics={},{{total=0,count=0,max=0},{total=0,count=0,max=0}}
+  submit=function(keys)
+    local seen={}
+    for _,key in ipairs(keys) do
+      local id=key.itemID
+      assert(not seen[id]); seen[id]=true
+      if checked[id] then
+        local m=metrics[seed[id] and 1 or 2]; local gap=now-checked[id]
+        m.total,m.count,m.max=m.total+gap,m.count+1,math.max(m.max,gap)
+      end
+      checked[id]=now
+    end
+    S.readBatch()
+  end
+  slots(180)
+  for id=1,1146 do assert(checked[id] and now-checked[id]<=57) end
+  assert(count('batch')==135 and count('browse')==45 and count('target')==0)
+  for lane,m in ipairs(metrics) do
+    print(string.format('COVERAGE priority=${priority} lane=%d mean=%.2fs max=%.2fs repeats=%d',lane,m.total/m.count,m.max,m.count))
+  end
+  if ${priority} then
+    assert(metrics[1].total/metrics[1].count<2 and metrics[1].max<=3)
+    assert(metrics[2].max<=57 and S.sweepStats.batchPriorityEligible==101)
+    assert(S.sweepStats.batchLanes.priority and S.sweepStats.batchLanes.coverage)
+  else assert(metrics[1].total/metrics[1].count>14) end
+`));
+
+test('priority slots retain eligibility, fill unused capacity and require the matching market', () => batchCheck(`
+  S.targetedItems={[123]=true,[124]=true,[125]=true,[126]=true}
+  ForeverSniperTSM={marketIdentity=function() return 'normal-horde','forever-eu' end}
+  db.blacklist[124]=true; watchByID[125]={}
+  commodityFor=function(id) return id~=126 end
+  assert(S.startBatch() and S.batchSearch.count==100)
+  assert(S.batchSearch.priorityIDs[123] and not S.batchSearch.ids[124] and not S.batchSearch.ids[125] and not S.batchSearch.ids[126])
+  assert(S.sweepStats.batchPriorityEligible==1)
+  S.readBatch(); now=now+1
+  ForeverSniperTSM.marketIdentity=function() return 'normal-alliance','forever-eu' end
+  assert(S.startBatch() and S.batchSearch.count==100 and not next(S.batchSearch.priorityIDs))
+`));
+
+const fastValidationSetup = `
+  db.book={[123]={s={100}}}
+  local queuedOnce=false
+  processBrowseRows=function()
+    if queuedOnce then return end
+    queuedOnce=true
+    S.liveCandidates={[123]={id=123,t=now,detectedAt=now,line=10,market=100}}
+  end
+  submit=function() after(0.54,function() S.readBatch() end) end
+  synchronous=function() S.liveCandidate=nil; S.wakeSweep() end
+`;
+
+test('a completed batch advances fresh validation and repays the pacing loan before monitoring', () => batchCheck(fastValidationSetup + `
+  requestItemSearch=function(id,commodity,separate,force)
+    assert(id==123 and force)
+    record('target',id); synchronous()
+  end
+  startSweeping(); advance(101)
+  assert(#queries==2 and queries[1].kind=='batch' and queries[2].kind=='target')
+  local wait=queries[2].t-(queries[1].t+0.54)
+  assert(wait>=0 and wait<0.02)
+  assert(S.sweepStats.validationSaved>0.4)
+  print(string.format('VALIDATION queue wait %.2fs versus 0.46s fixed-spacing baseline',wait))
+  advance(102); assert(#queries==2)
+  advance(102.03); assert(#queries==3 and queries[3].t-queries[1].t>=2)
+`));
+
+test('urgent validation cannot exceed 60 attempts in any rolling minute under repeated ready events', () => batchCheck(`
+  db.book={[123]={s={100}}}
+  processBrowseRows=function()
+    S.liveCandidates={[123]={id=123,t=now,detectedAt=now,line=10,market=100}}
+  end
+  submit=function() after(0.3,function() S.readBatch() end) end
+  synchronous=function() S.liveCandidate=nil; S.wakeSweep() end
+  C_AuctionHouse.SendBrowseQuery=function(query)
+    record('browse',query.itemClassFilters[1].classID)
+    after(0.3,handlers.AUCTION_HOUSE_BROWSE_RESULTS_UPDATED)
+  end
+  startSweeping()
+  for i=1,1800 do advance(100+i/10); handlers.AUCTION_HOUSE_THROTTLED_SYSTEM_READY() end
+  assert(count('target')>30 and count('browse')>15)
+  for i,query in ipairs(queries) do
+    local n=0
+    for j=i,1,-1 do if query.t-queries[j].t>=60 then break end n=n+1 end
+    assert(n<=60,'rolling minute exceeded: '..n)
+  end
+`));
+
+test('urgent validation preserves ownership, focus, discovery debt, purchase locks and live readiness', () => {
+  for (const change of ['ready=false', 'nativeSell=true', 'S.snipePending={}', 'db.unsettledPurchase={}',
+    'S.ahOpen=false', 'cfg.enabled=false', 'S.liveCandidate={id=999,t=now}', 'S.batchSearch={t=now}',
+    'S.discoveryDue=true', 'focus={id=999}; S.dealFocus={deal=focus}', 'db.blacklist[123]=true']) batchCheck(`
+    local candidate={id=123,t=now,detectedAt=now,line=10,market=100,forceSearch=true}
+    S.liveCandidates={[123]=candidate}; S.fastValidationCandidate=candidate
+    lastQueryAt=now-0.4
+    ${change}
+    sweepQuery(); assert(count('target',123)==0,'${change}')
+  `);
+});
+
+test('cancelled and old batch candidates cannot retain an urgent pacing loan', () => batchCheck(`
+  local candidate={id=123,t=now,detectedAt=now}
+  S.liveCandidates={[123]=candidate}; S.fastValidationCandidate=candidate
+  assert(S.fastValidation()==candidate)
+  S.liveCandidates[123]=nil; assert(not S.fastValidation())
+  S.liveCandidates[123]=candidate; now=now+1; assert(not S.fastValidation())
+`));
+
+test('manual owned queries must repay validation debt and obey the rolling request cap', () => check(`
+  ${section('    local function queryOwned(', '\n    function S.lowOwnedSnapshot(')}
+  C_AuctionHouse.QueryOwnedAuctions=function() record('owned') end
+  lastQueryAt=now-1.1; queryPacing().nextAt=now+0.5
+  assert(not S.requestSellingOwned() and #queries==0)
+  now=now+0.5; assert(S.requestSellingOwned() and count('owned')==1)
+  now=now+2
+  local p=queryPacing(); p.requests={}
+  for i=1,60 do p.requests[i]=now-59+i/100 end
+  assert(not S.requestSellingOwned() and count('owned')==1)
 `));
 
 test('batch replies use the shared candidate pipeline, never a tier snapshot', () => batchCheck(`

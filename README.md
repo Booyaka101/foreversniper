@@ -8,8 +8,11 @@ you can choose to buy. TradeSkillMaster is not required.
 
 Server-ready and result events wake the scanner without waiting for its fallback
 timer. Event bursts are coalesced and deferred, including synchronous cached
-replies. Every query still passes the existing minimum one-second spacing,
-server-readiness, ownership, native-form, and purchase-lock checks. `/fsn sweep`
+replies. Routine queries retain one-second spacing. A newly detected batch bargain
+can borrow its next pacing slot for a fresh detailed search as soon as the live
+API is ready. The following routine request repays that time, and a rolling limit
+keeps requests at no more than 60 attempts per 60 seconds. Server-readiness,
+ownership, native-form, and purchase-lock checks remain mandatory. `/fsn sweep`
 sets the fallback tick (2-30 seconds), not the event-driven request interval.
 The live readiness API is authoritative: stale SENT/QUEUED event flags do not add
 a five-second delay after the server reports ready. The feed distinguishes owned
@@ -125,10 +128,19 @@ the first check has no revisit interval, and counts include repeated items.
 
 Batches use automatic target opportunities after queued candidates, watches and
 due displayed-deal refreshes. Broad category discovery keeps its reserved slots
-to find unfamiliar items. Eligible keys with fresh references rotate
-oldest-check-first continuously, filling each batch up to 100 keys. There is no
-per-item ten-second cooldown or proximity boost. Shared one-second request
-spacing and server readiness still apply. Deep scans retain their own browse
+to find unfamiliar items. On verified Normal Horde / Forever-EU, each broad batch
+first selects up to 75 eligible materials from the existing 101-material seed,
+oldest-check-first. The remaining slots go to the oldest eligible keys across the
+whole book, with at least 25 slots available for coverage. Unused priority capacity
+returns to coverage. The seed sets monitoring priority, not evidence of current
+sales, cheap listings or safe purchases. Other markets retain oldest-first rotation.
+No new mode or saved setting is required. All keys still need fresh references,
+verified commodity eligibility and the existing blacklist/watch checks.
+
+This deliberately trades slower low-priority coverage for faster material revisits.
+`/fsn status` reports eligible pool sizes and separate priority/coverage mean and
+maximum revisit times; an overall mean can hide that tradeoff. There is no per-item
+ten-second cooldown. Routine spacing and server readiness still apply. Deep scans retain their own browse
 channel; batch requests do not run alongside them. Individual checks remain the
 fallback when no batch is eligible, batching is off, or its APIs are unavailable.
 
@@ -149,12 +161,25 @@ profit boost; summary profit is only a priority hint, not validated earnings.
 There is no 1% change cutoff: unchanged summaries and small quantity changes
 remain eligible on later visits. Existing duplicate-alert checks still apply.
 
-In the deterministic 205-item, 40-slot comparison (immediate replies, no candidates
+In the earlier deterministic 205-item, 40-slot comparison (immediate replies, no candidates
 or purchase pauses), continuous rotation checks 3,000 item keys versus 820 before,
 with the same 10 broad queries and 40 total requests. Mean batch revisit falls
 from 10.18s to 2.71s; maximum from 11s to 4s. Delayed-reply and 1,000-item tests also
 cover rotation, spacing and fairness. These tests establish scheduling behavior,
 not a measured live speedup.
+
+A 1,146-item, 180-request comparison with 101 priority materials and the same
+135 batches / 45 broad queries changes material revisit mean/max from
+14.70/16.00s to 1.79/3.00s. Other items change from 15.34/16.00s to
+55.73/56.00s. These are simulated intervals with immediate responses and no
+purchase pauses, not live availability or a guaranteed win rate.
+
+For a batch completing after 0.54s, the urgent-validation test reduces its extra
+pacing wait from 0.46s to 0.01s. The borrowed time is repaid before monitoring
+resumes. Only a newly queued batch candidate less than one second old can use
+this path; existing ownership, discovery debt, focused Buy windows, prebuy and
+remainder recovery take precedence. Batch candidates request a new detailed
+search instead of refreshing cached tiers. Callbacks still cannot start a buy.
 During the default-on rollout, compare batches on/off with the same
 known items: completed keys per minute, revisit delays, candidate-to-alert time,
 timeouts and stale-result rejections. Last response time is not listing age.
@@ -249,9 +274,9 @@ the next monitoring slot ahead of speculative searches. Existing owned result
 pages and the bounded five-second focused Buy window still take precedence.
 These are scheduling priorities, not faster server requests or instant alerts.
 
-Batch summaries revisit up to 100 known eligible items per request. Oldest checks
-lead without a per-item cooldown, allowing continuous coverage at the existing
-request rate. Unknown items
+Batch summaries revisit up to 100 known eligible items per request, sharing
+capacity between market-matched priority materials and oldest-first coverage
+as described above. There is no per-item cooldown. Unknown items
 still enter through broad discovery and full/deep scans, not a guessed item list.
 Every deep-scan page now evaluates candidates before learning its own prices;
 complete live tiers are still mandatory before admission. Deep browse requests
