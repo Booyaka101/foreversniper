@@ -82,8 +82,8 @@ const production = section('local SCAN_CATEGORIES =', '\nif db.boughtAt == nil')
   + section('do\n    -- Seed only,', '\ndo\n    function S.failBatch')
   + section('do\n    function S.failBatch', '\nlocal function sweepQuery()')
   + section('local function sweepQuery()', '\n-- DEEP')
-  + section('-- DEEP SCAN (/fsn deepscan', '\nfunction S.wakeSweep()')
-  + section('function S.wakeSweep()', '\n\n-- BATCH RELIST:')
+  + section('-- DEEP SCAN (/fsn deepscan', '\nfunction S.wakeSweep(')
+  + section('function S.wakeSweep(', '\n\n-- BATCH RELIST:')
   + section('stopRelisting = function()', '\nlocal function startRelisting')
   + section('do\nlocal function readDeepBrowse', '\n-- Event-driven throttle')
   + section('onOptional("OWNED_AUCTIONS_UPDATED"', '\nlocal function onReplicateUpdated()');
@@ -453,7 +453,7 @@ test('batch command toggles future requests without abandoning an in-flight owne
   `);
 });
 
-test('batch requests are bounded, deterministic and rotate across known keys', () => batchCheck(`
+test('batch requests fill each slot with the oldest eligible keys without a per-item cooldown', () => batchCheck(`
   local batches={}
   submit=function(keys) batches[#batches+1]=keys end
   slots(5)
@@ -463,15 +463,102 @@ test('batch requests are bounded, deterministic and rotate across known keys', (
   S.readBatch(); now=now+1; assert(S.startBatch())
   assert(#batches[2]==100 and batches[2][1].itemID==101)
   S.readBatch(); now=now+1; assert(S.startBatch())
-  assert(#batches[3]==5 and batches[3][1].itemID==201)
-  S.readBatch(); assert(not S.startBatch())
-  assert(S.sweepStats.batchKeys==205)
+  assert(#batches[3]==100 and batches[3][1].itemID==201 and batches[3][6].itemID==1)
+  S.readBatch(); now=now+1; assert(S.startBatch())
+  assert(batches[4][1].itemID==96)
+  assert(S.sweepStats.batchKeys==300)
 `));
 
 test('batch mode preserves broad discovery opportunities', () => batchCheck(`
   submit=function() S.readBatch() end
   slots(8)
-  assert(count("batch")==3 and count("browse")==2 and count("target")==3)
+  assert(count("batch")==6 and count("browse")==2 and count("target")==0)
+`));
+
+test('205-item cadence comparison retains discovery slots and bounds every item revisit', () => batchCheck(`
+  local checked, maxGap, repeats, totalGap = {},0,0,0
+  submit=function(keys)
+    for _,key in ipairs(keys) do
+      local previous=checked[key.itemID]
+      if previous then
+        local gap=now-previous
+        maxGap=math.max(maxGap,gap); repeats=repeats+1; totalGap=totalGap+gap
+      end
+      checked[key.itemID]=now
+    end
+    S.readBatch()
+  end
+  slots(40)
+  print(string.format('CADENCE 205 items/40 slots: batches=%d keys=%d broad=%d individual=%d mean=%.2fs max=%.2fs',
+    count('batch'), S.sweepStats.batchKeys, count('browse'), count('target'), totalGap/repeats, maxGap))
+  assert(count('batch')==30 and count('browse')==10 and count('target')==0)
+  assert(maxGap<=4)
+  for id=1,205 do assert(checked[id] and now-checked[id]<=4) end
+`));
+
+test('continuous broad batches retain the shared request ceiling', () => batchCheck(`
+  submit=function() S.readBatch() end
+  for i=0,700 do
+    now=100+i/10
+    pagePending=false; S.sweeping=false
+    sweepQuery()
+  end
+  for i,query in ipairs(queries) do
+    if i>1 then assert(query.t-queries[i-1].t>=1) end
+    local n=0
+    for j=i,1,-1 do if query.t-queries[j].t>=60 then break end n=n+1 end
+    assert(n<=60)
+  end
+  assert(count('batch')>=50 and count('browse')>=17 and count('target')==0)
+`));
+
+test('event-driven broad rotation sustains coverage with delayed replies and no watchdog ticks', () => batchCheck(`
+  local checked,maxGap={},0
+  submit=function(keys)
+    after(0.3,function()
+      for _,key in ipairs(keys) do
+        if checked[key.itemID] then maxGap=math.max(maxGap,now-checked[key.itemID]) end
+        checked[key.itemID]=now
+      end
+      S.readBatch()
+    end)
+  end
+  C_AuctionHouse.GetBrowseResults=function() return {} end
+  C_AuctionHouse.SendBrowseQuery=function(query)
+    record('browse',query.itemClassFilters[1].classID)
+    after(0.3,handlers.AUCTION_HOUSE_BROWSE_RESULTS_UPDATED)
+  end
+  startSweeping(); advance(140)
+  assert(count('batch')>=29 and count('browse')>=9 and count('target')==0)
+  assert(maxGap>0 and maxGap<=4.05)
+  for id=1,205 do assert(checked[id] and now-checked[id]<=4.05) end
+  for i=2,#queries do assert(queries[i].t-queries[i-1].t>=1) end
+`));
+
+test('large eligible pools retain oldest-first fairness across successive passes', () => batchCheck(`
+  for id=206,1000 do db.book[id]={s={100}} end
+  local checked,maxGap={},0
+  submit=function(keys)
+    assert(#keys==100)
+    for _,key in ipairs(keys) do
+      if checked[key.itemID] then maxGap=math.max(maxGap,now-checked[key.itemID]) end
+      checked[key.itemID]=now
+    end
+    S.readBatch()
+  end
+  slots(80)
+  assert(count('batch')==60 and count('browse')==20 and maxGap<=14)
+  for id=1,1000 do assert(checked[id] and now-checked[id]<=14) end
+`));
+
+test('batch revisit metrics exclude individual validation and do not invent a first revisit', () => batchCheck(`
+  db.book={[123]={s={100}}}
+  assert(S.startBatch()); S.readBatch()
+  assert(not S.sweepStats.batchRevisitCount)
+  now=101; S.noteRevisit(123)
+  now=103; assert(S.startBatch()); S.readBatch()
+  assert(S.sweepStats.batchRevisitLast==3 and S.sweepStats.batchRevisitCount==1)
+  assert(S.sweepStats.batchRevisitTotal==3 and S.sweepStats.batchRevisitMax==3)
 `));
 
 test('batch replies use the shared candidate pipeline, never a tier snapshot', () => batchCheck(`
@@ -703,11 +790,11 @@ test('queued bargains use the next monitoring slot ahead of watches and speculat
   assert(S.liveCandidate.detectedAt==101)
 `));
 
-test('batch hot-item boost is bounded so older coverage still wins', () => batchCheck(`
+test('oldest batch coverage precedes a newer hot-item sighting', () => batchCheck(`
   db.book={[1]={s={now,80}},[2]={s={now,100}}}
   function S.marketReference() return 100 end
   S.batchChecked={[1]=now-10,[2]=now-12}
-  submit=function(keys) assert(keys[1].itemID==1) end
+  submit=function(keys) assert(keys[1].itemID==2) end
   assert(S.startBatch()); S.readBatch()
   now=now+10; S.batchChecked[2]=now-16
   submit=function(keys) assert(keys[1].itemID==2) end
@@ -753,6 +840,48 @@ test('ready events dispatch at minimum spacing rather than waiting for the watch
   assert(#queries==2 and queries[2].t<102)
   assert(queries[2].t-queries[1].t>=1)
 `));
+
+test('focus window resumes at its deadline without another ready event or watchdog tick', () => check(`
+  focus={id=123,line=10,market=100}; S.dealFocus={deal=focus}
+  startSweeping(); advance(100.01)
+  assert(#queries==0)
+  advance(105); assert(#queries==0)
+  advance(105.02); assert(#queries==1 and queries[1].t<=105.02)
+`));
+
+test('an earlier wake replaces a later deadline without duplicate dispatch', () => check(`
+  S.sweepTicker={}; lastQueryAt=100
+  S.wakeSweep(105)
+  advance(101); assert(#queries==0)
+  S.wakeSweep()
+  advance(101.02); assert(#queries==1)
+  advance(105.1); assert(#queries==1)
+`));
+
+test('a watchdog overtaking a scheduled wake re-arms the next spacing deadline', () => check(`
+  startSweeping(); advance(100.01); complete()
+  S.wakeSweep()
+  now=101.01; S.sweepTicker.fn(); complete()
+  advance(101.02); assert(#queries==2)
+  advance(102.02); assert(#queries==3)
+  assert(queries[3].t-queries[2].t>=1)
+`));
+
+test('prebuy expiry wakes discovery while preserving the full second-press window', () => check(`
+  cfg.prebuy=true; S.prebuyCheck={completedAt=100}
+  startSweeping(); advance(102)
+  assert(#queries==0)
+  advance(102.02); assert(#queries==1)
+`));
+
+test('deadline wake still respects a purchase begun during the click window', () => {
+  for (const change of ['S.snipePending={}', 'db.unsettledPurchase={}', 'ready=false', 'S.ahOpen=false', 'cfg.enabled=false']) check(`
+    focus={id=123,line=10,market=100}; S.dealFocus={deal=focus}
+    startSweeping(); advance(100.01)
+    ${change}
+    advance(106); assert(#queries==0)
+  `);
+});
 
 test('bursts of ready events coalesce without duplicate requests', () => check(`
   S.sweepTicker={}; lastQueryAt=now
