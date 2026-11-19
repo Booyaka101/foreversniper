@@ -1,5 +1,41 @@
 # Depth optimiser verification
 
+## Feed render latency repair, November 17, 2026
+
+Branch: `fix/feed-render-latency`, based on installed PR #14 commit
+`3f903a0daed53e95c1077a71e242e201142afe35`.
+
+The feed's quarter-second redraw throttle only set a dirty flag when deferring
+work. It did not schedule the deferred redraw. With no intervening events, a
+validated deal could wait for the two-second default scan tick (longer with a
+slower configured tick). The comment incorrectly described an OnUpdate flush.
+A production-renderer regression reproduces the missing deadline against PR #14.
+
+Deferred redraws now schedule one coalesced callback at the existing 0.25s
+deadline. Redraw bursts do not extend it; newer completed redraws invalidate old
+callbacks. Hidden frames stay dirty without timer loops, and OnShow requests a
+redraw directly. This changes presentation scheduling, not purchase eligibility.
+
+Purchase timing also records the first eligible visible-feed row submission for
+the completed validation, separating validate-to-feed and feed-to-click. Missing,
+hidden, unready and retired rows do not invent timestamps. This is UI submission
+time, not a measured screen paint or proof the player saw the row. Popup/SNIPE
+rendering is not measured by this field.
+
+Local gates: 208 tests pass; lint zero errors/warnings; strict load/lifecycle
+simulation clean with existing unknown-event notices. Logs are retained as
+`forever-feed-latency-{before,tests,lint,sim}.log` in the approved temp directory.
+Live benefit and the cause of the original quote mismatches remain unproven.
+This repair is not installed; exact-head CI and owner approval precede deployment.
+
+During the pass, the owner supplied a live PR #14 screenshot: Copper Ore item
+2840, x19 at a 32c ceiling, new search response 0.30s, validation-to-click 1.20s,
+quote after 0.26s requesting 2938c total versus approved 608c. Detection-to-search
+was unknown. This bounds completion-to-quote near 1.46s but does not distinguish
+competition from stale server data. It also exposed diagnostic chat truncating
+records at 180 characters, hiding later timing stages. Informational logs now
+print continuation chunks while retaining the last-ten-record limit.
+
 ## Prebuy dispatch repair, November 17, 2026
 
 Branch: `fix/prebuy-dispatch`, based on PR #13 commit

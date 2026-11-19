@@ -36,6 +36,13 @@ times, query method and completed-result age at click. Missing stages are
 `unknown`. A live API reread preserves the completed-search timestamp; neither
 that timestamp nor a fast quote response tells us the age of server listings.
 
+`validate-to-feed` and `feed-to-click` split the feed redraw wait from the time
+after an eligible row was submitted to the visible feed UI. This is not a screen
+paint or player-observation timestamp, and it does not measure popup or SNIPE-card
+rendering. Unobserved stages remain `unknown`. Deferred feed redraws now schedule
+their own quarter-second deadline rather than waiting for a scanner tick; actual
+execution still depends on the client's frame/timer processing.
+
 `/fsn prebuy on` enables an opt-in diagnostic comparison, not a faster purchase:
 
 1. Press Buy (or the existing Buy binding) to queue a new `SendSearchQuery`,
