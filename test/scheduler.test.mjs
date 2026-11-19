@@ -140,6 +140,72 @@ test('focused click windows never interrupt owned result pagination', () => chec
   assert(not S.dealFocus.buyWindowUntil)
 `));
 
+const queuedPrebuy = `
+  cfg.prebuy=true
+  local check={id=123,line=10,t=now}
+  S.prebuyCheck=check
+  S.liveCandidates={[123]={id=123,line=10,market=100,t=now,prebuy=check}}
+  focus={id=123,line=10,market=100}; S.dealFocus={deal=focus,buyWindowUntil=now+5}
+`;
+
+test('an explicit prebuy press dispatches before the unused focus click window', () => check(queuedPrebuy + `
+  S.discoveryDue=true
+  S.liveCandidates[456]={id=456,line=10,t=now-10,profit=100000}
+  sweepQuery()
+  assert(count('target',123)==1, 'the hardware-requested search must not wait five seconds')
+  assert(S.liveCandidate.prebuy==check and not S.liveCandidates[123])
+  assert(S.discoveryDue and S.liveCandidates[456], 'routine work must remain queued')
+`));
+
+test('prebuy priority retains readiness, pacing, purchase locks and owned pages', () => {
+  for (const guard of [
+    'ready=false', 'lastQueryAt=now', 'S.snipePending={}',
+    'db.unsettledPurchase={}', 'cfg.enabled=false', 'S.ahOpen=false',
+    'nativeSell=true', 'S.batchSearch={t=now}',
+  ]) check(queuedPrebuy + `
+    ${guard}; sweepQuery(); assert(#queries==0)
+    assert(S.liveCandidates[123].prebuy==check)
+  `);
+  check(queuedPrebuy + `
+    S.liveCandidate={id=456,t=now,needsPage=true}
+    sweepQuery(); assert(count('page',456)==1 and count('target',123)==0)
+  `);
+});
+
+test('disabled, stale or superseded prebuy checks cannot bypass the click window', () => {
+  for (const change of [
+    'cfg.prebuy=false', 'check.t=now-15', 'check.finished=true',
+    'S.prebuyCheck={id=123,t=now}', 'db.blacklist[123]=true',
+  ]) check(queuedPrebuy + `
+    ${change}; sweepQuery(); assert(#queries==0)
+  `);
+});
+
+test('prebuy priority respects targeted scope and preserves explicit watches', () => {
+  for (const scope of ['nil', '{}']) check(queuedPrebuy + `
+    cfg.targeted=true
+    function S.targetedPool() return ${scope} end
+    sweepQuery(); assert(#queries==0)
+  `);
+  for (const allowed of ['pool[123]=true', 'watchByID[123]=true']) check(queuedPrebuy + `
+    cfg.targeted=true
+    local pool={}; ${allowed}
+    function S.targetedPool() return pool end
+    sweepQuery(); assert(count('target',123)==1)
+  `);
+});
+
+test('deep pages preserve the completed prebuy second-press window without a focused offer', () => check(`
+  startDeepScan(true)
+  local tick=S.deepScan.ticker.fn
+  complete(); now=105
+  cfg.prebuy=true; S.prebuyCheck={completedAt=now}
+  local sent=#queries
+  tick(); assert(#queries==sent, 'deep scan must leave the second-press window free')
+  now=107; tick(); assert(#queries==sent)
+  now=107.1; tick(); assert(#queries>sent, 'deep scanning must resume after two seconds')
+`));
+
 test('ready events refresh purchase controls before scheduling another search', () => check(`
   local refreshed=0
   function S.refreshPurchasePresentation()

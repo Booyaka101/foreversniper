@@ -43,6 +43,11 @@ that timestamp nor a fast quote response tells us the age of server listings.
 2. After completion, press Buy again within two seconds to start the usual
    guarded quote. The button shows Check until this window is ready.
 
+The explicit first press takes the next eligible query opportunity ahead of the
+ordinary five-second click wait and routine discovery. Server readiness, pacing,
+owned result pages and purchase locks still apply. Deep-scan pages also leave
+the completed check's two-second second-press window free.
+
 Diagnostics compare quantities and costs below the unchanged ceiling before and
 after that search, plus queue and search-response time. Partial, invalid or
 expired results do not authorize buying. The second press still rechecks the
