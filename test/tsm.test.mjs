@@ -84,6 +84,21 @@ C_GameRules={IsGameRuleActive=function(rule) return activeRules[rule] end}
 realm='A physical Forever realm'
 `;
 
+test('target-list identity exposes verified market and region without requiring price feeds', () => check(`
+  ${forever}
+  local portal='EU'
+  GetCVar=function(key) assert(key=='Portal'); return portal end
+  faction='Horde'
+  local scope,region=ForeverSniperTSM.marketIdentity()
+  assert(scope=='normal-horde' and region=='forever-eu')
+  portal='US'
+  scope,region=ForeverSniperTSM.marketIdentity()
+  assert(scope=='normal-horde' and region=='forever-us')
+  C_GameRules=nil
+  scope,region=ForeverSniperTSM.marketIdentity()
+  assert(scope==nil and region==nil)
+`));
+
 test('Forever resolves physical realms to the same ruleset markets as TSM', () => {
   for (const [hardcore, rp, pvp, market] of [
     [false,false,false,'Normal'], [false,false,true,'PvP'],

@@ -30,6 +30,46 @@ live-client detection speed or guarantee winning a contested listing.
 
 ## Experimental batch discovery
 
+### Targeted Normal Horde materials
+
+`/fsn targeted on` selects a single targeted-list strategy for routine scanning:
+101 material IDs screened from the installed Forever-EU regional sales feed and
+Normal Horde price feeds on November 17, 2026. It is opt-in and requires verified
+Normal Horde / Forever-EU identity. Missing or mismatched identity pauses targeted
+searches rather than silently switching to broad discovery. `/fsn targeted off`
+restores the previous scheduler; neither command clears saved data or watches.
+
+The seed was selected from 115 known crafting materials with positive sale-average
+and daily/AH data, sale rate at least 5%, and a conservative reference of at least
+1 silver. The reference used the lower positive faction market/recent/historical
+prices and regional sale average. This is a fixed initial pool, not an automatic
+daily ranking, an exhaustive commodity catalogue, or evidence of bargain frequency.
+Regional daily/AH volume is not faction-specific demand or guaranteed personal sales.
+
+Every available routine slot can search up to 100 eligible list keys. Keys rotate
+oldest-completed-first without the broad mode's ten-second cooldown or proximity
+boost. An eligible 101-key pool can be covered in two batch replies, but actual
+coverage depends on live eligibility, latency, detail searches and purchase pauses.
+No routine broad-category query is sent in this mode. Manual watches, explicit
+deep/full scans and existing displayed-offer refreshes remain available.
+
+List IDs do not need to be in the learned book. Live commodity identity, current
+trusted price references, minimum value and blacklist/watch exclusions still apply.
+Unknown commodity information is requested from the client and retried later.
+There are no hardcoded purchase prices. Local-history caps, complete-tier validation,
+liquidity/exposure limits, budgets, quote ceilings and hardware-click purchase rules
+are unchanged. If batching is disabled, unavailable or fails, individual checks use
+the same list, not the broad book. This fallback is slower and retains the ordinary
+automatic-check eligibility rules.
+
+`/fsn targeted` and `/fsn status` show mode, verified scope and distinct list keys
+with completed targeted batch replies this UI session (not necessarily all 101).
+Existing batch key counts include repeat checks. `/fsn tsm ITEMID` shows the item's
+last completed check and revisit interval. These metrics do not establish server
+snapshot freshness, live profitability or a successful purchase.
+
+### Broad-book batching
+
 `/fsn batch on` enables known-commodity summary searches of up to 100 unique item
 keys per request. It is **on by default** for the owner-approved rollout; Forever's
 live response semantics still need validation. Existing explicit off settings are
