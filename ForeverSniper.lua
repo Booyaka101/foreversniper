@@ -12,6 +12,10 @@
 
 local ADDON = ...
 
+-- WoW restores this addon's SavedVariables after executing its Lua files.
+-- Build the runtime only once the restored tables are available, so closures,
+-- frame handlers and stock/purchase locks all share the same database.
+local function initialize()
 -- Database --------------------------------------------------------------------
 
 local DEFAULTS = {
@@ -6204,6 +6208,9 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             "failure capture off. /fsn capture once arms one screenshot; /fsn capture off cancels.")
 
     elseif cmd == "" or cmd == "status" then
+        printf("database: %s; %d book items; spend cap %s; gold reserve %s.",
+            db == ForeverSniperDB and "using saved table" or "TABLE MISMATCH",
+            countKeys(db.book), fmtMoney(cfg.maxSpend or 0), fmtMoney(cfg.keepGold or 0))
         printf("%s | %d full snapshots done | book %d items | %d alerts fired",
             cfg.enabled and "|cff7cff4fon|r" or "|cffff4d4doff|r",
             S.scansDone, db.stats.book or 0, db.stats.deals or 0)
@@ -6839,3 +6846,12 @@ end
 
 -- (The Bilis sniper bridge was removed with the module: the feed's own
 -- SNIPE deals and BUY / SKIP cards are the sniping interface.)
+end
+
+local loader = CreateFrame("Frame")
+loader:RegisterEvent("ADDON_LOADED")
+loader:SetScript("OnEvent", function(self, _, name)
+    if name ~= ADDON then return end
+    self:UnregisterEvent("ADDON_LOADED")
+    initialize()
+end)
