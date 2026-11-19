@@ -3,10 +3,13 @@
 ForeverSniperTSM = {}
 local provider = ForeverSniperTSM
 local timestamps, cache, cacheSize = {}, {}, 0
+local salesCache, salesCacheSize = {}, 0
 local sources = {
     {key="dbmarket", tag="AUCTIONDB_NON_COMMODITY_SCAN_STAT", field="marketValue", age=43200},
     {key="dbrecent", tag="AUCTIONDB_NON_COMMODITY_DATA", field="marketValueRecent", age=43200},
     {key="dbhistorical", tag="AUCTIONDB_NON_COMMODITY_HISTORICAL", field="historical", age=172800},
+    {key="sales", tag="AUCTIONDB_REGION_SALE", field="regionSale", age=172800,
+        extraFields={"regionSoldPerDay", "regionSalePercent"}},
 }
 
 local function number(value)
@@ -39,20 +42,37 @@ local function realmKey()
     end
 end
 
+local function regionKey()
+    -- Only the installed Forever feed layout has been verified here.
+    if not WOW_PROJECT_CAMELOT or WOW_PROJECT_ID ~= WOW_PROJECT_CAMELOT or type(GetCVar) ~= "function" then return end
+    local realm = realmKey()
+    if not realm then return end
+    local ok, portal = pcall(GetCVar, "Portal")
+    if not ok or type(portal) ~= "string" then return end
+    portal = string.upper(portal)
+    if portal ~= "EU" and portal ~= "US" and portal ~= "KR" and portal ~= "TW" and portal ~= "CN" then return end
+    return (string.find(realm, "hardcore-", 1, true) == 1 and "forever-hc-" or "forever-") .. string.lower(portal)
+end
+
 local function observe(tag, realm, data)
     if type(realm) ~= "string" or type(data) ~= "string" then return end
     -- The installed Forever AppHelper uses realm/faction data even for mats.
-    -- Unknown layouts and commodity/region feeds are deliberately not inferred.
+    -- Unknown layouts and unrelated regional/commodity feeds are not inferred.
     local header = string.sub(data, 1, 512)
     local stamp = tonumber(string.match(header, "^return%s+{downloadTime=(%d+),fields="))
     if not number(stamp) then return end
     for _, source in ipairs(sources) do
-        if tag == source.tag and string.find(header, '"' .. source.field .. '"', 1, true) then
+        local matches = tag == source.tag and string.find(header, '"' .. source.field .. '"', 1, true)
+        for _, field in ipairs(source.extraFields or {}) do
+            matches = matches and string.find(header, '"' .. field .. '"', 1, true)
+        end
+        if matches then
             local key = string.lower(realm)
             timestamps[key] = timestamps[key] or {}
             if not timestamps[key][source.key] then
                 timestamps[key][source.key] = stamp
                 cache, cacheSize = {}, 0
+                salesCache, salesCacheSize = {}, 0
             end
         end
     end
@@ -107,7 +127,8 @@ function provider.reference(itemID, now)
         return previous.price, previous.label
     end
     local price, label, validUntil
-    for i, source in ipairs(sources) do
+    for i = 1, 3 do
+        local source = sources[i]
         local stamp = number(stamps[source.key])
         if stamp and stamp <= now and now - stamp <= source.age and (i < 3 or price) then
             local ok, value = pcall(TSM_API.GetCustomPriceValue, source.key, "i:" .. itemID)
@@ -123,4 +144,38 @@ function provider.reference(itemID, now)
     cache[itemID] = {realm=realm, at=now, untilTime=math.min(now + (price and 30 or 5), validUntil or math.huge),
         price=price, label=label}
     return price, label
+end
+
+function provider.sales(itemID, now)
+    if not number(itemID) or itemID % 1 ~= 0 or not number(now) then return nil, "invalid item or time" end
+    if type(TSM_API) ~= "table" or type(TSM_API.GetCustomPriceValue) ~= "function" then return nil, "TSM API unavailable" end
+    local region = regionKey()
+    if not region then return nil, "Forever region identity unavailable" end
+    local stamp = timestamps[region] and number(timestamps[region].sales)
+    if not stamp then return nil, "sales feed unobserved for " .. region end
+    if stamp > now then return nil, "sales feed future-dated for " .. region end
+    if now - stamp > sources[4].age then return nil, "sales feed stale for " .. region end
+    local previous = salesCache[itemID]
+    if previous and previous.region == region and now >= previous.at and now < previous.untilTime then
+        return previous.data, previous.reason
+    end
+    local function value(expression, maximum)
+        local ok, result = pcall(TSM_API.GetCustomPriceValue, expression, "i:" .. itemID)
+        result = ok and number(result) or nil
+        if result and result % 1 == 0 and (not maximum or result <= maximum) then return result end
+    end
+    -- The public API rounds to copper and normally suppresses zero. Scale
+    -- decimals before evaluation and offset by one to distinguish known zero.
+    local average = value("dbregionsaleavg")
+    local rate = value("1000 * dbregionsalerate + 1", 1001)
+    local daily = value("1000 * dbregionsoldperday + 1")
+    local data = {average=average, rate=rate and (rate - 1) / 1000,
+        daily=daily and (daily - 1) / 1000, region=region, stamp=stamp}
+    local reason
+    if not average and not rate and not daily then data, reason = nil, "no sales coverage for item in " .. region end
+    if salesCacheSize >= 12000 then salesCache, salesCacheSize = {}, 0 end
+    if not salesCache[itemID] then salesCacheSize = salesCacheSize + 1 end
+    salesCache[itemID] = {region=region, at=now, untilTime=math.min(now + (data and 30 or 5), stamp + sources[4].age),
+        data=data, reason=reason}
+    return data, reason
 end

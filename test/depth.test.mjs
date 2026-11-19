@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import test from 'node:test';
 import fengari from 'fengari';
 import { source, section, run } from './lua.mjs';
+import { fixture, provider, salesEnvironment, salesAPI } from './tsm-fixture.mjs';
 
 const optimizer = fs.readFileSync(new URL('../DepthOptimizer.lua', import.meta.url), 'utf8');
 
@@ -49,6 +50,7 @@ local function prepareCommodityDeal() end
 local function purchaseAPIAvailable() return true end
 local function markDealGone() end
 local function recordGate() end
+local function diagnostic() end
 local function printPending() end
 local function renderPopup() end
 local function checkWatchCommodity() end
@@ -67,7 +69,7 @@ local function on(event,fn) handlers[event]=fn end
 local onOptional=on
 local function snapshot(tiers)
     rows={}
-    for _,tier in ipairs(tiers) do rows[#rows+1]={unitPrice=tier.price,quantity=tier.quantity,numOwnerItems=0} end
+    for _,tier in ipairs(tiers) do rows[#rows+1]={itemID=123,unitPrice=tier.price,quantity=tier.quantity,numOwnerItems=0} end
     S.commoditySnapshots[123]={tiers=tiers,t=now}
     return S.commoditySnapshots[123]
 end
@@ -88,6 +90,98 @@ end
 `;
 function check(body) { run(setup + production + prepared + body); }
 
+function salesCheck(body) {
+  run(setup + fixture.replace(/\bcalls\b/g, 'apiCalls') + salesEnvironment + provider
+    + production + prepared + salesAPI.replace(/\bcalls\b/g, 'apiCalls') + body);
+}
+
+test('fresh sale averages cap resale profit without raising lower live exits', () => {
+  salesCheck(`salesFeed(); values.dbregionsaleavg=50
+    local terms=S.optimizedCommodityTerms(123,10,100,'market',snapshot({{price=10,quantity=10},{price=100,quantity=1}}))
+    assert(terms and terms.resale==50 and terms.profit==355)`);
+  salesCheck(`salesFeed(); values.dbregionsaleavg=1000
+    local terms=S.optimizedCommodityTerms(123,10,100,'market',snapshot({{price=10,quantity=10},{price=80,quantity=1}}))
+    assert(terms and terms.resale==79)`);
+});
+
+test('known low sale rate or daily volume rejects market and dump positions', () => {
+  for (const kind of ['market', 'dump']) for (const change of [
+    'values.dbregionsalerate=0.01', 'values.dbregionsalerate=0',
+    'values.dbregionsoldperday=0', 'values.dbregionsoldperday=9.999',
+  ]) salesCheck(`salesFeed(); ${change}
+    local terms,reason=S.optimizedCommodityTerms(123,10,100,'${kind}',snapshot({{price=10,quantity=1}}))
+    assert(not terms and reason=='liquidity')`);
+});
+
+test('daily volume bounds inventory, owned auctions and pending exposure', () => salesCheck(`
+  salesFeed(); values.dbregionsoldperday=100
+  held=4; owned={{itemKey={itemID=123},quantity=2}}; db.stockPending['123']=1
+  local terms=S.optimizedCommodityTerms(123,10,100,'market',snapshot({{price=10,quantity=3}}))
+  assert(terms and terms.units==3)
+  held=5
+  local rejected,reason=S.optimizedCommodityTerms(123,10,100,'market',snapshot({{price=10,quantity=3}}))
+  assert(not rejected and reason=='stocklimit')
+`));
+
+test('sales caps select complete prefixes and cannot loosen manual stock caps', () => salesCheck(`
+  salesFeed(); values.dbregionsoldperday=50
+  local wall=snapshot({{price=10,quantity=4},{price=20,quantity=4},{price=100,quantity=1}})
+  local terms=S.optimizedCommodityTerms(123,20,100,'market',wall)
+  assert(terms and terms.units==4 and terms.line==10)
+  db.stockLimits['123']=3
+  local rejected,reason=S.optimizedCommodityTerms(123,20,100,'market',wall)
+  assert(not rejected and reason=='stocklimit')
+`));
+
+test('volume caps require fresh readable stock with the manual cap off', () => {
+  for (const action of ['held=nil', 'S.sellingOwnedUpdated=nil', 'now=now+21']) salesCheck(`
+    salesFeed(); ${action}
+    local terms,reason=S.optimizedCommodityTerms(123,10,100,'market',snapshot({{price=10,quantity=1}}))
+    assert(not terms and reason=='stockinfo')
+  `);
+});
+
+test('unknown, stale or disabled sales preserve existing fallback', () => {
+  for (const action of ['', 'salesFeed(now-172801)', 'cfg.sales=false; salesFeed()', 'cfg.tsm=false; salesFeed()']) {
+    salesCheck(`${action}; values.dbregionsalerate=0
+      local terms=S.optimizedCommodityTerms(123,10,100,'market',snapshot({{price=10,quantity=10}}))
+      assert(terms and S.salesSummary(123):find('unknown'))`);
+  }
+});
+
+test('vendor and absolute watch purchases are exempt from market sales policy', () => salesCheck(`
+  salesFeed(); values.dbregionsalerate=0; values.dbregionsoldperday=0
+  local wall=snapshot({{price=10,quantity=10}})
+  assert(S.optimizedCommodityTerms(123,10,100,'vendor',wall))
+  assert(S.optimizedCommodityTerms(123,10,nil,'watch',wall))
+`));
+
+test('guarded Buy rechecks liquidity instead of trusting displayed offers', () => salesCheck(`
+  salesFeed(); values.dbregionsalerate=0
+  offer(); assert(calls.start==0 and not S.snipePending)
+`));
+
+test('guarded Buy rechecks sale-average profit and total exposure', () => {
+  for (const change of ['values.dbregionsaleavg=5', 'values.dbregionsoldperday=50']) {
+    salesCheck(`salesFeed(); ${change}
+      offer(); assert(calls.start==0 and not S.snipePending)`);
+  }
+});
+
+test('quote confirmation rechecks sales settings and newly held stock', () => {
+  for (const change of ['cfg.saleRate=0.30', 'cfg.saleShare=0.005', 'held=95']) {
+    salesCheck(`salesFeed(); offer(); assert(calls.start==1)
+      ${change}; handlers.COMMODITY_PRICE_UPDATED(10,100)
+      assert(calls.confirm==0 and not S.snipePending)`);
+  }
+});
+
+test('the exact sale-rate floor and sales exposure limit permit guarded confirmation', () => salesCheck(`
+  salesFeed(); values.dbregionsalerate=0.05; values.dbregionsoldperday=100
+  offer(); assert(calls.start==1)
+  handlers.COMMODITY_PRICE_UPDATED(10,100); assert(calls.confirm==1)
+`));
+
 test('an in-flight batch summary blocks buying even with a valid complete snapshot', () => check(`
   S.batchSearch={t=now}
   offer()
@@ -95,6 +189,58 @@ test('an in-flight batch summary blocks buying even with a valid complete snapsh
   S.batchSearch=nil
   offer()
   assert(calls.start==1)
+`));
+
+test('a contradicted cheap offer cannot be retried from cached tiers before a fresh result', () => check(`
+  local function refreshDealPresentation() end
+  ${section('markDealGone = function(', '\nquickBuy = function')}
+  ${section('function S.offerAvailable(', '\nfunction S.dismissDeal(')}
+  ${section('local function prepareCommodityDeal(', '\nlocal function offerKind(')
+    .replace('local function prepareCommodityDeal(', 'prepareCommodityDeal = function(')}
+  local deal={id=123,line=25,units=13,cost=325,market=300,kind='market'}
+  S.deals={deal}
+  snapshot({{price=25,quantity=13},{price=300,quantity=1}})
+  local row={itemID=123,line=25,units=13,cost=325,market2=300,kind='market',offer=deal,t=100}
+  quickBuy(row); assert(calls.start==1)
+  handlers.COMMODITY_PRICE_UPDATED(159,2070)
+  assert(calls.confirm==0 and deal.gone and not S.commoditySnapshots[123])
+  assert(S.liveCandidates[123] and S.liveCandidates[123].line==25)
+  quickBuy(row); assert(calls.start==1)
+  local terms,reason=commodityOfferTerms(123,25,13,325,300,'market')
+  assert(not terms and reason=='loading','API cache alone must not restore Buy readiness')
+  S.liveCandidate=S.liveCandidates[123]; S.liveCandidates[123]=nil
+  rows={{unitPrice=155,quantity=100,numOwnerItems=0}}
+  handlers.COMMODITY_SEARCH_RESULTS_UPDATED(123)
+  assert(S.commoditySnapshots[123] and deal.gone and not captured)
+`));
+
+test('commodity tier prices preserve the observed Forever item identity and copper units', () => check(`
+  WOW_PROJECT_ID=99; WOW_PROJECT_CAMELOT=99
+  rows={{itemID=2772,unitPrice=296,quantity=173,numOwnerItems=0}}
+  local result=readCommodityTiers(2772)
+  assert(result and result.tiers[1].price==296 and result.tiers[1].quantity==173)
+`));
+
+test('mismatched or missing Forever tier identity cannot authorize Buy or fall back to cached tiers', () => {
+  for (const id of ['456', '123.5', '"123"', 'nil']) check(`
+    WOW_PROJECT_ID=99; WOW_PROJECT_CAMELOT=99
+    snapshot({{price=10,quantity=10}}); rows[1].itemID=${id}
+    local result,reason,identity=readCommodityTiers(123)
+    assert(not result and reason=='unreadable' and identity:find('requested item 123',1,true))
+    result,reason=commodityTiersForBuy(123)
+    assert(not result and reason=='unreadable','wrong-item results must not reuse the old snapshot')
+    quickBuy({itemID=123,line=10,units=10,cost=100,market2=100,kind='market',t=100})
+    assert(calls.start==0 and not S.snipePending)
+    handlers.COMMODITY_SEARCH_RESULTS_UPDATED(123)
+    assert(not S.commoditySnapshots[123])
+  `);
+});
+
+test('one wrong-item tier discards the whole wall instead of selecting a cheap partial prefix', () => check(`
+  snapshot({{price=2,quantity=21},{price=274,quantity=100}})
+  rows[2].itemID=456
+  local result,reason=readCommodityTiers(123)
+  assert(not result and reason=='unreadable')
 `));
 
 const commands = section('    elseif cmd == "keep" then', '\n    elseif cmd == "thresh" then')

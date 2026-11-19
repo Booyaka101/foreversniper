@@ -317,3 +317,127 @@ intentional; live confirmation after reload is required, not claimed by tests.
 Local validation: all 129 tests pass; secret lint reports zero errors/warnings;
 strict load/lifecycle simulation passes. Deployment requires successful exact
 PR-head and merged-main CI, a runtime backup and unchanged SavedVariables hashes.
+
+## TSM regional sales and liquidity, 2026-11-16
+
+Branch: `feat/tsm-sales-liquidity`, based on deployed PR #8 main (`fc35aa8`).
+Scope is implementation, validation and a review PR only. No runtime installation,
+SavedVariables, publication switches, release version or deployment changes.
+
+Research verified the installed TSM 4.15.7 Forever regional sale feed has
+`regionSale`, `regionSoldPerDay` and `regionSalePercent`, under `Forever-EU`.
+Its number-source registration divides stored values by 1000, and the public
+custom-price evaluator rounds the final expression. Scaled expressions with a
+positive offset preserve fractional rates/volume and distinguish known zero
+from missing values. Metadata inspection never executes AppHelper payloads.
+
+Definitions were checked against TSM's official price/value source documentation:
+
+- https://support.tradeskillmaster.com/en_US/custom-strings/which-price-sources-can-i-use-and-what-do-they-mean
+- https://support.tradeskillmaster.com/en_US/custom-strings/which-value-sources-can-i-use-and-what-do-they-mean
+
+Policy: matching Forever normal/hardcore regional data, observed and no more than
+48 hours old, may lower existing market references/resale estimates. It cannot
+bootstrap discovery. Known rates below 5% or volume-derived caps below one reject
+market/dump positions. Exposure is capped at 10% of daily regional volume per AH,
+rounded down, including held/banked items, owned auctions and pending receipts.
+Manual limits may tighten but not loosen this cap. Vendor/absolute watches keep
+their existing policies. Defaults are configurable policy choices, not measured
+optimal thresholds. Unknown sales data preserves existing fallback behavior.
+
+Review covered provider metadata/scoping/caching, discovery reference selection,
+complete-prefix optimization, fresh owned-stock scheduling, guarded Buy and quote
+revalidation, bounded candidate priority, commands and tooltip/status diagnostics.
+Sales queries use only the public TSM API and do not issue AH requests. Fresh
+stock maintenance shares existing paced scheduler slots.
+
+Final local checks: all 153 tests passed (129 prior, 24 added); secret lint zero
+errors/warnings; strict load/lifecycle simulation clean with existing unknown-event
+notices; diff whitespace check passed. Tests exercise production Lua sections,
+provider failure/zero/fractional values, stale/future/mismatched scopes, no regional
+bootstrap, live-tier admission/profit, total exposure and complete prefixes,
+vendor/watch exemptions, Buy and quote-time policy, commands and bounded priority.
+Full test and simulation logs are retained under the approved local temp directory
+as `forever-sales-tests.log` and `forever-sales-sim.log`.
+
+Remaining gates: PR review and CI; actual in-game per-item API coverage, observer
+delivery, protected execution and resale performance remain unverified. The known
+strict AH scenario failures described above were not re-investigated or claimed
+as passing. Stop at the review PR; do not merge or deploy this feature in this pass.
+
+### Owner-authorized test deployment and quote diagnostics
+
+The owner subsequently requested a test deployment. PR #9 commit `16b6bf9`
+passed CI run `43885700112` and was installed from a git archive with verified
+runtime hashes, a verified prior-runtime backup and unchanged SavedVariables hash.
+Receipt: `D:/WoW/AddonBackups/ForeverSniper/pre-tsm-sales-20261116-222736/deployment-receipt.json`.
+The PR remains unmerged and no release was created.
+
+The owner then reported two generic quote refusals for 11 units of item 2592
+under 14 copper/unit (154 copper total). This message originates before the sales
+policy revalidation. Neither the screenshot nor the on-disk saved file establishes
+which guard failed. The follow-up replaces the combined boolean with equivalent,
+ordered rejection reasons and logs numeric unit/total quotes, approved caps,
+current budget and quote age to chat and `/fsn diagnostics`. No permission,
+price, age, stock, profit, outcome or sales-policy limit is relaxed.
+
+All 154 local tests pass, including a regression covering each of the ten
+unchanged quote guards and retained diagnostic evidence. Static lint has zero
+errors/warnings and strict load/lifecycle simulation is clean. The actual live
+cause remains unresolved pending the next quote's evidence; this is a diagnostic
+repair, not a claim that purchases are fixed. The owner was told this diagnostic
+update would be deployed only after its exact-commit CI passes.
+
+### Contradicted quote invalidation
+
+The deployed diagnostic build (`0d97cd9`, passing CI run `43891207857`) showed
+item 2592 x13 approved at 25 copper each / 325 total, but quoted at 159 copper
+each / 2070-2079 total within 0.22-0.35 seconds. A subsequent native browse
+screenshot showed Wool Cloth at 155 copper each. This establishes an obsolete
+cheap offer relative to the purchase quote and native browse, not a timeout or
+sales-policy rejection. It does not establish why the initial search had the
+cheap tiers (removed auctions, delayed cache updates or another source).
+
+Confirmed retry defect: above-cap quotes were cancelled but left their offers
+and cached complete tiers available for another click. Price-contradicted quotes
+now discard that item's snapshot, mark its offers gone and queue normal paced
+revalidation at the original ceiling/exit caps. No price, budget or policy ceiling
+is raised. Non-price refusals keep existing behavior. Unknown outcomes stay locked.
+
+Local validation: 157 tests passed, lint zero errors/warnings, strict load/lifecycle
+simulation clean. Production-path regression reproduces the reported 13 x25 /2070
+case, blocks a second click and cache-only readiness, then feeds a fresh 155-copper
+result and verifies the original offer remains rejected. Additional tests cover
+independent unit/total overruns, item-local invalidation, unchanged refresh caps,
+late quotes and non-price refusals. Deployment remains gated on exact-commit CI;
+the original search/quote divergence still requires live observation.
+
+### Live tier identity validation
+
+The owner reported the same mismatch on item 2772: 21 units approved at 2 copper
+each /42 total, quoted at 274 copper each /5754 total in 0.25 seconds. Native and
+TSM screens showed roughly 296-298 copper, not 2 copper. With our scanner disabled
+and the native commodity panel refreshed, a raw API dump returned `itemID=2772`,
+`unitPrice=296`, `quantity=173`, `numOwnerItems=0`, `auctionID=123030736`, matching
+the native price tier. Earlier active-scanner dumps were empty; these do not
+establish an API signature error. The standard two-argument getter works.
+
+Found a concrete missing check: the production tier reader used requested item ID
+to label rows but did not verify each returned row's item ID. On Forever the
+verified layout now requires every tier's `itemID` to match the request. Other
+clients reject mismatches when a row identity is supplied. A wrong, malformed or
+missing Forever identity rejects the entire wall, cannot fall back to a cached
+snapshot, and cannot admit a deal or teach automatic price history. Result-event
+diagnostics retain requested/returned IDs. No price scaling is introduced.
+
+This closes an attribution gap but a wrong-item row has not yet been captured
+during the failing live scan. It is not proof of the incident's root cause.
+The quote-contradiction invalidation above is retained so a rejected stale bargain
+cannot remain repeatedly buyable from the same snapshot.
+
+Final local checks for the combined repair: 161 tests pass; secret lint zero
+errors/warnings; strict load/lifecycle simulation clean. Regressions preserve the
+actual 296-copper/173-unit raw values, reject wrong/missing/malformed identities
+and mixed-item walls, block Buy and cached fallback, and prevent automatic history
+or live admission from a wrong-item cheap result. The initial source of cheap
+tiers remains an unresolved live question. No purchase guard has been weakened.

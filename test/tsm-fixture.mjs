@@ -30,3 +30,30 @@ local function historical(stamp,scope)
   feed('AUCTIONDB_NON_COMMODITY_HISTORICAL','historical',stamp or now,scope)
 end
 `;
+
+export const salesEnvironment = `
+WOW_PROJECT_ID=99; WOW_PROJECT_CAMELOT=99
+Enum={GameRule={HardcoreRuleset=1,RPRuleset=2,PvPRuleset=3}}
+local hardcore=false
+C_GameRules={IsGameRuleActive=function(rule) return rule==1 and hardcore or false end}
+local portal='EU'
+local function GetCVar(key) assert(key=='Portal'); return portal end
+`;
+
+export const salesAPI = `
+values.dbregionsaleavg=9000; values.dbregionsalerate=0.25; values.dbregionsoldperday=1000
+TSM_API.GetCustomPriceValue=function(expression,item)
+  assert(item=='i:123'); calls=calls+1
+  local value
+  if expression=='1000 * dbregionsalerate + 1' then
+    value=values.dbregionsalerate; return value and math.floor(value*1000+1+0.5)
+  elseif expression=='1000 * dbregionsoldperday + 1' then
+    value=values.dbregionsoldperday; return value and math.floor(value*1000+1+0.5)
+  end
+  value=values[expression]; return value and math.floor(value+0.5)
+end
+local function salesFeed(stamp,scope)
+  observed('AUCTIONDB_REGION_SALE',scope or 'Forever-EU',
+    'return {downloadTime='..(stamp or now)..',fields={"itemString","regionSale","regionSoldPerDay","regionSalePercent"},data={}}')
+end
+`;

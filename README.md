@@ -179,10 +179,46 @@ its data can be observed when it subsequently loads.
 - `/fsn tsm <itemID>`: selected reference and its source, including a local cap.
 - `/fsn tsm off` / `/fsn tsm on`: persistently disable or enable TSM references.
 
-This changes discovery only. Local history is not filled with TSM samples, and
+These realm references change discovery only. Local history is not filled with TSM samples, and
 selling/portfolio references keep their existing local-history rules. It does
 not increase request rates or import TSM's saved operations. A candidate can
 appear when its first live results arrive, not necessarily in the first second.
+
+#### Regional sales and liquidity checks
+
+Fresh TSM Forever regional sales data can tighten market/dump flips:
+
+- `DBRegionSaleAvg` only lowers an existing reference or resale estimate. Regional
+  sales alone never create a discovery reference.
+- A known `DBRegionSaleRate` below **5%** rejects the flip. This measures regional
+  posting success, not the probability that your particular listing sells.
+- Known `DBRegionSoldPerDay` limits total exposure to **10%** of average regional
+  daily volume per AH, rounded down. Inventory/bank, owned auctions and pending
+  purchases all count. A cap below one rejects the flip. Existing manual caps can
+  tighten this further; setting a manual cap to zero does not disable sales caps.
+
+These configurable defaults are conservative policy choices, not proven optimum
+settings. Regional sale averages aggregate reported Accounting sales and purchases;
+they are not a promised exit price on your realm. Daily volume is not realm-specific
+or a guarantee of available buyers. Vendor and absolute-price watches are exempt
+from market sales policy, but retain existing budgets and manual stock controls.
+
+Sales metadata must be observed for the matching `Forever-<region>` or
+`Forever-HC-<region>` feed, no more than 48 hours old and not future-dated.
+Missing/stale/unobserved data remains explicitly unknown and retains existing
+fallback. Public API queries preserve fractional rates/volume and known zeroes.
+Known volume requires fresh readable owned-auction stock, even without manual
+stock caps. Complete-tier, Buy and quote-time guards remain authoritative.
+
+- `/fsn sales <itemID>`: inspect coverage, values and liquidity policy.
+- `/fsn sales on` / `/fsn sales off`: enable or disable sales checks (default on).
+- `/fsn sales rate 5`: set the minimum known rate to 5%.
+- `/fsn sales share 10`: cap known exposure at 10% of regional daily/AH volume.
+
+Rate/share accept percentages greater than zero and at most 100. `/fsn tsm off`
+also disables sales checks. Tooltips show sales values or why coverage is unknown.
+Fresh rate/volume adds at most two seconds of candidate priority; aging still wins.
+The addon does not import TSM operations, write its data or increase AH request rates.
 
 The default discovery ceiling is now **70% of the trusted reference**, not
 50%. An upgrade retunes exactly the former 50% setting once, records it in
