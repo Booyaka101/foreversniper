@@ -1172,6 +1172,18 @@ function S.salesSummary(itemID)
         limit and tostring(limit) or "none", rejected and ("; blocked: " .. (unknown or "low liquidity")) or "")
 end
 
+-- For an NPC exit the counterparty is the merchant, not an AH buyer.
+-- Never accept a saved offer's market estimate as proof of a vendor payout.
+function S.exitPolicy(id, kind, units, cost, reference)
+    if kind ~= "vendor" then return S.salesPolicy(id) end
+    local payout = num(vendorOf(id))
+    if not payout or not num(reference) or not num(units) or not num(cost)
+        or units < 1 or cost < 1 then return nil, nil, "vendorprofit" end
+    payout = math.min(payout, reference)
+    if payout * units - cost < math.max(1, cfg.vendorMin or 5000) then return nil, nil, "vendorprofit" end
+    return nil, nil, nil, payout
+end
+
 function S.stockAllowance(itemID, salesLimit)
     local cap = db.stockLimits[tostring(itemID)]
     if cap == nil then cap = cfg.maxStock end
@@ -1222,7 +1234,11 @@ local function commodityPositionTerms(itemID, line, units, cost, market, kind, s
     kind = offerKind(itemID, line, kind) or (market ~= nil and "market" or "watch")
     local sales, salesLimit, salesReason
     if policy then sales = policy.sales
-    else sales, salesLimit, salesReason = S.salesPolicy(itemID) end
+    else
+        local payout
+        sales, salesLimit, salesReason, payout = S.exitPolicy(itemID, kind, liveUnits, liveCost, market)
+        if kind == "vendor" then market = payout end
+    end
     if salesReason then return nil, salesReason end
     local allowance, stockReason
     if policy then allowance = policy.allowance else allowance, stockReason = S.stockAllowance(itemID, salesLimit) end
@@ -1434,7 +1450,7 @@ local function renderPopup()
     for i = #popupRows, 1, -1 do
         local d = popupRows[i]
         local alive = false
-        if (d.t and time() - d.t > 600) or select(3,S.salesPolicy(d.itemID)) then
+        if (d.t and time() - d.t > 600) or select(3,S.exitPolicy(d.itemID,d.kind,d.units,d.cost,d.market)) then
             table.remove(popupRows, i)
         else
             for _, dd in ipairs(S.deals) do
@@ -2253,7 +2269,7 @@ end
 
 function S.offerAvailable(offer)
     if not offer then return true end -- non-UI callers still validate complete tiers
-    if offer.gone or offer.bought or select(3,S.salesPolicy(offer.id)) then return false end
+    if offer.gone or offer.bought or select(3,S.exitPolicy(offer.id,offer.kind,offer.units,offer.cost,offer.market)) then return false end
     for _, d in ipairs(S.deals) do if d == offer then return true end end
     return false
 end
@@ -2398,6 +2414,7 @@ quickBuy = function(r)
             stocklimit="full deal exceeds your per-item stock limit - nothing purchased.",
             liquidity="fresh regional sales are below your liquidity policy - nothing purchased.",
             salesvolume="no verified positive regional daily sales - nothing purchased.",
+            vendorprofit="verified NPC payout does not cover the purchase and vendor profit floor.",
             stockinfo="stock data is unavailable or stale - refresh /fsn sell before buying.",
             profit="full live deal does not clear the profit floor after fees - nothing purchased.",
             iteminfo="item eligibility is still loading - nothing purchased.",
@@ -2472,7 +2489,7 @@ local function collectDealGroups(forBuy)
     local walletCap = math.floor((GetMoney() or 0) * 0.95)
     local groups, order = {}, {}
     for _, cand in ipairs(S.deals) do
-        if not cand.bought and not cand.gone and not select(3,S.salesPolicy(cand.id)) and num(cand.cost) and cand.cost > 0
+        if not cand.bought and not cand.gone and not select(3,S.exitPolicy(cand.id,cand.kind,cand.units,cand.cost,cand.market)) and num(cand.cost) and cand.cost > 0
             and num(cand.units) and cand.units > 0 and num(cand.unit) and cand.unit > 0 then
             local previous = groups[cand.id]
             -- Observations may overlap. Actual lots combine only from a
@@ -3076,7 +3093,7 @@ end
 
 local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
     if not cfg.enabled or db.blacklist[itemID] then return end
-    local _, _, salesReason = S.salesPolicy(itemID)
+    local _, _, salesReason = S.exitPolicy(itemID, kind, sweep and sweep.units, sweep and sweep.cost, market)
     if salesReason then recordGate("offer", salesReason, itemID) return end
     if (kind == "market" or kind == "dump") and (not sweep or (num(sweep.profit) or 0) < math.max(1, cfg.profit or 0)) then
         recordGate("offer", "estimated net below floor", itemID)
@@ -3993,7 +4010,7 @@ local function processBrowseRows(rows, added, source)
                 -- a 2s fang with 1s of vendor margin is noise, not a deal
                 if est >= (cfg.vendorMin or 5000) then
                     fireAlert("vendor", key, nil, price, sell,
-                        { units = qty, cost = price * qty, profit = est, line = sell })
+                        { units = qty, cost = price * qty, profit = est, line = sell - 1 })
                 else
                     why("vendor margin under floor", key,
                         " (" .. fmtMoney(est) .. " est vs " .. fmtMoney(cfg.vendorMin or 5000) .. " floor)")
@@ -5749,6 +5766,7 @@ local function onCommodityResults(itemID)
                 overhang="live competing stock over limit", stocklimit="per-item stock limit reached",
                  liquidity="fresh regional sales below liquidity policy",
                  salesvolume="no verified positive regional daily sales",
+                 vendorprofit="insufficient verified NPC profit",
                 stockinfo="stock data unavailable or stale"}
             recordGate("validation", reasons[rejected] or rejected, itemID)
             if c.refresh then markDealGone(itemID, math.huge) end
@@ -5789,7 +5807,10 @@ on("COMMODITY_PRICE_UPDATED", function(unitPrice, totalPrice)
         elseif not t or t < sp.units or t < u or t % 1 ~= 0 then rejected = "unreadable total price"
         elseif u > ceiling then rejected = "unit price above approved ceiling"
         elseif t > sp.tolTotal then rejected = "total above approved purchase cost"
-        elseif t > budget then rejected = "total above current budget" end
+        elseif t > budget then rejected = "total above current budget"
+        elseif sp.kind == "vendor" and select(3,S.exitPolicy(sp.deal.id,"vendor",sp.units,t,sp.market)) then
+            rejected = "quote below vendor profit floor"
+        end
         S.logPurchaseTiming(sp, rejected or "price caps passed")
         if rejected then
             local detail = string.format("%s; item %d x%d; quote unit/total %s/%s copper; caps unit/total/budget %.0f/%.0f/%.0f copper; age %.2fs",
@@ -6222,7 +6243,7 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             S.scansDone, db.stats.book or 0, db.stats.deals or 0)
         printf("market reference: %s. /fsn tsm <itemID> inspects an item's reference.",
             cfg.tsm == false and "TSM disabled; local history only" or ForeverSniperTSM.status(time()))
-        printf("positive regional daily sales required for all deals; extra sales checks: %s; known rate floor %.1f%%, exposure cap %.1f%% of regional daily/AH volume. /fsn sales ITEMID inspects coverage.",
+        printf("AH flips require positive regional daily sales; verified NPC flips use vendor profit instead. Extra sales checks: %s; rate floor %.1f%%, exposure cap %.1f%%. /fsn sales ITEMID inspects coverage.",
             cfg.sales == false and "off" or "on", (cfg.saleRate or 0.05) * 100, (cfg.saleShare or 0.10) * 100)
         local ss = S.sweepStats or { sent = 0, rows = 0, yields = 0 }
         printf("monitor timing: completed-check revisit last/mean/max %.1f/%.1f/%.1fs (%d repeats); detected-to-validated last/max %.1f/%.1fs. Not listing age or a Buy guarantee.",
@@ -6442,7 +6463,7 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             printf("item %d: %s", id, S.salesSummary(id))
             return
         end
-        printf("extra sales checks %s: rate floor %.1f%%; exposure share %.1f%%. All deals still require positive regional daily sales.",
+        printf("extra sales checks %s: rate floor %.1f%%; exposure share %.1f%%. AH flips require positive daily sales; profitable NPC exits are exempt.",
             cfg.sales == false and "off" or "on", (cfg.saleRate or 0.05) * 100, (cfg.saleShare or 0.10) * 100)
 
     elseif cmd == "tsm" then

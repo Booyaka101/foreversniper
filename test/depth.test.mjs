@@ -44,6 +44,8 @@ local function commodityFor() return true end
 local function requestItemLoad() end
 local function offerKind(_,_,kind) return kind end
 local function depositPerUnit() return deposit end
+local payout=100
+local function vendorOf() return payout end
 local function printf() end
 local function err() end
 local function fmtMoney(v) return tostring(v) end
@@ -525,14 +527,15 @@ test('volume caps require fresh readable stock with the manual cap off', () => {
   `);
 });
 
-test('missing, stale, zero or unavailable volume blocks every exit regardless of optional checks', () => {
+test('missing, stale, zero or unavailable volume blocks every AH exit regardless of optional checks', () => {
   for (const action of ['', 'salesFeed(now-172801)', 'salesFeed(); values.dbregionsoldperday=nil',
     'cfg.sales=false; salesFeed(); values.dbregionsoldperday=0', 'cfg.tsm=false; salesFeed()']) {
     salesCheck(`${action}
-      for _,kind in ipairs({'vendor','watch','market','dump'}) do
+      for _,kind in ipairs({'watch','market','dump'}) do
         local terms,reason=S.optimizedCommodityTerms(123,10,100,kind,snapshot({{price=10,quantity=10}}))
         assert(not terms and reason=='salesvolume')
-      end`);
+      end
+      assert(S.optimizedCommodityTerms(123,10,100,'vendor',snapshot({{price=10,quantity=10}})))`);
   }
 });
 
@@ -543,8 +546,8 @@ test('vendor and watch deals with positive sales still work', () => salesCheck(`
   assert(S.optimizedCommodityTerms(123,10,nil,'watch',wall))
 `));
 
-test('old vendor rows are hidden even without loaded tiers and cannot start a purchase', () => salesCheck(`
-  salesFeed(); values.dbregionsoldperday=nil
+test('old vendor labels without verified profit are hidden and cannot start a purchase', () => salesCheck(`
+  payout=0; salesFeed(); values.dbregionsoldperday=nil
   S.deals={{id=123,t=now,line=10,unit=10,units=10,cost=100,profit=500,market=100,kind='vendor'}}
   ${section('local function collectDealGroups(', '\nlocal function feedBestSkip()')}
   assert(#collectDealGroups()==0)
@@ -554,10 +557,18 @@ test('old vendor rows are hidden even without loaded tiers and cannot start a pu
   assert(calls.start==0)
 `));
 
-test('a vendor quote cannot confirm after the regional feed becomes unavailable', () => salesCheck(`
+test('a vendor quote can confirm without the regional feed', () => salesCheck(`
   salesFeed(); snapshot({{price=10,quantity=10}})
   quickBuy({itemID=123,line=10,units=10,cost=100,market2=100,kind='vendor'})
   assert(calls.start==1); TSM_API=nil
+  handlers.COMMODITY_PRICE_UPDATED(10,100)
+  assert(calls.confirm==1 and db.unsettledPurchase)
+`));
+
+test('a vendor quote rechecks the NPC payout and the actual quoted margin', () => salesCheck(`
+  cfg.vendorMin=100; snapshot({{price=10,quantity=10}})
+  quickBuy({itemID=123,line=10,units=10,cost=100,market2=100,kind='vendor'})
+  assert(calls.start==1); payout=19; rows[1].unitPrice=8
   handlers.COMMODITY_PRICE_UPDATED(10,100)
   assert(calls.confirm==0 and not db.unsettledPurchase)
 `));

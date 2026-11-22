@@ -101,13 +101,13 @@ test('sales data reaches live-tier admission and conservative profit estimates',
   assert(#admitted==1 and admitted[1].sweep.verified and admitted[1].sweep.profit==25480)
 `));
 
-test('vendor margin and region average cannot queue or alert without reported volume', () => salesCheck(`
+test('only the verified NPC exit can queue and alert without reported AH volume', () => salesCheck(`
   salesFeed(); market(); values.dbregionsoldperday=nil
   vendorOf=function() return 9000 end
   observe(100,10)
-  assert(not S.liveCandidates and #admitted==0 and #db.alerts==0)
-  fireAlert('vendor',123,nil,100,9000,{units=10,cost=1000,profit=89000,line=9000,verified=true})
-  assert(#admitted==0 and #db.alerts==0)
+  assert(S.liveCandidates[123].kind=='vendor' and #admitted==0 and #db.alerts==0)
+  complete(100,10,9000,20)
+  assert(#admitted==1 and admitted[1].sweep.units==10 and admitted[1].sweep.profit==89000)
 `));
 
 test('wrong-item cheap API tiers cannot admit deals or teach automatic price history', () => salesCheck(`
