@@ -383,8 +383,11 @@ These configurable defaults are conservative policy choices, not proven optimum
 settings. Regional sale averages aggregate reported Accounting sales and purchases;
 they are not a promised exit price on your realm. Daily volume is not realm-specific
 or a guarantee of available buyers. A vendor flip needs no AH buyer: its
-verified NPC sell value must cover the full purchase and meet the configured
-vendor profit floor. The quote is checked against that payout before confirmation.
+verified NPC sell value need only exceed the full purchase cost by **1 copper
+per lot**. Neither the AH profit setting nor any old saved vendor minimum applies.
+The quote is checked against that payout before confirmation. `/fsn vendor`
+shows the count of verified NPC payouts. Discovery learns from single-item
+native sell-price tooltips when available, and from actual merchant buybacks.
 Wallet, reserve, manual stock limits and price ceilings still apply.
 
 Sales metadata must be observed for the matching `Forever-<region>` or

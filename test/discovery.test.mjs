@@ -22,7 +22,7 @@ local function GetMoney() return 1000000 end
 local function countKeys(t) local n=0 for _ in pairs(t) do n=n+1 end return n end
 local function sampleCount(s) return math.floor(#s/2) end
 local function serverHour() return 12 end
-local function vendorOf() return 0 end
+${section('local vendorOf\n', '\n-- DEPOSIT PER UNIT')}
 local function rebuildWatch() end
 local function noteStack() end
 local function trackSold() end
@@ -108,6 +108,49 @@ test('only the verified NPC exit can queue and alert without reported AH volume'
   assert(S.liveCandidates[123].kind=='vendor' and #admitted==0 and #db.alerts==0)
   complete(100,10,9000,20)
   assert(#admitted==1 and admitted[1].sweep.units==10 and admitted[1].sweep.profit==89000)
+`));
+
+test('a cold vendor table learns the unit payout during discovery and retains the vendor exit over an AH flip', () => salesCheck(`
+  salesFeed(); market()
+  Enum.TooltipDataLineType={SellPrice=11}
+  C_TooltipInfo={GetItemByID=function(id)
+    return {id=id,lines={{type=2,price=50000},{type=11,price=1000}}}
+  end}
+  observe(100,10)
+  assert(db.vendorVerified['123']==1000 and S.liveCandidates[123].kind=='vendor')
+  complete(100,10,1000,30)
+  assert(#admitted==1 and admitted[1].sweep.kind=='vendor' and admitted[1].sweep.profit==9000)
+`));
+
+test('ambiguous, foreign, fractional and missing tooltip values do not qualify a vendor flip', () => check(`
+  Enum={TooltipDataLineType={SellPrice=11}}
+  for _,tip in ipairs({{id=456,lines={{type=11,price=1000}}},{lines={{type=3,price=1000}}},
+    {lines={{type=11,price=10.5}}},{lines={{type=11}}}}) do
+    now=now+61; C_TooltipInfo={GetItemByID=function() return tip end}
+    observe(100,10); assert(not db.vendorVerified and not S.liveCandidates)
+  end
+`));
+
+test('one copper total vendor profit is admitted despite legacy 50s and AH floors, break-even is not', () => check(`
+  cfg.vendorMin=5000; cfg.profit=100000; cfg.tsm=false
+  db.vendorVerified={['123']=101}
+  observe(101,1); assert(not S.liveCandidates and #admitted==0)
+  observe(100,1); complete(100,1,101,7)
+  assert(#admitted==1 and admitted[1].sweep.kind=='vendor' and admitted[1].sweep.profit==1)
+`));
+
+test('merchant updates learn newly sold stack payouts per unit without waiting to reopen', () => check(`
+  local callback
+  C_Timer={After=function(_,fn) assert(not callback);callback=fn end}
+  GetNumBuybackItems=function() return 0 end
+  GetBuybackItemLink=function() return 'item:123' end
+  GetBuybackItemInfo=function() return 'cloth',0,900,3 end
+  ${section('-- merchant learner:', '\n-- options panel:')}
+  handlers.MERCHANT_SHOW(); callback(); callback=nil
+  assert(vendorOf(123)==0)
+  GetNumBuybackItems=function() return 1 end
+  handlers.MERCHANT_UPDATE(); handlers.MERCHANT_UPDATE(); callback()
+  assert(vendorOf(123)==300)
 `));
 
 test('wrong-item cheap API tiers cannot admit deals or teach automatic price history', () => salesCheck(`

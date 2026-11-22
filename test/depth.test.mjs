@@ -565,10 +565,19 @@ test('a vendor quote can confirm without the regional feed', () => salesCheck(`
   assert(calls.confirm==1 and db.unsettledPurchase)
 `));
 
+test('one copper merchant gain passes both Buy and quote even with the old saved floor', () => salesCheck(`
+  payout=101; cfg.vendorMin=5000; cfg.profit=50000; cfg.tsm=false
+  snapshot({{price=100,quantity=1}})
+  quickBuy({itemID=123,line=100,units=1,cost=100,market2=101,kind='vendor'})
+  assert(calls.start==1)
+  handlers.COMMODITY_PRICE_UPDATED(100,100)
+  assert(calls.confirm==1 and db.unsettledPurchase.total==100)
+`));
+
 test('a vendor quote rechecks the NPC payout and the actual quoted margin', () => salesCheck(`
   cfg.vendorMin=100; snapshot({{price=10,quantity=10}})
   quickBuy({itemID=123,line=10,units=10,cost=100,market2=100,kind='vendor'})
-  assert(calls.start==1); payout=19; rows[1].unitPrice=8
+  assert(calls.start==1); payout=10; rows[1].unitPrice=8
   handlers.COMMODITY_PRICE_UPDATED(10,100)
   assert(calls.confirm==0 and not db.unsettledPurchase)
 `));
