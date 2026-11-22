@@ -50,7 +50,6 @@ local DEFAULTS = {
     avoidBrowse = true, -- auto-switch the AH off the Browse tab so sweeps run
     undercut  = true,    -- guard your listings: alert when the market undercuts you
     tolerance = 5,       -- snipe quote tolerance %: live total vs snapshot, abort past it
-    vendorMin = 5000,    -- vendor flips need this much total estimated profit (50s)
 }
 
 ForeverSniperDB = ForeverSniperDB or {}
@@ -72,14 +71,13 @@ end
 -- one-time retune: installs from the retail-scale era keep their old gates
 -- (10s unit floor, 1g profit) which silence a classic economy entirely.
 -- Market-tuned for the Forever beta: 1s unit floor, 10s profit floor, 5%
--- snipe tolerance, 50s vendor-flip floor.
+-- snipe tolerance.
 if not db.tunedClassic then
     db.tunedClassic = true
     db.config.minUnit = 100      -- 1s: the 12-20s tier markets qualify
     db.config.profit = 1000      -- 10s: real floor, not off - junk stays out
     db.config.threshold = 0.50
     db.config.tolerance = 5
-    db.config.vendorMin = 5000
     print("|cffff7d0aForever Sniper|r: retuned for the classic economy - 1s unit floor, 10s profit floor, 5% snipe tolerance. /fsn options to adjust.")
 end
 local cfg = db.config
@@ -553,10 +551,37 @@ end
 -- really pays for items you sell it lands in the buyback list) and from
 -- native "Sell Price" tooltips as you browse. Unlearned items read 0: no
 -- flips, no floods.
-local function vendorOf(itemID)
+local vendorOf
+do
+local retryAt, frameAt, probes = {}, nil, 0
+vendorOf = function(itemID, learn)
     local v = db.vendorVerified and db.vendorVerified[tostring(itemID)]
     if v and v > 0 then return v end
+    if not learn or not (C_TooltipInfo and C_TooltipInfo.GetItemByID) then return 0 end
+    local now = GetTime()
+    if frameAt ~= now then frameAt, probes = now, 0 end
+    if probes >= 8 or now < (retryAt[itemID] or 0) then return 0 end
+    probes = probes + 1
+    retryAt[itemID] = now + 60
+    -- A base-item tooltip has no hovered stack or unrelated money frames.
+    local ok, tip = pcall(C_TooltipInfo.GetItemByID, itemID)
+    if ok and type(tip) == "table" and (not tip.id or tip.id == itemID) and type(tip.lines) == "table" then
+        local sellType = Enum and Enum.TooltipDataLineType and Enum.TooltipDataLineType.SellPrice
+        for _, row in ipairs(tip.lines) do
+            if type(row) == "table" and ((sellType and row.type == sellType)
+                or (SELL_PRICE and row.leftText == SELL_PRICE)) then
+                local price = num(row.price)
+                if price and price > 0 and price % 1 == 0 then
+                    db.vendorVerified = db.vendorVerified or {}
+                    db.vendorVerified[tostring(itemID)] = price
+                    retryAt[itemID] = nil
+                    return price
+                end
+            end
+        end
+    end
     return 0
+end
 end
 
 -- DEPOSIT PER UNIT for relisting. A flip only profits if the wallet can pay
@@ -739,30 +764,10 @@ if GameTooltip and GameTooltip.HookScript then
         if not okG or not link then return end
         local itemID = tonumber(tostring(link):match("item:(%d+)"))
         if not itemID then return end
-        -- VENDOR PRICE LEARNER: the native tooltip carries the TRUE sell
-        -- price (C_Item.GetItemInfo's sell slot is garbage here). The amount
-        -- sits in the tooltip's money frame; read it guarded - if the
-        -- structure ever changes, learning goes quiet instead of lying.
-        -- Learns BEFORE the display early-return: every hover teaches.
-        db.vendor = db.vendor or {}
-        if tt.NumLines and tt:NumLines() > 0 then
-            for li = 1, tt:NumLines() do
-                local lf = _G["GameTooltipTextLeft" .. li]
-                local txt = lf and lf:GetText()
-                if txt and txt:find("Sell Price") then
-                    local mf = _G.GameTooltipMoneyFrame1
-                    local amount = mf and (tonumber(mf.staticMoney) or (mf.info and tonumber(mf.info.amount)))
-                    if type(amount) == "number" and amount > 0 then
-                        db.vendor[tostring(itemID)] = amount
-                    end
-                    break
-                end
-            end
-        end
         local b = db.book[itemID]
         local med = b and freshMedian(b.s, time(), (cfg.freshMins or 45) * 60, 1) or nil
         local paid = db.boughtAt and (db.boughtAt[tostring(itemID)] or db.boughtAt[itemID])
-        local vend = vendorOf(itemID)
+        local vend = vendorOf(itemID, true)
         if not med and not paid and not (vend and vend > 0) then return end
         tt:AddLine(" ")
         tt:AddLine("|cffff7d0aForever Sniper|r", 1, 0.5, 0.05)
@@ -1148,10 +1153,13 @@ function S.purchaseBudget()
 end
 
 function S.salesPolicy(itemID, now)
-    if cfg.sales == false or cfg.tsm == false then return nil, nil, nil, "sales checks disabled" end
-    if not ForeverSniperTSM or not ForeverSniperTSM.sales then return nil, nil, nil, "TSM sales unavailable" end
+    if cfg.tsm == false then return nil, nil, "salesvolume", "TSM disabled" end
+    if not ForeverSniperTSM or not ForeverSniperTSM.sales then return nil, nil, "salesvolume", "TSM sales unavailable" end
     local data, unknown = ForeverSniperTSM.sales(itemID, now or time())
-    if not data then return nil, nil, nil, unknown end
+    if not data or not num(data.daily) or data.daily <= 0 then
+        return data, nil, "salesvolume", unknown or "no positive regional daily sales"
+    end
+    if cfg.sales == false then return data end
     local limit = data.daily and math.floor(data.daily * (cfg.saleShare or 0.10))
     if data.rate and data.rate < (cfg.saleRate or 0.05) then return data, limit, "liquidity" end
     if limit and limit < 1 then return data, limit, "liquidity" end
@@ -1160,13 +1168,25 @@ end
 
 function S.salesSummary(itemID)
     local data, limit, rejected, unknown = S.salesPolicy(itemID)
-    if not data then return "sales/liquidity unknown: " .. (unknown or "no verified data") end
+    if not data then return "deals blocked; regional sales unknown: " .. (unknown or "no verified data") end
     return string.format("regional sales %s (%.1fh old): avg %s; rate %s; daily/AH %s; exposure cap %s%s (not a sale guarantee)",
         data.region, (time() - data.stamp) / 3600,
         data.average and fmtMoney(data.average) or "unknown",
         data.rate and string.format("%.1f%%", data.rate * 100) or "unknown",
         data.daily and string.format("%.3f", data.daily) or "unknown",
-        limit and tostring(limit) or "unknown", rejected and "; rejected: low liquidity" or "")
+        limit and tostring(limit) or "none", rejected and ("; blocked: " .. (unknown or "low liquidity")) or "")
+end
+
+-- For an NPC exit the counterparty is the merchant, not an AH buyer.
+-- Never accept a saved offer's market estimate as proof of a vendor payout.
+function S.exitPolicy(id, kind, units, cost, reference)
+    if kind ~= "vendor" then return S.salesPolicy(id) end
+    local payout = num(vendorOf(id))
+    if not payout or not num(reference) or not num(units) or not num(cost)
+        or units < 1 or cost < 1 then return nil, nil, "vendorprofit" end
+    payout = math.min(payout, reference)
+    if payout * units - cost < 1 then return nil, nil, "vendorprofit" end
+    return nil, nil, nil, payout
 end
 
 function S.stockAllowance(itemID, salesLimit)
@@ -1218,11 +1238,13 @@ local function commodityPositionTerms(itemID, line, units, cost, market, kind, s
     if liveUnits < 1 then return nil, "empty" end
     kind = offerKind(itemID, line, kind) or (market ~= nil and "market" or "watch")
     local sales, salesLimit, salesReason
-    if kind == "market" or kind == "dump" then
-        if policy then sales = policy.sales
-        else sales, salesLimit, salesReason = S.salesPolicy(itemID) end
-        if salesReason then return nil, salesReason end
+    if policy then sales = policy.sales
+    else
+        local payout
+        sales, salesLimit, salesReason, payout = S.exitPolicy(itemID, kind, liveUnits, liveCost, market)
+        if kind == "vendor" then market = payout end
     end
+    if salesReason then return nil, salesReason end
     local allowance, stockReason
     if policy then allowance = policy.allowance else allowance, stockReason = S.stockAllowance(itemID, salesLimit) end
     if not allowance then return nil, stockReason end
@@ -1249,11 +1271,11 @@ local function commodityPositionTerms(itemID, line, units, cost, market, kind, s
     if market ~= nil then
         market = num(market)
         if not market or market <= 0 then return nil, "invalid" end
-        if sales and sales.average then market = math.min(market, sales.average) end
+        if kind ~= "vendor" and sales and sales.average then market = math.min(market, sales.average) end
         resale = kind ~= "vendor" and competing and math.min(market, competing - 1) or market
         profit = math.floor(liveUnits * resale * (kind == "vendor" and 1 or (1 - (cfg.cut or 0.05))) - liveCost - reserve)
         if not num(profit) then return nil, "invalid" end
-        if profit < math.max(1, kind == "vendor" and (cfg.vendorMin or 5000) or (cfg.profit or 0)) then return nil, "profit" end
+        if profit < (kind == "vendor" and 1 or math.max(1, cfg.profit or 0)) then return nil, "profit" end
     end
     return {units=liveUnits, cost=liveCost, reserve=reserve, walletCap=budget - reserve, profit=profit, first=first, resale=resale, kind=kind}
 end
@@ -1433,7 +1455,7 @@ local function renderPopup()
     for i = #popupRows, 1, -1 do
         local d = popupRows[i]
         local alive = false
-        if d.t and time() - d.t > 600 then
+        if (d.t and time() - d.t > 600) or select(3,S.exitPolicy(d.itemID,d.kind,d.units,d.cost,d.market)) then
             table.remove(popupRows, i)
         else
             for _, dd in ipairs(S.deals) do
@@ -2163,6 +2185,7 @@ commodityActionState = function(itemID, link, line, units, cost, market, kind)
             or "The Auction House throttle is busy."
     end
     local ready, reason = commodityOfferReady(itemID, link, line, units, cost, market, kind)
+    if reason == "salesvolume" or reason == "liquidity" then return "Sales", false, S.salesSummary(itemID) end
     if reason == "budget" then return "Cost", false, "The complete position plus deposit reserve exceeds your wallet or spend cap." end
     if reason == "stocklimit" then return "Stock", false, "The complete position exceeds your per-item stock limit, including uncollected purchases." end
     if reason == "stockinfo" then return "Stock", false, "Stock data is unavailable or stale. Refresh owned auctions with /fsn sell; buying remains blocked." end
@@ -2251,7 +2274,7 @@ end
 
 function S.offerAvailable(offer)
     if not offer then return true end -- non-UI callers still validate complete tiers
-    if offer.gone or offer.bought then return false end
+    if offer.gone or offer.bought or select(3,S.exitPolicy(offer.id,offer.kind,offer.units,offer.cost,offer.market)) then return false end
     for _, d in ipairs(S.deals) do if d == offer then return true end end
     return false
 end
@@ -2395,6 +2418,8 @@ quickBuy = function(r)
             budget="full deal plus deposit reserve exceeds the budget - no partial wall purchased.",
             stocklimit="full deal exceeds your per-item stock limit - nothing purchased.",
             liquidity="fresh regional sales are below your liquidity policy - nothing purchased.",
+            salesvolume="no verified positive regional daily sales - nothing purchased.",
+            vendorprofit="no verified positive profit at the NPC sell price.",
             stockinfo="stock data is unavailable or stale - refresh /fsn sell before buying.",
             profit="full live deal does not clear the profit floor after fees - nothing purchased.",
             iteminfo="item eligibility is still loading - nothing purchased.",
@@ -2469,7 +2494,7 @@ local function collectDealGroups(forBuy)
     local walletCap = math.floor((GetMoney() or 0) * 0.95)
     local groups, order = {}, {}
     for _, cand in ipairs(S.deals) do
-        if not cand.bought and not cand.gone and num(cand.cost) and cand.cost > 0
+        if not cand.bought and not cand.gone and not select(3,S.exitPolicy(cand.id,cand.kind,cand.units,cand.cost,cand.market)) and num(cand.cost) and cand.cost > 0
             and num(cand.units) and cand.units > 0 and num(cand.unit) and cand.unit > 0 then
             local previous = groups[cand.id]
             -- Observations may overlap. Actual lots combine only from a
@@ -3073,6 +3098,8 @@ end
 
 local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
     if not cfg.enabled or db.blacklist[itemID] then return end
+    local _, _, salesReason = S.exitPolicy(itemID, kind, sweep and sweep.units, sweep and sweep.cost, market)
+    if salesReason then recordGate("offer", salesReason, itemID) return end
     if (kind == "market" or kind == "dump") and (not sweep or (num(sweep.profit) or 0) < math.max(1, cfg.profit or 0)) then
         recordGate("offer", "estimated net below floor", itemID)
         return
@@ -3095,6 +3122,7 @@ local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
         S.liveCandidates = S.liveCandidates or {}
         local queued = S.liveCandidates[itemID]
         if queued and queued.remainder then return end
+        if queued and queued.kind == "vendor" and not queued.refresh and kind ~= "vendor" then return end
         local detectedAt = GetTime()
         if queued then detectedAt = queued.detectedAt end
         S.liveCandidates[itemID] = { kind = kind, id = itemID, link = link,
@@ -3290,7 +3318,25 @@ local function completeScan(reason)
     -- resale profit - market after the AH cut, minus cost - clears the floor.
     local deals = 0
     do -- Trusted references can qualify candidates on the first full snapshot.
+        local vendorChecked = {}
         for _, c in ipairs(cands) do
+            if not db.blacklist[c.id] and not vendorChecked[c.id] then
+                vendorChecked[c.id] = true
+                local payout = vendorOf(c.id, true)
+                if payout > 1 and curMins[c.id] and curMins[c.id] < payout then
+                    local units, cost = 0, 0
+                    for _, lot in ipairs(depth[c.id] or {}) do
+                        if lot.unit < payout then
+                            units, cost = units + lot.count, cost + lot.unit * lot.count
+                        end
+                    end
+                    local profit = payout * units - cost
+                    if profit >= 1 then
+                        fireAlert("vendor", c.id, c.link, curMins[c.id], payout,
+                            {units=units,cost=cost,profit=profit,line=payout-1})
+                    end
+                end
+            end
             if not db.blacklist[c.id] and c.unit >= cfg.minUnit then
                 local med = S.marketReference(c.id, t)
                 local lineR = med and dealLine(med, c.id) or nil
@@ -3967,7 +4013,7 @@ local function processBrowseRows(rows, added, source)
             end
             -- VENDOR FLIP: priced under the vendor sell price = guaranteed
             -- instant profit. No market gates apply - the vendor always buys.
-            local sell = vendorOf(key)
+            local sell = vendorOf(key, true)
             -- vendor flips ignore the stackable filter: guaranteed profit is
             -- guaranteed, and gear vendored is gear sold
             if false then
@@ -3984,14 +4030,9 @@ local function processBrowseRows(rows, added, source)
             end
             if sell > 0 and price < sell and isNewListing(key, price) then
                 local est = (sell - price) * qty
-                -- guaranteed profit, but it still has to be WORTH the click:
-                -- a 2s fang with 1s of vendor margin is noise, not a deal
-                if est >= (cfg.vendorMin or 5000) then
+                if est >= 1 then
                     fireAlert("vendor", key, nil, price, sell,
-                        { units = qty, cost = price * qty, profit = est, line = sell })
-                else
-                    why("vendor margin under floor", key,
-                        " (" .. fmtMoney(est) .. " est vs " .. fmtMoney(cfg.vendorMin or 5000) .. " floor)")
+                        { units = qty, cost = price * qty, profit = est, line = sell - 1 })
                 end
             end
         -- WATCH RULES: absolute price targets, evaluated on EVERY browsed
@@ -4144,7 +4185,7 @@ do
             local checked = id and (S.batchChecked[id] or -60)
             if id and id > 0 and id % 1 == 0 and not watchByID[id] and not db.blacklist[id] and commodity == true then
                 local market = S.marketReference(id)
-                if market and market >= cfg.minUnit then
+                if (market and market >= cfg.minUnit) or (db.vendorVerified and db.vendorVerified[tostring(id)] and vendorOf(id) > 1) then
                     candidates[#candidates + 1] = {id=id, checked=checked}
                 end
             end
@@ -5742,7 +5783,9 @@ local function onCommodityResults(itemID)
                 profit="net after competition and deposit below floor", invalid="invalid position data",
                 quality="quality below floor", stackable="not stackable", iteminfo="item info loading",
                 overhang="live competing stock over limit", stocklimit="per-item stock limit reached",
-                liquidity="fresh regional sales below liquidity policy",
+                 liquidity="fresh regional sales below liquidity policy",
+                 salesvolume="no verified positive regional daily sales",
+                 vendorprofit="insufficient verified NPC profit",
                 stockinfo="stock data unavailable or stale"}
             recordGate("validation", reasons[rejected] or rejected, itemID)
             if c.refresh then markDealGone(itemID, math.huge) end
@@ -5783,7 +5826,10 @@ on("COMMODITY_PRICE_UPDATED", function(unitPrice, totalPrice)
         elseif not t or t < sp.units or t < u or t % 1 ~= 0 then rejected = "unreadable total price"
         elseif u > ceiling then rejected = "unit price above approved ceiling"
         elseif t > sp.tolTotal then rejected = "total above approved purchase cost"
-        elseif t > budget then rejected = "total above current budget" end
+        elseif t > budget then rejected = "total above current budget"
+        elseif sp.kind == "vendor" and select(3,S.exitPolicy(sp.deal.id,"vendor",sp.units,t,sp.market)) then
+            rejected = "quote below vendor profit floor"
+        end
         S.logPurchaseTiming(sp, rejected or "price caps passed")
         if rejected then
             local detail = string.format("%s; item %d x%d; quote unit/total %s/%s copper; caps unit/total/budget %.0f/%.0f/%.0f copper; age %.2fs",
@@ -5879,8 +5925,13 @@ end)
 
 -- merchant learner: the buyback list records what a vendor REALLY paid for
 -- everything sold to it - exact vendor prices, no guessing
-on("MERCHANT_SHOW", function()
-    C_Timer.After(1, function()
+do
+    local scheduled
+    local function learnBuyback()
+        if scheduled then return end
+        scheduled = true
+        C_Timer.After(0.1, function()
+        scheduled = nil
         if GetNumBuybackItems == nil or GetBuybackItemLink == nil then return end
         db.vendorVerified = db.vendorVerified or {}
         local n = GetNumBuybackItems() or 0
@@ -5888,12 +5939,16 @@ on("MERCHANT_SHOW", function()
             local okI, _, _, price, quantity = pcall(GetBuybackItemInfo, i)
             local okL, link = pcall(GetBuybackItemLink, i)
             local id = okL and link and tonumber(tostring(link):match("item:(%d+)"))
-            if okI and num(price) and price > 0 and num(quantity) and quantity > 0 and id then
+            if okI and num(price) and price > 0 and num(quantity) and quantity > 0
+                and quantity % 1 == 0 and price % quantity == 0 and id then
                 db.vendorVerified[tostring(id)] = math.floor(price / quantity)
             end
         end
-    end)
-end)
+        end)
+    end
+    on("MERCHANT_SHOW", learnBuyback)
+    onOptional("MERCHANT_UPDATE", learnBuyback)
+end
 
 -- options panel: plain-frame toggles and steppers, no templates needed ------
 local optionsFrame
@@ -6042,6 +6097,7 @@ local HELP = {
     "/fsn min 10s          ignore deals under this per-unit price",
     "/fsn quality 2        minimum rarity for market alerts (0 = any)",
     "/fsn profit 1g        minimum estimated resale profit (0 = off)",
+    "/fsn vendor           show verified NPC price coverage; any positive vendor profit qualifies",
     "/fsn arm 2            scans of history before alerts fire",
     "/fsn fresh 45         minutes a price sample stays fresh (5-480)",
     "/fsn overhang 500     skip deals buried under more units (0 = off)",
@@ -6208,6 +6264,8 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             "failure capture off. /fsn capture once arms one screenshot; /fsn capture off cancels.")
 
     elseif cmd == "" or cmd == "status" then
+        printf("vendor flips: %d verified NPC prices; any positive profit qualifies (1c per lot).",
+            countKeys(db.vendorVerified or {}))
         printf("database: %s; %d book items; spend cap %s; gold reserve %s.",
             db == ForeverSniperDB and "using saved table" or "TABLE MISMATCH",
             countKeys(db.book), fmtMoney(cfg.maxSpend or 0), fmtMoney(cfg.keepGold or 0))
@@ -6216,7 +6274,7 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             S.scansDone, db.stats.book or 0, db.stats.deals or 0)
         printf("market reference: %s. /fsn tsm <itemID> inspects an item's reference.",
             cfg.tsm == false and "TSM disabled; local history only" or ForeverSniperTSM.status(time()))
-        printf("sales checks: %s; known rate floor %.1f%%, exposure cap %.1f%% of regional daily/AH volume. Unknown data retains fallback; /fsn sales ITEMID inspects coverage.",
+        printf("AH flips require positive regional daily sales; verified NPC flips use vendor profit instead. Extra sales checks: %s; rate floor %.1f%%, exposure cap %.1f%%. /fsn sales ITEMID inspects coverage.",
             cfg.sales == false and "off" or "on", (cfg.saleRate or 0.05) * 100, (cfg.saleShare or 0.10) * 100)
         local ss = S.sweepStats or { sent = 0, rows = 0, yields = 0 }
         printf("monitor timing: completed-check revisit last/mean/max %.1f/%.1f/%.1fs (%d repeats); detected-to-validated last/max %.1f/%.1fs. Not listing age or a Buy guarantee.",
@@ -6436,7 +6494,7 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             printf("item %d: %s", id, S.salesSummary(id))
             return
         end
-        printf("sales checks %s: rate floor %.1f%%; exposure share %.1f%%. Unknown data is not proof of liquidity.",
+        printf("extra sales checks %s: rate floor %.1f%%; exposure share %.1f%%. AH flips require positive daily sales; profitable NPC exits are exempt.",
             cfg.sales == false and "off" or "on", (cfg.saleRate or 0.05) * 100, (cfg.saleShare or 0.10) * 100)
 
     elseif cmd == "tsm" then
@@ -6551,6 +6609,8 @@ SlashCmdList.FOREVERSNIPER = function(msg)
             end
         end
 
+    elseif cmd == "vendor" then
+        printf("vendor flips: %d verified NPC prices. Any positive vendor profit qualifies (1c per lot); no daily sales required.", countKeys(db.vendorVerified or {}))
     elseif cmd == "profit" and rest ~= "" then
         local v = rest == "0" and 0 or parseMoney(rest)
         if v then

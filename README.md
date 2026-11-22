@@ -366,7 +366,9 @@ appear when its first live results arrive, not necessarily in the first second.
 
 #### Regional sales and liquidity checks
 
-Fresh TSM Forever regional sales data can tighten market/dump flips:
+Every **AH resale** deal (market, dump or watch) requires a positive
+`DBRegionSoldPerDay` from a fresh TSM feed for the matching Forever region.
+A regional average price or sale rate alone does not qualify.
 
 - `DBRegionSaleAvg` only lowers an existing reference or resale estimate. Regional
   sales alone never create a discovery reference.
@@ -380,23 +382,28 @@ Fresh TSM Forever regional sales data can tighten market/dump flips:
 These configurable defaults are conservative policy choices, not proven optimum
 settings. Regional sale averages aggregate reported Accounting sales and purchases;
 they are not a promised exit price on your realm. Daily volume is not realm-specific
-or a guarantee of available buyers. Vendor and absolute-price watches are exempt
-from market sales policy, but retain existing budgets and manual stock controls.
+or a guarantee of available buyers. A vendor flip needs no AH buyer: its
+verified NPC sell value need only exceed the full purchase cost by **1 copper
+per lot**. Neither the AH profit setting nor any old saved vendor minimum applies.
+The quote is checked against that payout before confirmation. `/fsn vendor`
+shows the count of verified NPC payouts. Discovery learns from single-item
+native sell-price tooltips when available, and from actual merchant buybacks.
+Wallet, reserve, manual stock limits and price ceilings still apply.
 
 Sales metadata must be observed for the matching `Forever-<region>` or
 `Forever-HC-<region>` feed, no more than 48 hours old and not future-dated.
-Missing/stale/unobserved data remains explicitly unknown and retains existing
-fallback. Public API queries preserve fractional rates/volume and known zeroes.
+Missing, stale, unobserved or zero sales volume hides AH resale offers and blocks buying them.
+Public API queries preserve fractional rates/volume and known zeroes.
 Known volume requires fresh readable owned-auction stock, even without manual
 stock caps. Complete-tier, Buy and quote-time guards remain authoritative.
 
 - `/fsn sales <itemID>`: inspect coverage, values and liquidity policy.
-- `/fsn sales on` / `/fsn sales off`: enable or disable sales checks (default on).
+- `/fsn sales on` / `/fsn sales off`: toggle the extra rate and exposure limits (default on). Positive volume is always required for AH resale.
 - `/fsn sales rate 5`: set the minimum known rate to 5%.
 - `/fsn sales share 10`: cap known exposure at 10% of regional daily/AH volume.
 
 Rate/share accept percentages greater than zero and at most 100. `/fsn tsm off`
-also disables sales checks. Tooltips show sales values or why coverage is unknown.
+blocks AH resale deals because regional volume cannot be verified. Tooltips show sales values or why coverage is unknown.
 Fresh rate/volume adds at most two seconds of candidate priority; aging still wins.
 The addon does not import TSM operations, write its data or increase AH request rates.
 

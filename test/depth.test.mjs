@@ -44,6 +44,8 @@ local function commodityFor() return true end
 local function requestItemLoad() end
 local function offerKind(_,_,kind) return kind end
 local function depositPerUnit() return deposit end
+local payout=100
+local function vendorOf() return payout end
 local function printf() end
 local function err() end
 local function fmtMoney(v) return tostring(v) end
@@ -94,7 +96,7 @@ local function offer()
     quickBuy({itemID=123,line=10,units=10,cost=100,market2=100,kind="market",t=100})
 end
 `;
-function check(body) { run(setup + production + prepared + body); }
+function check(body) { run(setup + `cfg.sales=false; ForeverSniperTSM={sales=function() return {daily=100} end}\n` + production + prepared + body); }
 
 function salesCheck(body) {
   run(setup + fixture.replace(/\bcalls\b/g, 'apiCalls') + salesEnvironment + provider
@@ -494,7 +496,7 @@ test('known low sale rate or daily volume rejects market and dump positions', ()
     'values.dbregionsoldperday=0', 'values.dbregionsoldperday=9.999',
   ]) salesCheck(`salesFeed(); ${change}
     local terms,reason=S.optimizedCommodityTerms(123,10,100,'${kind}',snapshot({{price=10,quantity=1}}))
-    assert(not terms and reason=='liquidity')`);
+    assert(not terms and reason==(${change.includes('soldperday=0') ? "'salesvolume'" : "'liquidity'"}))`);
 });
 
 test('daily volume bounds inventory, owned auctions and pending exposure', () => salesCheck(`
@@ -525,19 +527,59 @@ test('volume caps require fresh readable stock with the manual cap off', () => {
   `);
 });
 
-test('unknown, stale or disabled sales preserve existing fallback', () => {
-  for (const action of ['', 'salesFeed(now-172801)', 'cfg.sales=false; salesFeed()', 'cfg.tsm=false; salesFeed()']) {
-    salesCheck(`${action}; values.dbregionsalerate=0
-      local terms=S.optimizedCommodityTerms(123,10,100,'market',snapshot({{price=10,quantity=10}}))
-      assert(terms and S.salesSummary(123):find('unknown'))`);
+test('missing, stale, zero or unavailable volume blocks every AH exit regardless of optional checks', () => {
+  for (const action of ['', 'salesFeed(now-172801)', 'salesFeed(); values.dbregionsoldperday=nil',
+    'cfg.sales=false; salesFeed(); values.dbregionsoldperday=0', 'cfg.tsm=false; salesFeed()']) {
+    salesCheck(`${action}
+      for _,kind in ipairs({'watch','market','dump'}) do
+        local terms,reason=S.optimizedCommodityTerms(123,10,100,kind,snapshot({{price=10,quantity=10}}))
+        assert(not terms and reason=='salesvolume')
+      end
+      assert(S.optimizedCommodityTerms(123,10,100,'vendor',snapshot({{price=10,quantity=10}})))`);
   }
 });
 
-test('vendor and absolute watch purchases are exempt from market sales policy', () => salesCheck(`
-  salesFeed(); values.dbregionsalerate=0; values.dbregionsoldperday=0
+test('vendor and watch deals with positive sales still work', () => salesCheck(`
+  salesFeed()
   local wall=snapshot({{price=10,quantity=10}})
   assert(S.optimizedCommodityTerms(123,10,100,'vendor',wall))
   assert(S.optimizedCommodityTerms(123,10,nil,'watch',wall))
+`));
+
+test('old vendor labels without verified profit are hidden and cannot start a purchase', () => salesCheck(`
+  payout=0; salesFeed(); values.dbregionsoldperday=nil
+  S.deals={{id=123,t=now,line=10,unit=10,units=10,cost=100,profit=500,market=100,kind='vendor'}}
+  ${section('local function collectDealGroups(', '\nlocal function feedBestSkip()')}
+  assert(#collectDealGroups()==0)
+  snapshot({{price=10,quantity=10}})
+  feedBestBuy()
+  quickBuy({itemID=123,line=10,units=10,cost=100,market2=100,kind='vendor'})
+  assert(calls.start==0)
+`));
+
+test('a vendor quote can confirm without the regional feed', () => salesCheck(`
+  salesFeed(); snapshot({{price=10,quantity=10}})
+  quickBuy({itemID=123,line=10,units=10,cost=100,market2=100,kind='vendor'})
+  assert(calls.start==1); TSM_API=nil
+  handlers.COMMODITY_PRICE_UPDATED(10,100)
+  assert(calls.confirm==1 and db.unsettledPurchase)
+`));
+
+test('one copper merchant gain passes both Buy and quote even with the old saved floor', () => salesCheck(`
+  payout=101; cfg.vendorMin=5000; cfg.profit=50000; cfg.tsm=false
+  snapshot({{price=100,quantity=1}})
+  quickBuy({itemID=123,line=100,units=1,cost=100,market2=101,kind='vendor'})
+  assert(calls.start==1)
+  handlers.COMMODITY_PRICE_UPDATED(100,100)
+  assert(calls.confirm==1 and db.unsettledPurchase.total==100)
+`));
+
+test('a vendor quote rechecks the NPC payout and the actual quoted margin', () => salesCheck(`
+  cfg.vendorMin=100; snapshot({{price=10,quantity=10}})
+  quickBuy({itemID=123,line=10,units=10,cost=100,market2=100,kind='vendor'})
+  assert(calls.start==1); payout=10; rows[1].unitPrice=8
+  handlers.COMMODITY_PRICE_UPDATED(10,100)
+  assert(calls.confirm==0 and not db.unsettledPurchase)
 `));
 
 test('guarded Buy rechecks liquidity instead of trusting displayed offers', () => salesCheck(`
