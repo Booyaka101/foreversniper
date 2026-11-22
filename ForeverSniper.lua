@@ -2310,6 +2310,164 @@ function S.clearFeedDeals()
     refreshDealPresentation()
 end
 
+-- One-shot quantities, never an item-ID sell list. Only matched AH mail or
+-- the player's explicit receipt acknowledgement can release units for sale.
+do
+    local mail, visit, split
+    local function held(id)
+        local n = C_Item and C_Item.GetItemCount and num(C_Item.GetItemCount(id,false))
+        return n and n >= 0 and n % 1 == 0 and n or nil
+    end
+    function S.markVendorBuy(id, units, total)
+        if cfg.autoVendor == false then return end
+        db.vendorLots = db.vendorLots or {}
+        local key = tostring(id)
+        local lot = db.vendorLots[key] or {ready=0, invoices={}, maxPaid=0}
+        local invoice = units .. ":" .. total
+        lot.invoices[invoice] = (lot.invoices[invoice] or 0) + 1
+        lot.maxPaid = math.max(lot.maxPaid, total / units)
+        db.vendorLots[key] = lot
+    end
+    local function reconcile(lot, count)
+        if lot.last and count < lot.last then lot.ready = math.max(0, lot.ready - (lot.last - count)) end
+        lot.last = count
+    end
+    local function release(key, lot, qty, count)
+        reconcile(lot,count)
+        lot.ready = math.min(count,lot.ready + qty)
+        printf("marked %d x item %s for the merchant; %d ready.",qty,key,lot.ready)
+    end
+    function S.ackVendorReceipt(id)
+        local key=tostring(id)
+        local lot=db.vendorLots and db.vendorLots[key]
+        local count=lot and held(id)
+        if not count then return end
+        local qty=0
+        for invoice,n in pairs(lot.invoices) do qty=qty+tonumber(invoice:match("^(%d+):"))*n end
+        if qty>0 then release(key,lot,qty,count); lot.invoices={} end
+        mail=nil
+    end
+    function S.vendorMailbox(open)
+        if not open or not db.vendorLots or not GetInboxInvoiceInfo or not GetInboxItem then mail=nil return end
+        local n,total=GetInboxNumItems()
+        if not n or (total and total>n) then mail=nil return end
+        local seen={}
+        for i=1,n do
+            local kind,_,_,bid,buyout=GetInboxInvoiceInfo(i)
+            if kind=="buyer" then
+                local _,id,_,qty=GetInboxItem(i,1)
+                local key=tostring(id)
+                local lot=db.vendorLots[key]
+                local paid=(num(buyout) or 0)>0 and buyout or bid
+                if lot and num(qty) and num(paid) then
+                    local invoice=qty..":"..paid
+                    if lot.invoices[invoice] then
+                        seen[key]=seen[key] or {}
+                        seen[key][invoice]=(seen[key][invoice] or 0)+1
+                    end
+                end
+            end
+        end
+        mail=mail or {}
+        for key,lot in pairs(db.vendorLots) do
+            local count=held(tonumber(key))
+            if count then
+                local m=mail[key] or {balance=count,counts={}}
+                for invoice,pending in pairs(lot.invoices) do
+                    local visible=(seen[key] or {})[invoice] or 0
+                    local before=m.counts[invoice] or 0
+                    local qty=tonumber(invoice:match("^(%d+):"))
+                    local copies=math.min(before-visible,pending,math.floor((count-m.balance)/qty))
+                    if copies>0 then
+                        release(key,lot,copies*qty,count)
+                        local reserved=num(db.stockPending[key]) or 0
+                        db.stockPending[key]=reserved>copies*qty and reserved-copies*qty or nil
+                        pending=pending-copies
+                        lot.invoices[invoice]=pending>0 and pending or nil
+                        before=before-copies
+                        m.balance=m.balance+copies*qty
+                    end
+                    if visible>before then m.balance=count end
+                    m.counts[invoice]=math.max(before,visible)
+                end
+                mail[key]=m
+            end
+        end
+    end
+    local function sellOne()
+        if not visit or not cfg.enabled or cfg.autoVendor==false or not MerchantFrame or not MerchantFrame:IsShown()
+            or (MerchantFrame.selectedTab and MerchantFrame.selectedTab~=1) or InCombatLockdown()
+            or not GetCursorInfo or GetCursorInfo() or not SellCursorItem or not C_Container then return end
+        local c=C_Container
+        if not c.GetContainerNumSlots or not c.GetContainerItemInfo or not c.PickupContainerItem then return end
+        for key,lot in pairs(db.vendorLots or {}) do
+            local id=tonumber(key)
+            local count=held(id)
+            if count then reconcile(lot,count) end
+            if count and lot.ready>0 and vendorOf(id)>lot.maxPaid then
+                local large,empty
+                for bag=0,(NUM_BAG_SLOTS or 4) do
+                    for slot=1,c.GetContainerNumSlots(bag) do
+                        local info=c.GetContainerItemInfo(bag,slot)
+                        if not info and bag==0 then empty=slot end
+                        if info and info.itemID==id and not info.isLocked and not info.hasNoValue
+                            and num(info.stackCount) and info.stackCount>0 then
+                            local qty=info.stackCount
+                            if qty<=lot.ready then
+                                c.PickupContainerItem(bag,slot)
+                                local kind,cursorID=GetCursorInfo()
+                                if kind~="item" or cursorID~=id then return end
+                                -- Debit before the API call. A missing result must
+                                -- never cause another sale on the next visit.
+                                lot.ready,lot.last=lot.ready-qty,count-qty
+                                if lot.ready==0 and not next(lot.invoices) then db.vendorLots[key]=nil end
+                                visit.wait={id=id,count=count-qty}
+                                SellCursorItem()
+                                diagnostic("vendor sale",string.format("submitted %d x item %d; %d marked units left",qty,id,lot.ready))
+                                return
+                            end
+                            large={bag,slot}
+                        end
+                    end
+                end
+                if large and empty and not split and c.SplitContainerItem then
+                    split=true
+                    c.SplitContainerItem(large[1],large[2],lot.ready)
+                    local kind,cursorID=GetCursorInfo()
+                    if kind=="item" and cursorID==id then c.PickupContainerItem(0,empty) end
+                    return -- a subsequent bag event must verify the exact stack
+                end
+                if large and not empty and not visit.warned then
+                    visit.warned=true; printf("vendor flip held: free one backpack slot to split the marked quantity.")
+                end
+            end
+        end
+    end
+    function S.vendorVisit(open)
+        visit=open and {} or nil; split=nil
+        if open then S.vendorBagUpdate() end
+    end
+    function S.vendorBagUpdate()
+        if not db.vendorLots or not next(db.vendorLots) then return end
+        for key,lot in pairs(db.vendorLots) do
+            local count=held(tonumber(key))
+            if count and not (visit and visit.wait and visit.wait.id==tonumber(key)) then reconcile(lot,count) end
+            if lot.ready==0 and not next(lot.invoices) then db.vendorLots[key]=nil end
+        end
+        if mail then S.vendorMailbox(true) end
+        local owner=visit
+        if not owner or owner.scheduled then return end
+        owner.scheduled=true
+        C_Timer.After(0.2,function()
+            if visit~=owner then return end
+            owner.scheduled=nil
+            if owner.wait and held(owner.wait.id)~=owner.wait.count then return end
+            if owner.wait then owner.wait=nil; split=nil end
+            sellOne()
+        end)
+    end
+end
+
 local function finishPurchase(p, source)
     if type(p) ~= "table" or not p.confirmed or db.unsettledPurchase ~= p then return end
     local id, units, total = purchaseDetails(p)
@@ -2318,6 +2476,7 @@ local function finishPurchase(p, source)
         return
     end
     S.purchaseResult(p, source)
+    if source=="server confirmed" and p.kind=="vendor" then S.markVendorBuy(id,units,total) end
     db.unsettledPurchase, S.outcomeOwner, S.snipePending = nil, nil, nil
     S.remainderRetry = nil
     S.session.spent = (S.session.spent or 0) + total
@@ -5289,7 +5448,9 @@ f:SetScript("OnEvent", function(_, event, ...)
     if not ok then err(event, e) end
 end)
 
-onOptional("MAIL_SHOW", function() scanMailbox() end)
+onOptional("MAIL_SHOW", function() scanMailbox(); S.vendorMailbox(true) end)
+onOptional("MAIL_INBOX_UPDATE", function() if MailFrame and MailFrame:IsShown() then S.vendorMailbox(true) end end)
+onOptional("MAIL_CLOSED", function() S.vendorMailbox(false) end)
 
 on("PLAYER_LOGIN", function()
     buildPopup()
@@ -5372,7 +5533,7 @@ on("AUCTION_HOUSE_SHOW", function()
     end
 end)
 
-on("BAG_UPDATE_DELAYED", function() S.refreshSelling() end)
+on("BAG_UPDATE_DELAYED", function() S.refreshSelling(); S.vendorBagUpdate() end)
 
 -- UI error capture: Blizzard's own refusals ("not enough gold", "item already
 -- sold", ...) are not Lua errors and never reach ErrorTap - they only flash
@@ -5946,7 +6107,8 @@ do
         end
         end)
     end
-    on("MERCHANT_SHOW", learnBuyback)
+    on("MERCHANT_SHOW", function() learnBuyback(); S.vendorVisit(true) end)
+    onOptional("MERCHANT_CLOSED", function() S.vendorVisit(false) end)
     onOptional("MERCHANT_UPDATE", learnBuyback)
 end
 
@@ -6097,7 +6259,7 @@ local HELP = {
     "/fsn min 10s          ignore deals under this per-unit price",
     "/fsn quality 2        minimum rarity for market alerts (0 = any)",
     "/fsn profit 1g        minimum estimated resale profit (0 = off)",
-    "/fsn vendor           show verified NPC price coverage; any positive vendor profit qualifies",
+    "/fsn vendor [on|off|forget ID]  show or clear one-time merchant sale marks",
     "/fsn arm 2            scans of history before alerts fire",
     "/fsn fresh 45         minutes a price sample stays fresh (5-480)",
     "/fsn overhang 500     skip deals buried under more units (0 = off)",
@@ -6463,6 +6625,7 @@ SlashCmdList.FOREVERSNIPER = function(msg)
         if not id or id <= 0 or id % 1 ~= 0 then printf("usage: /fsn received <item ID or link>, only after collecting ALL reserved purchases") return end
         if S.snipePending or db.unsettledPurchase then printf("resolve the pending purchase first; reservations unchanged.") return end
         db.stockPending[tostring(id)] = nil
+        S.ackVendorReceipt(id)
         refreshDealPresentation()
         printf("item %d reservations cleared by your acknowledgment. Bags/bank and owned auctions still count toward its cap.", id)
 
@@ -6610,7 +6773,21 @@ SlashCmdList.FOREVERSNIPER = function(msg)
         end
 
     elseif cmd == "vendor" then
+        local forget=rest:match("^forget%s+(%d+)$")
+        if forget then
+            if db.vendorLots then db.vendorLots[tostring(tonumber(forget))]=nil end
+            printf("cleared merchant sale marks for item %s.",forget)
+            return
+        end
+        if rest=="off" then cfg.autoVendor=false; db.vendorLots=nil; S.vendorVisit(false); S.vendorMailbox(false)
+        elseif rest=="on" then cfg.autoVendor=true end
         printf("vendor flips: %d verified NPC prices. Any positive vendor profit qualifies (1c per lot); no daily sales required.", countKeys(db.vendorVerified or {}))
+        printf("one-time merchant sales %s; /fsn vendor forget ID clears one item; off clears all; on marks future purchases.",cfg.autoVendor==false and "off" or "on")
+        for key,lot in pairs(db.vendorLots or {}) do
+            local pending=0
+            for invoice,n in pairs(lot.invoices) do pending=pending+n*tonumber(invoice:match("^(%d+):")) end
+            printf("item %s: %d awaiting collection, %d marked in bags.",key,pending,lot.ready)
+        end
     elseif cmd == "profit" and rest ~= "" then
         local v = rest == "0" and 0 or parseMoney(rest)
         if v then

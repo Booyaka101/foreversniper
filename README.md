@@ -388,6 +388,23 @@ per lot**. Neither the AH profit setting nor any old saved vendor minimum applie
 The quote is checked against that payout before confirmation. `/fsn vendor`
 shows the count of verified NPC payouts. Discovery learns from single-item
 native sell-price tooltips when available, and from actual merchant buybacks.
+
+**One-time merchant sales.** New server-confirmed VENDOR purchases mark only the
+quantity bought. Existing holdings, older purchase history, AH resale purchases
+and manually reconciled buys do not create marks. Collect auction mail normally.
+When the addon observes a matching buyer invoice (item, quantity and total)
+disappear and the units arrive in your bags, it releases those units for sale.
+If the client does not expose matching mail data, collect **all** reserved
+purchases of that item first, then acknowledge with `/fsn received ITEMID`.
+
+Opening a merchant sells up to the released quantity. For a mixed stack, keep
+one regular backpack slot free so the addon can split and verify the smaller
+stack. Identical items are fungible: quantities, not specific physical units,
+are tracked. Observed bag-count decreases reduce the allowance. Sale attempts
+consume their allowance before submission; an uncertain result is not retried
+as a second sale. `/fsn vendor` lists pending/ready counts. `/fsn vendor forget ID`
+clears one item's pending and ready units without selling anything. `/fsn vendor off`
+clears all marks; `/fsn vendor on` tracks new purchases only.
 Wallet, reserve, manual stock limits and price ceilings still apply.
 
 Sales metadata must be observed for the matching `Forever-<region>` or

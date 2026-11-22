@@ -146,6 +146,7 @@ test('merchant updates learn newly sold stack payouts per unit without waiting t
   GetBuybackItemLink=function() return 'item:123' end
   GetBuybackItemInfo=function() return 'cloth',0,900,3 end
   ${section('-- merchant learner:', '\n-- options panel:')}
+  function S.vendorVisit() end
   handlers.MERCHANT_SHOW(); callback(); callback=nil
   assert(vendorOf(123)==0)
   GetNumBuybackItems=function() return 1 end
