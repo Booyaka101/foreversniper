@@ -366,7 +366,9 @@ appear when its first live results arrive, not necessarily in the first second.
 
 #### Regional sales and liquidity checks
 
-Fresh TSM Forever regional sales data can tighten market/dump flips:
+Every deal requires a positive `DBRegionSoldPerDay` from a fresh TSM feed for
+the matching Forever region. Market, dump, watch and vendor offers all use this
+rule. A vendor price, regional average price or sale rate alone does not qualify.
 
 - `DBRegionSaleAvg` only lowers an existing reference or resale estimate. Regional
   sales alone never create a discovery reference.
@@ -380,23 +382,23 @@ Fresh TSM Forever regional sales data can tighten market/dump flips:
 These configurable defaults are conservative policy choices, not proven optimum
 settings. Regional sale averages aggregate reported Accounting sales and purchases;
 they are not a promised exit price on your realm. Daily volume is not realm-specific
-or a guarantee of available buyers. Vendor and absolute-price watches are exempt
-from market sales policy, but retain existing budgets and manual stock controls.
+or a guarantee of available buyers. Vendor exits still use the NPC payout when
+calculating profit, but must qualify on AH demand first.
 
 Sales metadata must be observed for the matching `Forever-<region>` or
 `Forever-HC-<region>` feed, no more than 48 hours old and not future-dated.
-Missing/stale/unobserved data remains explicitly unknown and retains existing
-fallback. Public API queries preserve fractional rates/volume and known zeroes.
+Missing, stale, unobserved or zero sales volume hides offers and blocks buying.
+Public API queries preserve fractional rates/volume and known zeroes.
 Known volume requires fresh readable owned-auction stock, even without manual
 stock caps. Complete-tier, Buy and quote-time guards remain authoritative.
 
 - `/fsn sales <itemID>`: inspect coverage, values and liquidity policy.
-- `/fsn sales on` / `/fsn sales off`: enable or disable sales checks (default on).
+- `/fsn sales on` / `/fsn sales off`: toggle the extra rate and exposure limits (default on). Positive volume is always required.
 - `/fsn sales rate 5`: set the minimum known rate to 5%.
 - `/fsn sales share 10`: cap known exposure at 10% of regional daily/AH volume.
 
 Rate/share accept percentages greater than zero and at most 100. `/fsn tsm off`
-also disables sales checks. Tooltips show sales values or why coverage is unknown.
+blocks deals because regional volume cannot be verified. Tooltips show sales values or why coverage is unknown.
 Fresh rate/volume adds at most two seconds of candidate priority; aging still wins.
 The addon does not import TSM operations, write its data or increase AH request rates.
 

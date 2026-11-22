@@ -79,9 +79,10 @@ local function complete(low,qty,high,competition)
   handlers.COMMODITY_SEARCH_RESULTS_UPDATED(123)
 end
 `;
-function check(body) { run(setup + production + helpers + body); }
+const covered = `cfg.sales=false; ForeverSniperTSM.sales=function() return {daily=100} end\n`;
+function check(body) { run(setup + `ForeverSniperTSM={reference=function() end}\n` + covered + production + helpers + body); }
 
-function tsmCheck(body) { run(setup + fixture + provider + production + helpers + tsmHelpers + body); }
+function tsmCheck(body) { run(setup + fixture + provider + covered + production + helpers + tsmHelpers + body); }
 
 function salesCheck(body) { run(setup + fixture + salesEnvironment + provider + production + helpers + tsmHelpers + salesAPI + body); }
 
@@ -94,10 +95,19 @@ test('sale averages cap existing references but cannot bootstrap regional-only p
 });
 
 test('sales data reaches live-tier admission and conservative profit estimates', () => salesCheck(`
-  salesFeed(); market(); values.dbregionsoldperday=nil
+  salesFeed(); market(); cfg.sales=false
   observe(6000,10); assert(S.liveCandidates[123] and #admitted==0)
   complete(6000,10,10000,10)
   assert(#admitted==1 and admitted[1].sweep.verified and admitted[1].sweep.profit==25480)
+`));
+
+test('vendor margin and region average cannot queue or alert without reported volume', () => salesCheck(`
+  salesFeed(); market(); values.dbregionsoldperday=nil
+  vendorOf=function() return 9000 end
+  observe(100,10)
+  assert(not S.liveCandidates and #admitted==0 and #db.alerts==0)
+  fireAlert('vendor',123,nil,100,9000,{units=10,cost=1000,profit=89000,line=9000,verified=true})
+  assert(#admitted==0 and #db.alerts==0)
 `));
 
 test('wrong-item cheap API tiers cannot admit deals or teach automatic price history', () => salesCheck(`
@@ -153,7 +163,7 @@ test('mature local history caps TSM while missing, stale or disabled TSM preserv
     observe(7500,20); assert(not S.liveCandidates)`);
   for (const action of ['TSM_API=nil','market(now-43201)','cfg.tsm=false; market()']) {
     tsmCheck(`seed(); ${action}; assert(S.marketReference(123)==10000)
-      observe(6500,20); assert(S.liveCandidates[123])`);
+      observe(6500,20); assert(${action.includes('cfg.tsm=false') ? 'not S.liveCandidates' : 'S.liveCandidates[123]'})`);
   }
 });
 
