@@ -86,7 +86,7 @@ const production = optimizer
   + section('function S.noteRevisit(', '\nS.autoChecked =')
   + section('local COMMODITY_SNAPSHOT_AGE', 'local function prepareCommodityDeal')
   + section('function S.purchaseBudget()', 'local function purchaseAPIAvailable()')
-  + section('local function finishPurchase(p, source)', '\nmarkDealGone =')
+  + section('-- One-shot quantities,', '\nmarkDealGone =')
   + section('quickBuy = function(r)', '\n-- KEY BINDINGS:')
   + section('local function onCommodityResults(itemID)', '\non("COMMODITY_PRICE_UPDATED"')
   + section('on("COMMODITY_PRICE_UPDATED", function', '\n-- merchant learner:');
@@ -706,7 +706,7 @@ test('one wrong-item tier discards the whole wall instead of selecting a cheap p
 const commands = section('    elseif cmd == "keep" then', '\n    elseif cmd == "thresh" then')
   .replace('elseif cmd', 'if cmd');
 function commandCheck(body) {
-  run(setup + section('local function parseMoney(text)', '\n-- Timers:') + `
+  run(setup + section('-- One-shot quantities,', '\nlocal function finishPurchase') + section('local function parseMoney(text)', '\n-- Timers:') + `
     local function refreshDealPresentation() end
     function S.requestSellingOwned() end
     local function command(cmd,rest)
@@ -716,6 +716,17 @@ function commandCheck(body) {
     ${body}
   `);
 }
+
+test('only live server-confirmed vendor purchases create one-shot merchant marks', () => check(`
+  for _,v in ipairs({{'market','server confirmed'},{'vendor','user reconciled'},{'vendor','server confirmed'}}) do
+    local p={deal={id=123},units=3,total=300,maxUnit=100,confirmed=true,kind=v[1]}
+    db.unsettledPurchase=p
+    finishPurchase(p,v[2]);finishPurchase(p,v[2])
+    if v[1]=='vendor' and v[2]=='server confirmed' then
+      assert(db.vendorLots['123'].invoices['3:300']==1 and db.vendorLots['123'].ready==0)
+    else assert(not db.vendorLots) end
+  end
+`));
 
 test('reserve command supports setting, disabling, and rejecting invalid input', () => commandCheck(`
   command("keep","10g"); assert(cfg.keepGold==100000)
