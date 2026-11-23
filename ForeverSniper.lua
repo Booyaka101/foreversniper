@@ -1275,7 +1275,7 @@ local function commodityPositionTerms(itemID, line, units, cost, market, kind, s
         resale = kind ~= "vendor" and competing and math.min(market, competing - 1) or market
         profit = math.floor(liveUnits * resale * (kind == "vendor" and 1 or (1 - (cfg.cut or 0.05))) - liveCost - reserve)
         if not num(profit) then return nil, "invalid" end
-        if profit < (kind == "vendor" and 1 or math.max(1, cfg.profit or 0)) then return nil, "profit" end
+        if profit < ((kind == "vendor" or (policy and policy.compareExits)) and 1 or math.max(1, cfg.profit or 0)) then return nil, "profit" end
     end
     return {units=liveUnits, cost=liveCost, reserve=reserve, walletCap=budget - reserve, profit=profit, first=first, resale=resale, kind=kind}
 end
@@ -2468,6 +2468,47 @@ do
     end
 end
 
+function S.compareVendorExit(id, vendor, snapshot)
+    local reference = S.marketReference(id)
+    if not reference or reference <= vendor.resale then return end
+    local sales,limit,rejected = S.salesPolicy(id)
+    if rejected or not sales then return end
+    local allowance = S.stockAllowance(id,limit)
+    if not allowance or allowance < vendor.units then return end
+    -- Price the exact vendor lot. A smaller retry may leave cheap stock on
+    -- the AH; that stock is the competing floor, not the tier above the wall.
+    local tiers={}
+    for _,tier in ipairs(snapshot.tiers) do tiers[#tiers+1]=tier end
+    table.sort(tiers,function(a,b) return a.price<b.price end)
+    local remaining,cost,competing,overhang=vendor.units,0,nil,0
+    for _,tier in ipairs(tiers) do
+        local take=math.min(remaining,tier.quantity)
+        remaining,cost=remaining-take,cost+take*tier.price
+        if tier.quantity>take then
+            competing=competing or tier.price
+            overhang=overhang+tier.quantity-take
+        end
+    end
+    if remaining~=0 or cost~=vendor.cost then return end
+    local ah=commodityPositionTerms(id,vendor.first,vendor.units,cost,reference,"market",snapshot,
+        {units=vendor.units,cost=cost,first=vendor.first,competing=competing,competingUnits=overhang},
+        {sales=sales,allowance=allowance,budget=S.purchaseBudget(),compareExits=true})
+    if ah and ah.profit>vendor.profit then
+        return {units=vendor.units,cost=cost,npc=vendor.profit,net=ah.profit,resale=ah.resale}
+    end
+end
+
+function S.vendorAdviceText(a)
+    return string.format("For %d: vendor net %s; AH net est. %s (%s more) if sold at %s each after cut and deposit.",
+        a.units,fmtMoney(a.npc),fmtMoney(a.net),fmtMoney(a.net-a.npc),fmtMoney(a.resale))
+end
+
+function S.vendorAdvice(id,units,cost)
+    local s=S.commoditySnapshots[id]
+    local a=s and s.ahAlternative
+    if a and GetTime()>=s.t and GetTime()-s.t<=COMMODITY_SNAPSHOT_AGE and a.units==units and a.cost==cost then return a end
+end
+
 local function finishPurchase(p, source)
     if type(p) ~= "table" or not p.confirmed or db.unsettledPurchase ~= p then return end
     local id, units, total = purchaseDetails(p)
@@ -2486,12 +2527,17 @@ local function finishPurchase(p, source)
     push(db.purchases, 200, {t=time(), id=id, units=units, total=total, source=source, kind=p.kind, ceiling=p.maxUnit})
     local stockKey = tostring(id)
     db.stockPending[stockKey] = (num(db.stockPending[stockKey]) or 0) + units
+    local alternative = p.kind=="vendor" and S.vendorAdvice(id,units,total)
     S.commoditySnapshots[id] = nil
     S.sellingOwnedDisplay = nil -- a newly settled ceiling changes the owned-listing filter
     for _, d in ipairs(S.deals) do
         if d.id == id and not d.bought then d.bought = true end
     end
     printf("BOUGHT %d x %s for %s (%s).", units, p.deal.link or ("item " .. id), fmtMoney(total), source)
+    if alternative then
+        printf("%s To keep this item for AH resale, use /fsn vendor forget %d before visiting a merchant (clears all its marks).",
+            S.vendorAdviceText(alternative),id)
+    end
     S.refreshPurchasePresentation()
 end
 
@@ -2863,7 +2909,7 @@ local function refreshFeed()
             row.gone = d.gone and true or nil
             -- the action label: what to DO with this deal
             if d.tier == "VENDOR" then
-                row.action:SetText("|cffffd100VENDOR|r")
+                row.action:SetText(S.vendorAdvice(d.id,d.units,d.cost) and "|cff7cff4fAH > NPC|r" or "|cffffd100VENDOR|r")
             elseif d.market and d.market > 0 then
                 row.action:SetText("|cff7cff4fAH " .. fmtMoney(math.floor(d.market)) .. "|r")
             else
@@ -3190,6 +3236,8 @@ local function buildFeed()
             if self.link then GameTooltip:SetHyperlink(self.link) else GameTooltip:SetItemByID(self.itemID) end
             addPositionTooltip(self.units, self.cost, self.line, self.market2, self.positionProfit, self.itemID)
             local volatility = bookVolatility(self.itemID)
+            local alternative = self.kind=="vendor" and S.vendorAdvice(self.itemID,self.units,self.cost)
+            if alternative then GameTooltip:AddLine(S.vendorAdviceText(alternative),0.5,1,0.4,true) end
             if volatility then
                 GameTooltip:AddLine(string.format("observed price variation: %.0f%% (not expected profit)", volatility * 100), 0.7, 0.7, 0.7)
             end
@@ -3336,7 +3384,8 @@ local function fireAlert(kind, itemID, link, unit, market, sweep, isNew)
     -- the action label: every deal says what to DO with it
     local action
     if kind == "vendor" then
-        action = "|cffffd100vendor value reference|r - no AH relist assumed"
+        action = sweep.ahAlternative and S.vendorAdviceText(sweep.ahAlternative)
+            or "|cffffd100vendor value reference|r - no AH relist assumed"
     elseif market and market > 0 then
         action = "|cffffd100AH resale reference " .. fmtMoney(math.floor(market)) .. "|r - resale is not guaranteed"
     else
@@ -5937,8 +5986,10 @@ local function onCommodityResults(itemID)
                     stats.responseMax = math.max(stats.responseMax or 0, stats.responseLast)
                 end
             end
+            snapshot.ahAlternative = c.kind=="vendor" and S.compareVendorExit(itemID,terms,snapshot) or nil
             fireAlert(c.kind, itemID, c.link, terms.first, terms.resale,
-                {units=terms.units,cost=terms.cost,profit=terms.profit,line=terms.line or c.line,verified=true}, true)
+                {units=terms.units,cost=terms.cost,profit=terms.profit,line=terms.line or c.line,
+                    ahAlternative=snapshot.ahAlternative,verified=true}, true)
         else
             local reasons = {empty="no units below ceiling", budget="complete position exceeds budget",
                 profit="net after competition and deposit below floor", invalid="invalid position data",
