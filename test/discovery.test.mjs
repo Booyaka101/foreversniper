@@ -63,7 +63,7 @@ const production = history + merge
   + fs.readFileSync(new URL('../DepthOptimizer.lua', import.meta.url), 'utf8')
   + section('local COMMODITY_SNAPSHOT_AGE', 'local function prepareCommodityDeal')
   + section('function S.purchaseBudget()', 'local function purchaseAPIAvailable()')
-  + section('function S.compareVendorExit(', '\nlocal function finishPurchase(')
+  + section('function S.chooseExit(', '\nlocal function finishPurchase(')
   + section('local function recordGate(', '\n-- The scan ')
   + section('local function processBrowseRows(', '\ndo\n    function S.failBatch')
   + section('local function onCommodityResults(', '\non("COMMODITY_PRICE_UPDATED"');
@@ -121,15 +121,17 @@ test('a cold vendor table learns the unit payout during discovery and retains th
   assert(db.vendorVerified['123']==1000 and S.liveCandidates[123].kind=='vendor')
   complete(100,10,1000,30)
   assert(#admitted==1 and admitted[1].sweep.kind=='vendor' and admitted[1].sweep.profit==9000)
-  assert(not admitted[1].sweep.ahAlternative, 'same-priced competing stock cannot beat NPC after fees')
+  assert(admitted[1].sweep.kind=='vendor','same-priced competing stock cannot beat NPC after fees')
 `));
 
-test('vendor alert includes a higher AH estimate without changing the purchase ceiling', () => salesCheck(`
+test('overlap produces a single AH recommendation when a larger eligible lot beats the NPC position', () => salesCheck(`
   salesFeed(); market(); cfg.sales=false; db.vendorVerified={['123']=1000}
-  observe(100,10); complete(100,10,5000,5)
+  observe(100,10)
+  rows={{itemID=123,unitPrice=100,quantity=10},{itemID=123,unitPrice=1200,quantity=5},{itemID=123,unitPrice=8000,quantity=4}}
+  handlers.COMMODITY_SEARCH_RESULTS_UPDATED(123)
   local sweep=admitted[1].sweep
-  assert(sweep.kind=='vendor' and sweep.line==999 and sweep.profit==9000)
-  assert(sweep.ahAlternative and sweep.ahAlternative.net>sweep.profit)
+  assert(#admitted==1 and sweep.kind=='market' and sweep.line==1200 and sweep.units==15 and sweep.cost==7000)
+  assert(sweep.exitComparison.npcUnits==10 and sweep.exitComparison.npc==9000 and sweep.exitComparison.net==sweep.profit)
 `));
 
 test('ambiguous, foreign, fractional and missing tooltip values do not qualify a vendor flip', () => check(`
