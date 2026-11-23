@@ -574,26 +574,28 @@ test('one copper merchant gain passes both Buy and quote even with the old saved
   assert(calls.confirm==1 and db.unsettledPurchase.total==100)
 `));
 
-test('vendor exit comparison uses the same lot, competing floor, cut and deposit even below the AH alert threshold', () => salesCheck(`
+test('automatic exit choice respects AH floor, returns one winner and expires comparison text', () => salesCheck(`
   salesFeed(); function S.marketReference() return 250 end
-  cfg.profit=10000
+  cfg.minUnit=1
+  local candidate={kind='vendor',line=99,market=100,ahExit={kind='market',line=99,market=250}}
+  dealLine=function() return 99,0.7 end
   local wall=snapshot({{price=200,quantity=20},{price=50,quantity=3}})
-  local vendor=S.optimizedCommodityTerms(123,99,100,'vendor',wall)
-  assert(vendor.profit==150)
-  local a=S.compareVendorExit(123,vendor,wall)
-  assert(a and a.units==3 and a.cost==150 and a.resale==199 and a.npc==150 and a.net==411)
-  wall.ahAlternative=a
-  assert(S.vendorAdvice(123,3,150)==a and not S.vendorAdvice(123,2,100))
-  now=now+21; assert(not S.vendorAdvice(123,3,150))
+  cfg.profit=10000;assert(S.chooseExit(123,candidate,wall).kind=='vendor')
+  cfg.profit=1;local winner=S.chooseExit(123,candidate,wall)
+  assert(winner.kind=='market' and winner.resale==199 and winner.profit==411)
+  local a=S.exitComparison(123,'market',3,150)
+  assert(a and a.npc==150 and a.net==411 and not S.exitComparison(123,'vendor',3,150))
+  now=now+21; assert(not S.exitComparison(123,'market',3,150))
 `));
 
-test('no AH upsell for unknown demand, net below NPC, or a partial lot leaving cheap competitors', () => {
-  for (const change of ['values.dbregionsoldperday=nil','reference=101','wall.tiers[1].quantity=4','reference=nil']) salesCheck(`
+test('NPC wins for missing demand, missing reference, net below NPC, or an explicit prebuy check', () => {
+  for (const change of ['values.dbregionsoldperday=nil','reference=101','candidate.prebuy={}','reference=nil']) salesCheck(`
     salesFeed(); local reference=250; function S.marketReference() return reference end
+    cfg.minUnit=1; dealLine=function() return 99 end
+    local candidate={kind='vendor',line=99,market=100,ahExit={kind='market',line=99,market=250}}
     local wall=snapshot({{price=50,quantity=3},{price=200,quantity=20}})
     ${change}
-    local vendor={units=3,cost=150,first=50,resale=100,profit=150}
-    assert(not S.compareVendorExit(123,vendor,wall))
+    assert(S.chooseExit(123,candidate,wall).kind=='vendor')
   `);
 });
 
@@ -603,6 +605,35 @@ test('a vendor quote rechecks the NPC payout and the actual quoted margin', () =
   assert(calls.start==1); payout=10; rows[1].unitPrice=8
   handlers.COMMODITY_PRICE_UPDATED(10,100)
   assert(calls.confirm==0 and not db.unsettledPurchase)
+`));
+
+test('one Buy requests the selected AH quantity and settlement never creates an NPC mark', () => salesCheck(`
+  salesFeed(); local ref=1000
+  function S.marketReference() return ref end
+  dealLine=function() return 500,0.7 end; cfg.minUnit=1
+  local c={kind='vendor',line=99,market=100,ahExit={kind='market',line=500,market=1000}}
+  local wall=snapshot({{price=50,quantity=2},{price=150,quantity=3},{price=900,quantity=1}})
+  local selected=S.chooseExit(123,c,wall)
+  assert(selected.kind=='market' and selected.units==5 and selected.cost==550 and selected.line==150)
+  assert(calls.start==0)
+  quickBuy({itemID=123,line=selected.line,units=selected.units,cost=selected.cost,
+      market2=selected.resale,kind=selected.kind})
+  assert(calls.start==1 and calls.startArgs[2]==5)
+  handlers.COMMODITY_PRICE_UPDATED(110,550);assert(calls.confirm==1)
+  handlers.COMMODITY_PURCHASE_SUCCEEDED()
+  assert(db.purchases[1].kind=='market' and not db.vendorLots)
+`));
+
+test('equal net picks NPC; unaffordable larger AH wall cannot displace the vendor lot', () => salesCheck(`
+  salesFeed(); cfg.minUnit=1; cfg.cut=0; deposit=0
+  function S.marketReference() return 500 end
+  dealLine=function() return 400 end
+  local c={kind='vendor',line=99,market=100,ahExit={kind='market',line=400,market=500}}
+  local wall=snapshot({{price=50,quantity=2},{price=101,quantity=50}})
+  cfg.maxSpend=100
+  local selected=S.chooseExit(123,c,wall)
+  assert(wall.exitComparison.net==wall.exitComparison.npc)
+  assert(selected.kind=='vendor' and selected.units==2)
 `));
 
 test('guarded Buy rechecks liquidity instead of trusting displayed offers', () => salesCheck(`
