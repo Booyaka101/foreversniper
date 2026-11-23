@@ -389,6 +389,15 @@ The quote is checked against that payout before confirmation. `/fsn vendor`
 shows the count of verified NPC payouts. Discovery learns from single-item
 native sell-price tooltips when available, and from actual merchant buybacks.
 
+**Comparing exits.** A vendor deal shows **AH > NPC** when the same units have
+a higher estimated AH profit after cut and deposit. Hover the feed row for both
+net profits, the difference and the estimated listing price. This requires a
+fresh market reference and qualifying regional daily sales. Remaining cheap
+units count as competition. The estimate does not change the vendor Buy ceiling
+or merchant marks. To keep that item for manual resale, use
+`/fsn vendor forget ITEMID` before opening a merchant; this clears all marks for
+that item.
+
 **One-time merchant sales.** New server-confirmed VENDOR purchases mark only the
 quantity bought. Existing holdings, older purchase history, AH resale purchases
 and manually reconciled buys do not create marks. Collect auction mail normally.

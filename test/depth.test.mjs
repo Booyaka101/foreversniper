@@ -574,6 +574,29 @@ test('one copper merchant gain passes both Buy and quote even with the old saved
   assert(calls.confirm==1 and db.unsettledPurchase.total==100)
 `));
 
+test('vendor exit comparison uses the same lot, competing floor, cut and deposit even below the AH alert threshold', () => salesCheck(`
+  salesFeed(); function S.marketReference() return 250 end
+  cfg.profit=10000
+  local wall=snapshot({{price=200,quantity=20},{price=50,quantity=3}})
+  local vendor=S.optimizedCommodityTerms(123,99,100,'vendor',wall)
+  assert(vendor.profit==150)
+  local a=S.compareVendorExit(123,vendor,wall)
+  assert(a and a.units==3 and a.cost==150 and a.resale==199 and a.npc==150 and a.net==411)
+  wall.ahAlternative=a
+  assert(S.vendorAdvice(123,3,150)==a and not S.vendorAdvice(123,2,100))
+  now=now+21; assert(not S.vendorAdvice(123,3,150))
+`));
+
+test('no AH upsell for unknown demand, net below NPC, or a partial lot leaving cheap competitors', () => {
+  for (const change of ['values.dbregionsoldperday=nil','reference=101','wall.tiers[1].quantity=4','reference=nil']) salesCheck(`
+    salesFeed(); local reference=250; function S.marketReference() return reference end
+    local wall=snapshot({{price=50,quantity=3},{price=200,quantity=20}})
+    ${change}
+    local vendor={units=3,cost=150,first=50,resale=100,profit=150}
+    assert(not S.compareVendorExit(123,vendor,wall))
+  `);
+});
+
 test('a vendor quote rechecks the NPC payout and the actual quoted margin', () => salesCheck(`
   cfg.vendorMin=100; snapshot({{price=10,quantity=10}})
   quickBuy({itemID=123,line=10,units=10,cost=100,market2=100,kind='vendor'})
